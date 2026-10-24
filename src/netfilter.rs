@@ -1,4 +1,4 @@
-//! Dedicated per-instance nftables table: kernel RST suppression, MSS clamping, exit masquerade.
+//! Dedicated per-instance nftables table: conntrack/TCP-input bypass, RST suppression, MSS clamping, exit masquerade.
 
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -42,7 +42,7 @@ pub fn render(spec: &NftSpec) -> String {
         OuterFamily::Ipv4 => ("ipv4", "ip"),
         OuterFamily::Ipv6 => ("ipv6", "ip6"),
     };
-    // Outer tunnel frames bypass host-local conntrack; kernel-generated RSTs are dropped in raw.
+    // Non-TUN outer frames bypass conntrack and local TCP input (tcp_v4/v6_rcv discard pkt_type != PACKET_HOST).
     let (outer_in, outer_out) = match spec.mode {
         Mode::Entry => {
             let r = spec.remote.expect("entry netfilter spec requires remote");
@@ -103,7 +103,7 @@ delete table inet {table}
 table inet {table} {{
     chain prerouting {{
         type filter hook prerouting priority raw; policy accept;
-        {outer_in} notrack
+        iifname != "{tun}" {outer_in} notrack meta pkttype set other
     }}
     chain output {{
         type filter hook output priority raw; policy accept;
@@ -166,8 +166,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn table_name_is_sanitized() {
+    fn table_name_and_prerouting_rules_exclude_inner_tun() {
         assert_eq!(table_name("ghostun0"), "ghostun_ghostun0");
         assert_eq!(table_name("wan.1-a"), "ghostun_wan_1_a");
+        let rules = render(&NftSpec {
+            mode: Mode::Exit,
+            outer_family: OuterFamily::Ipv4,
+            tun_name: "ghostun0".into(),
+            remote: None,
+            base_port: 30000,
+            listen_port: 443,
+            inner_v4: "10.200.0.2/30".parse().unwrap(),
+            inner_v6: None,
+            out_iface: Some("eth0".into()),
+        });
+        assert!(
+            rules.contains(
+                r#"iifname != "ghostun0" meta nfproto ipv4 tcp dport 443 notrack meta pkttype set other"#
+            ),
+            "{rules}"
+        );
     }
 }

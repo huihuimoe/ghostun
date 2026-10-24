@@ -89,7 +89,7 @@ Design and deliver `ghostun`: a high-performance, low-memory L3-over-FakeTCP tun
 ### 2. Inner Multi-Queue TUN and Dual-Stack Addressing
 
 - Create the virtual interface through Linux `/dev/net/tun` and `TUNSETIFF` with `IFF_TUN | IFF_NO_PI | IFF_MULTI_QUEUE`; default name `ghostun0`. Do not set `IFF_PERSIST`.
-- Match the queue count to the worker count. Automatically configure inner IPv4 (Entry `10.200.0.1/30`, Exit `10.200.0.2/30`) and IPv6 ULA (Entry `fd00:200::1/126`, Exit `fd00:200::2/126`) addresses, with `--no-ipv6` available to disable IPv6.
+- Match the queue count to the worker count and configure `txqueuelen 8192` so multi-queue ring division does not tail-drop bursts. Automatically configure inner IPv4 (Entry `10.200.0.1/30`, Exit `10.200.0.2/30`) and IPv6 ULA (Entry `fd00:200::1/126`, Exit `fd00:200::2/126`) addresses, with `--no-ipv6` available to disable IPv6.
 - Configure the TUN before installing firewall rules. If inner IPv6 configuration fails because IPv6 is unavailable, log a warning and continue with inner IPv4; omit IPv6 forwarding sysctls and masquerade rules. Do not change the selected outer transport family.
 - With `IFF_NO_PI`, the kernel identifies the address family from each packet's first IP version nibble (`4` or `6`); user space does not prepend a four-byte PI header.
 
@@ -155,7 +155,7 @@ Design and deliver `ghostun`: a high-performance, low-memory L3-over-FakeTCP tun
 - Unless `--no-netfilter` is set, manage rules at startup using `nft -f -`. Use table name `ghostun_<tun_name>`, replacing characters outside `[A-Za-z0-9_]` with `_` to support multiple instances on one host:
   1. Attempt to delete any old `table inet ghostun_<tun_name>`, idempotently clearing rules left by an earlier crash.
   2. Atomically create the dedicated table and its rules:
-     - **Shared Entry/Exit rules**: In the output chain, match and drop kernel-generated `tcp flags rst` for local tunnel ports in the selected outer family. Use `ip daddr` or `ip6 daddr` on Entry, and `meta nfproto ipv4` or `ipv6` on Exit. Ghostun sockets set `SO_MARK = 0x67687374`; `meta mark != 0x67687374` exempts intentionally emitted RSTs.
+     - **Shared Entry/Exit rules**: In the prerouting chain, match non-TUN outer tunnel frames (`iifname != "<tun>"`) and apply `notrack meta pkttype set other` so outer traffic bypasses host conntrack and is discarded immediately at local `tcp_v4_rcv` / `tcp_v6_rcv` entry after `SOCK_RAW` delivery. In the output chain, match `notrack` and drop fallback kernel-generated `tcp flags rst` for local tunnel ports in the selected outer family. Use `ip`/`ip6` endpoint matching on Entry, and `meta nfproto ipv4`/`ipv6` on Exit. Ghostun sockets set `SO_MARK = 0x67687374`; `meta mark != 0x67687374` exempts intentionally emitted RSTs.
      - **Exit-specific rules**: Enable `net.ipv4.ip_forward=1` and, in dual-stack mode, `net.ipv6.conf.all.forwarding=1`. In the forward chain, apply `maxseg size set rt mtu` to TCP SYNs entering or leaving `ghostun0`. In postrouting, masquerade inner networks (`10.200.0.0/30` and `fd00:200::/126`) on traffic leaving through non-tunnel interfaces.
   3. On SIGINT/SIGTERM, have Entry send RSTs for every outer connection to release firewall slots, then remove `table inet ghostun_<tun_name>` before exiting.
 

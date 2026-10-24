@@ -2,7 +2,7 @@
 
 use std::fs::File;
 use std::io::{self, Write};
-use std::mem::size_of;
+use std::mem::{size_of, MaybeUninit};
 use std::net::{IpAddr, Ipv6Addr};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
@@ -15,6 +15,13 @@ use crate::pkt::{self, IPV6_HDR};
 pub const SOCKET_MARK: u32 = 0x6768_7374;
 const SOCKET_BUF: libc::c_int = 4 << 20;
 pub const RAW_BATCH: usize = 64;
+/// Multi-queue TUN divides `tx_queue_len / numqueues` per ring; 8192 prevents burst tail-drops.
+const TUN_TXQUEUELEN: &str = "8192";
+type CmsgBuf = [usize; 8];
+
+fn uninit_batch<T>() -> [MaybeUninit<T>; RAW_BATCH] {
+    [const { MaybeUninit::uninit() }; RAW_BATCH]
+}
 
 fn cvt(ret: libc::c_int) -> io::Result<libc::c_int> {
     if ret < 0 {
@@ -201,29 +208,35 @@ pub fn send_raw_batch(
     lens: &[usize],
     dst: IpAddr,
 ) -> io::Result<()> {
+    let count = lens.len();
     let (addr, namelen) = destination(dst);
-    // SAFETY: POD socket structs; initialized for every active index below.
-    let mut iovs: [libc::iovec; RAW_BATCH] = unsafe { std::mem::zeroed() };
-    let mut hdrs: [libc::mmsghdr; RAW_BATCH] = unsafe { std::mem::zeroed() };
-    for (k, &len) in lens.iter().enumerate() {
-        iovs[k] = libc::iovec {
-            iov_base: bufs[k * stride..].as_ptr().cast_mut().cast(),
-            iov_len: len,
-        };
-        hdrs[k].msg_hdr.msg_name = (&addr as *const Destination).cast_mut().cast();
-        hdrs[k].msg_hdr.msg_namelen = namelen;
-        hdrs[k].msg_hdr.msg_iov = &mut iovs[k];
-        hdrs[k].msg_hdr.msg_iovlen = 1;
+    let mut iovs = uninit_batch::<libc::iovec>();
+    let mut hdrs = uninit_batch::<libc::mmsghdr>();
+    // SAFETY: POD socket structs; active indices 0..count are fully initialized before sendmmsg.
+    unsafe {
+        let mut base: libc::mmsghdr = std::mem::zeroed();
+        base.msg_hdr.msg_name = (&addr as *const Destination).cast_mut().cast();
+        base.msg_hdr.msg_namelen = namelen;
+        base.msg_hdr.msg_iovlen = 1;
+        for (k, &len) in lens.iter().enumerate() {
+            let iov = iovs[k].write(libc::iovec {
+                iov_base: bufs[k * stride..].as_ptr().cast_mut().cast(),
+                iov_len: len,
+            });
+            let mut hdr = base;
+            hdr.msg_hdr.msg_iov = iov;
+            hdrs[k].write(hdr);
+        }
     }
     let mut first_err = None;
     let mut sent = 0;
-    while sent < lens.len() {
-        // SAFETY: hdrs[sent..lens.len()] reference live iovecs, buffers, and destination storage.
+    while sent < count {
+        // SAFETY: hdrs[sent..count] were initialized above and reference live iovecs and buffers.
         let n = unsafe {
             libc::sendmmsg(
                 fd.as_raw_fd(),
-                hdrs[sent..].as_mut_ptr(),
-                (lens.len() - sent) as libc::c_uint,
+                hdrs[sent..].as_mut_ptr().cast(),
+                (count - sent) as libc::c_uint,
                 libc::MSG_DONTWAIT,
             )
         };
@@ -256,32 +269,35 @@ pub fn recv_raw_batch(
     // SAFETY: receive buffers and ancillary storage live through recvmmsg; CMSG traversal is
     // bounded by the returned controllen, and flags are checked before reading pktinfo.
     unsafe {
-        let mut iovs: [libc::iovec; RAW_BATCH] = std::mem::zeroed();
-        let mut hdrs: [libc::mmsghdr; RAW_BATCH] = std::mem::zeroed();
-        let mut sources: [libc::sockaddr_in6; RAW_BATCH] = std::mem::zeroed();
-        let mut controls = [[0usize; 8]; RAW_BATCH];
+        let mut iovs = uninit_batch::<libc::iovec>();
+        let mut hdrs = uninit_batch::<libc::mmsghdr>();
+        let mut sources = uninit_batch::<libc::sockaddr_in6>();
+        let mut controls = uninit_batch::<CmsgBuf>();
+        let mut base: libc::mmsghdr = std::mem::zeroed();
+        base.msg_hdr.msg_iovlen = 1;
         let offset = if family == OuterFamily::Ipv6 {
+            base.msg_hdr.msg_namelen = size_of::<libc::sockaddr_in6>() as libc::socklen_t;
+            base.msg_hdr.msg_controllen = size_of::<CmsgBuf>();
             IPV6_HDR
         } else {
             0
         };
         for k in 0..RAW_BATCH {
-            iovs[k] = libc::iovec {
+            let iov = iovs[k].write(libc::iovec {
                 iov_base: bufs[k * stride + offset..].as_mut_ptr().cast(),
                 iov_len: stride - offset,
-            };
-            hdrs[k].msg_hdr.msg_iov = &mut iovs[k];
-            hdrs[k].msg_hdr.msg_iovlen = 1;
+            });
+            let mut hdr = base;
+            hdr.msg_hdr.msg_iov = iov;
             if family == OuterFamily::Ipv6 {
-                hdrs[k].msg_hdr.msg_name = (&mut sources[k] as *mut libc::sockaddr_in6).cast();
-                hdrs[k].msg_hdr.msg_namelen = size_of::<libc::sockaddr_in6>() as libc::socklen_t;
-                hdrs[k].msg_hdr.msg_control = controls[k].as_mut_ptr().cast();
-                hdrs[k].msg_hdr.msg_controllen = size_of_val(&controls[k]);
+                hdr.msg_hdr.msg_name = sources[k].as_mut_ptr().cast();
+                hdr.msg_hdr.msg_control = controls[k].as_mut_ptr().cast();
             }
+            hdrs[k].write(hdr);
         }
         let m = libc::recvmmsg(
             fd.as_raw_fd(),
-            hdrs.as_mut_ptr(),
+            hdrs.as_mut_ptr().cast(),
             RAW_BATCH as libc::c_uint,
             libc::MSG_DONTWAIT,
             std::ptr::null_mut(),
@@ -291,8 +307,9 @@ pub fn recv_raw_batch(
         }
         let m = m as usize;
         for k in 0..m {
-            let msg = &hdrs[k].msg_hdr;
-            let n = hdrs[k].msg_len as usize;
+            let hdr = hdrs[k].assume_init_ref();
+            let msg = &hdr.msg_hdr;
+            let n = hdr.msg_len as usize;
             if msg.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0 {
                 lens[k] = 0;
             } else if family == OuterFamily::Ipv4 {
@@ -300,7 +317,7 @@ pub fn recv_raw_batch(
             } else if let Some(dst) = pktinfo_dst(msg) {
                 pkt::write_ipv6_header(
                     &mut bufs[k * stride..(k + 1) * stride],
-                    Ipv6Addr::from(sources[k].sin6_addr.s6_addr),
+                    Ipv6Addr::from(sources[k].assume_init_ref().sin6_addr.s6_addr),
                     dst,
                     n,
                 );
@@ -413,12 +430,22 @@ pub fn iface_mtu(dev: &str) -> io::Result<u32> {
         .map_err(|_| invalid(format!("bad MTU for {dev}: {text:?}")))
 }
 
-/// Sets MTU, brings the device up and assigns addresses. An IPv6 failure (IPv6 disabled in the
-/// kernel) only warns; returns whether IPv6 got configured.
+/// Sets MTU and `TUN_TXQUEUELEN` (avoiding per-queue burst tail-drops), brings the device up, and
+/// assigns inner addresses. An IPv6 failure only warns; returns whether IPv6 got configured.
 pub fn configure_tun(name: &str, mtu: u32, v4: &str, v6: Option<&str>) -> io::Result<bool> {
     run(
         "ip",
-        &["link", "set", "dev", name, "mtu", &mtu.to_string(), "up"],
+        &[
+            "link",
+            "set",
+            "dev",
+            name,
+            "mtu",
+            &mtu.to_string(),
+            "txqueuelen",
+            TUN_TXQUEUELEN,
+            "up",
+        ],
         None,
     )?;
     run("ip", &["-4", "addr", "add", v4, "dev", name], None)?;

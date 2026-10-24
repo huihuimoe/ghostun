@@ -145,16 +145,16 @@ Measured inside a single 4-vCPU VM (AMD EPYC-Genoa, Linux 7.2) running Entry, a 
 
 | `--conns` (CPU pinning) | Outer family | Inner IPv4 upload | Inner IPv6 download | Entry RSS | Exit RSS |
 |---|---|---|---|---|---|
-| `2` (`0-1` / `2-3`) | IPv4 (TUN MTU 1380) | 2.20 Gbit/s | 2.88 Gbit/s | ~3.1 MB | ~3.1 MB |
-| `2` (`0-1` / `2-3`) | IPv6 (TUN MTU 1360) | 1.92 Gbit/s | 2.33 Gbit/s | ~3.1 MB | ~3.1 MB |
-| `4` (shared 4 vCPUs) | IPv4 (TUN MTU 1380) | 2.19 Gbit/s | 2.97 Gbit/s | ~3.3 MB | ~3.3 MB |
-| `4` (shared 4 vCPUs) | IPv6 (TUN MTU 1360) | 2.30 Gbit/s | 2.68 Gbit/s | ~3.4 MB | ~3.3 MB |
+| `2` (`0-1` / `2-3`) | IPv4 (TUN MTU 1380) | 2.22 Gbit/s | 2.62 Gbit/s | ~3.1 MB | ~3.1 MB |
+| `2` (`0-1` / `2-3`) | IPv6 (TUN MTU 1360) | 2.17 Gbit/s | 2.38 Gbit/s | ~3.1 MB | ~3.1 MB |
+| `4` (shared 4 vCPUs) | IPv4 (TUN MTU 1380) | 2.37 Gbit/s | 3.17 Gbit/s | ~3.4 MB | ~3.5 MB |
+| `4` (shared 4 vCPUs) | IPv6 (TUN MTU 1360) | 2.42 Gbit/s | 3.11 Gbit/s | ~3.3 MB | ~3.5 MB |
 
 Stripped release binary size is ~800 KB.
 
 ## Operational notes
 
 - **MTU:** Outer headers take 40 bytes over IPv4 and 60 bytes over IPv6. If your path MTU is lower than the NIC MTU (for example PPPoE `1492` or cloud VPC `1420`) and large transfers stall while ping works, set `--outer-mtu`.
-- **Firewall rules:** Unless `--no-netfilter` is set, `ghostun` manages `table inet ghostun_<tun>` (kernel RST suppression, MSS clamping, and Exit masquerade) and cleans it up on `SIGINT`/`SIGTERM`.
+- **Firewall rules:** Unless `--no-netfilter` is set, `ghostun` manages `table inet ghostun_<tun>` (conntrack/TCP-input bypass, kernel RST suppression, MSS clamping, and Exit masquerade) and cleans it up on `SIGINT`/`SIGTERM`.
 - **Security boundary:** `auth_key` authenticates tunnel handshakes so stray clients cannot claim worker slots. `ghostun` does not encrypt traffic or disguise payloads as TLS/HTTP; keep encryption and client authentication in your proxy layer.
 - **Further docs:** [Testing guide](tests/README.md), [architecture spec](docs/261024-ghostun-spec.md), and [authentication spec](docs/261024-handshake-auth-spec.md).

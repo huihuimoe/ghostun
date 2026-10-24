@@ -175,7 +175,9 @@ impl Session {
                     return None;
                 }
                 if m.flags & flags::RST != 0 {
-                    if self.state != State::Closed {
+                    // Pre-established attempts wait for SYN_RETRY / dead_timeout so a down peer's
+                    // kernel RSTs cannot spin port rotation or extend the attempt deadline.
+                    if self.state == State::Established {
                         self.reconnect(now, false, out);
                     }
                     return None;
@@ -1402,6 +1404,22 @@ mod tests {
         s.start(t, &mut w);
         let first = parsed(&w.take()[0]).meta;
         assert_eq!(s.next_deadline(), t + SYN_RETRY);
+        let rst = frame(
+            TcpMeta {
+                src: first.dst,
+                dst: first.src,
+                seq: 0,
+                ack: first.seq.wrapping_add(1),
+                flags: flags::RST | flags::ACK,
+                window: 0,
+            },
+            &[],
+        );
+        assert!(s.on_outer(t, &rst, &mut w).is_none());
+        assert!(
+            w.take().is_empty(),
+            "SynSent RST must not spin immediate reconnect"
+        );
         s.on_tick(t + SYN_RETRY, &mut w);
         let retry = parsed(&w.take()[0]).meta;
         assert_eq!(

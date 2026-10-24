@@ -87,36 +87,7 @@ pub fn run(
         }
         now = Instant::now();
         busy = false;
-        if fds[0].revents & libc::POLLIN != 0 {
-            for round in 0..ROUNDS {
-                let mut reads = 0;
-                let mut count = 0;
-                let mut batch_dst = None;
-                while reads < RAW_BATCH {
-                    let slot = &mut bufs[count * stride..(count + 1) * stride];
-                    let Some(n) = read(tun.as_fd(), &mut slot[overhead..]) else {
-                        break;
-                    };
-                    reads += 1;
-                    if let Some((len, dst)) = session.encap(slot, n) {
-                        lens[count] = len;
-                        batch_dst = Some(dst);
-                        count += 1;
-                    }
-                }
-                if let Some(dst) = batch_dst {
-                    if let Err(e) =
-                        sys::send_raw_batch(raw.as_fd(), &bufs, stride, &lens[..count], dst)
-                    {
-                        log::debug!("worker {id}: send to {dst}: {e}");
-                    }
-                }
-                if reads < RAW_BATCH {
-                    break;
-                }
-                busy |= round + 1 == ROUNDS;
-            }
-        }
+        let mut tun_ready = fds[0].revents & libc::POLLIN != 0;
         if fds[1].revents & libc::POLLIN != 0 {
             for round in 0..ROUNDS {
                 let m = match sys::recv_raw_batch(raw.as_fd(), family, &mut bufs, stride, &mut lens)
@@ -143,10 +114,42 @@ pub fn run(
                                 "worker {id}: tun write: {}",
                                 std::io::Error::last_os_error()
                             );
+                        } else {
+                            tun_ready = true;
                         }
                     }
                 }
                 if m < RAW_BATCH {
+                    break;
+                }
+                busy |= round + 1 == ROUNDS;
+            }
+        }
+        if tun_ready {
+            for round in 0..ROUNDS {
+                let mut reads = 0;
+                let mut count = 0;
+                let mut batch_dst = None;
+                while reads < RAW_BATCH {
+                    let slot = &mut bufs[count * stride..(count + 1) * stride];
+                    let Some(n) = read(tun.as_fd(), &mut slot[overhead..]) else {
+                        break;
+                    };
+                    reads += 1;
+                    if let Some((len, dst)) = session.encap(slot, n) {
+                        lens[count] = len;
+                        batch_dst = Some(dst);
+                        count += 1;
+                    }
+                }
+                if let Some(dst) = batch_dst {
+                    if let Err(e) =
+                        sys::send_raw_batch(raw.as_fd(), &bufs, stride, &lens[..count], dst)
+                    {
+                        log::debug!("worker {id}: send to {dst}: {e}");
+                    }
+                }
+                if reads < RAW_BATCH {
                     break;
                 }
                 busy |= round + 1 == ROUNDS;
