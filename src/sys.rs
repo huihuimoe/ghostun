@@ -14,6 +14,7 @@ use crate::pkt::{self, IPV6_HDR};
 /// fwmark on every frame ghostun sends, so the netfilter RST-suppression rule spares our own RSTs.
 pub const SOCKET_MARK: u32 = 0x6768_7374;
 const SOCKET_BUF: libc::c_int = 4 << 20;
+pub const RAW_BATCH: usize = 64;
 
 fn cvt(ret: libc::c_int) -> io::Result<libc::c_int> {
     if ret < 0 {
@@ -151,13 +152,14 @@ pub fn raw_socket(
     Ok(fd)
 }
 
-pub fn send_raw(fd: BorrowedFd<'_>, frame: &[u8], dst: IpAddr) -> io::Result<()> {
-    #[repr(C)]
-    union Destination {
-        v4: libc::sockaddr_in,
-        v6: libc::sockaddr_in6,
-    }
-    let (addr, len) = match dst {
+#[repr(C)]
+union Destination {
+    v4: libc::sockaddr_in,
+    v6: libc::sockaddr_in6,
+}
+
+fn destination(dst: IpAddr) -> (Destination, libc::socklen_t) {
+    match dst {
         IpAddr::V4(ip) => (
             Destination {
                 v4: libc::sockaddr_in {
@@ -169,7 +171,7 @@ pub fn send_raw(fd: BorrowedFd<'_>, frame: &[u8], dst: IpAddr) -> io::Result<()>
                     sin_zero: [0; 8],
                 },
             },
-            size_of::<libc::sockaddr_in>(),
+            size_of::<libc::sockaddr_in>() as libc::socklen_t,
         ),
         IpAddr::V6(ip) => (
             Destination {
@@ -183,86 +185,147 @@ pub fn send_raw(fd: BorrowedFd<'_>, frame: &[u8], dst: IpAddr) -> io::Result<()>
                     sin6_scope_id: 0,
                 },
             },
-            size_of::<libc::sockaddr_in6>(),
+            size_of::<libc::sockaddr_in6>() as libc::socklen_t,
         ),
-    };
-    // SAFETY: frame and addr are valid for the lengths passed.
-    let n = unsafe {
-        libc::sendto(
-            fd.as_raw_fd(),
-            frame.as_ptr().cast(),
-            frame.len(),
-            libc::MSG_DONTWAIT,
-            (&addr as *const Destination).cast(),
-            len as libc::socklen_t,
-        )
-    };
-    if n < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
     }
 }
 
-/// Normalizes IPv6 raw TCP receives into a complete frame without moving the TCP payload.
-pub fn recv_raw(fd: BorrowedFd<'_>, family: OuterFamily, buf: &mut [u8]) -> io::Result<usize> {
-    // SAFETY: receive buffers and ancillary storage live through recvmsg; CMSG traversal is bounded
-    // by the returned controllen, and the data length is checked before reading pktinfo.
-    unsafe {
-        if family == OuterFamily::Ipv4 {
-            let n = libc::recv(
-                fd.as_raw_fd(),
-                buf.as_mut_ptr().cast(),
-                buf.len(),
-                libc::MSG_DONTWAIT,
-            );
-            return if n < 0 {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(n as usize)
-            };
-        }
-        let mut source: libc::sockaddr_in6 = std::mem::zeroed();
-        let mut control = [0usize; 8];
-        let mut iov = libc::iovec {
-            iov_base: buf[IPV6_HDR..].as_mut_ptr().cast(),
-            iov_len: buf.len() - IPV6_HDR,
+pub fn send_raw(fd: BorrowedFd<'_>, frame: &[u8], dst: IpAddr) -> io::Result<()> {
+    send_raw_batch(fd, frame, frame.len(), &[frame.len()], dst)
+}
+
+pub fn send_raw_batch(
+    fd: BorrowedFd<'_>,
+    bufs: &[u8],
+    stride: usize,
+    lens: &[usize],
+    dst: IpAddr,
+) -> io::Result<()> {
+    let (addr, namelen) = destination(dst);
+    // SAFETY: POD socket structs; initialized for every active index below.
+    let mut iovs: [libc::iovec; RAW_BATCH] = unsafe { std::mem::zeroed() };
+    let mut hdrs: [libc::mmsghdr; RAW_BATCH] = unsafe { std::mem::zeroed() };
+    for (k, &len) in lens.iter().enumerate() {
+        iovs[k] = libc::iovec {
+            iov_base: bufs[k * stride..].as_ptr().cast_mut().cast(),
+            iov_len: len,
         };
-        let mut msg: libc::msghdr = std::mem::zeroed();
-        msg.msg_name = (&mut source as *mut libc::sockaddr_in6).cast();
-        msg.msg_namelen = size_of::<libc::sockaddr_in6>() as libc::socklen_t;
-        msg.msg_iov = &mut iov;
-        msg.msg_iovlen = 1;
-        msg.msg_control = control.as_mut_ptr().cast();
-        msg.msg_controllen = size_of_val(&control);
-        let n = libc::recvmsg(fd.as_raw_fd(), &mut msg, libc::MSG_DONTWAIT);
-        if n < 0 {
+        hdrs[k].msg_hdr.msg_name = (&addr as *const Destination).cast_mut().cast();
+        hdrs[k].msg_hdr.msg_namelen = namelen;
+        hdrs[k].msg_hdr.msg_iov = &mut iovs[k];
+        hdrs[k].msg_hdr.msg_iovlen = 1;
+    }
+    let mut first_err = None;
+    let mut sent = 0;
+    while sent < lens.len() {
+        // SAFETY: hdrs[sent..lens.len()] reference live iovecs, buffers, and destination storage.
+        let n = unsafe {
+            libc::sendmmsg(
+                fd.as_raw_fd(),
+                hdrs[sent..].as_mut_ptr(),
+                (lens.len() - sent) as libc::c_uint,
+                libc::MSG_DONTWAIT,
+            )
+        };
+        if n > 0 {
+            sent += n as usize;
+            continue;
+        }
+        let e = io::Error::last_os_error();
+        if matches!(
+            e.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+        ) {
+            return Err(e);
+        }
+        first_err.get_or_insert(e);
+        sent += 1;
+    }
+    first_err.map_or(Ok(()), Err)
+}
+
+/// Receives up to `RAW_BATCH` frames via `recvmmsg`, normalizing IPv6 headers in place.
+/// Slots with truncated or malformed ancillary data are marked with length `0`.
+pub fn recv_raw_batch(
+    fd: BorrowedFd<'_>,
+    family: OuterFamily,
+    bufs: &mut [u8],
+    stride: usize,
+    lens: &mut [usize; RAW_BATCH],
+) -> io::Result<usize> {
+    // SAFETY: receive buffers and ancillary storage live through recvmmsg; CMSG traversal is
+    // bounded by the returned controllen, and flags are checked before reading pktinfo.
+    unsafe {
+        let mut iovs: [libc::iovec; RAW_BATCH] = std::mem::zeroed();
+        let mut hdrs: [libc::mmsghdr; RAW_BATCH] = std::mem::zeroed();
+        let mut sources: [libc::sockaddr_in6; RAW_BATCH] = std::mem::zeroed();
+        let mut controls = [[0usize; 8]; RAW_BATCH];
+        let offset = if family == OuterFamily::Ipv6 {
+            IPV6_HDR
+        } else {
+            0
+        };
+        for k in 0..RAW_BATCH {
+            iovs[k] = libc::iovec {
+                iov_base: bufs[k * stride + offset..].as_mut_ptr().cast(),
+                iov_len: stride - offset,
+            };
+            hdrs[k].msg_hdr.msg_iov = &mut iovs[k];
+            hdrs[k].msg_hdr.msg_iovlen = 1;
+            if family == OuterFamily::Ipv6 {
+                hdrs[k].msg_hdr.msg_name = (&mut sources[k] as *mut libc::sockaddr_in6).cast();
+                hdrs[k].msg_hdr.msg_namelen = size_of::<libc::sockaddr_in6>() as libc::socklen_t;
+                hdrs[k].msg_hdr.msg_control = controls[k].as_mut_ptr().cast();
+                hdrs[k].msg_hdr.msg_controllen = size_of_val(&controls[k]);
+            }
+        }
+        let m = libc::recvmmsg(
+            fd.as_raw_fd(),
+            hdrs.as_mut_ptr(),
+            RAW_BATCH as libc::c_uint,
+            libc::MSG_DONTWAIT,
+            std::ptr::null_mut(),
+        );
+        if m < 0 {
             return Err(io::Error::last_os_error());
         }
-        if msg.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0 {
-            return Err(invalid("truncated IPv6 raw frame or pktinfo".into()));
-        }
-        let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
-        while !cmsg.is_null() {
-            if (*cmsg).cmsg_level == libc::IPPROTO_IPV6
-                && (*cmsg).cmsg_type == libc::IPV6_PKTINFO
-                && (*cmsg).cmsg_len
-                    >= libc::CMSG_LEN(size_of::<libc::in6_pktinfo>() as u32) as usize
-            {
-                let info =
-                    std::ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast::<libc::in6_pktinfo>());
+        let m = m as usize;
+        for k in 0..m {
+            let msg = &hdrs[k].msg_hdr;
+            let n = hdrs[k].msg_len as usize;
+            if msg.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0 {
+                lens[k] = 0;
+            } else if family == OuterFamily::Ipv4 {
+                lens[k] = n;
+            } else if let Some(dst) = pktinfo_dst(msg) {
                 pkt::write_ipv6_header(
-                    buf,
-                    Ipv6Addr::from(source.sin6_addr.s6_addr),
-                    Ipv6Addr::from(info.ipi6_addr.s6_addr),
-                    n as usize,
+                    &mut bufs[k * stride..(k + 1) * stride],
+                    Ipv6Addr::from(sources[k].sin6_addr.s6_addr),
+                    dst,
+                    n,
                 );
-                return Ok(IPV6_HDR + n as usize);
+                lens[k] = IPV6_HDR + n;
+            } else {
+                lens[k] = 0;
             }
-            cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
         }
-        Err(invalid("missing IPv6 destination pktinfo".into()))
+        Ok(m)
     }
+}
+
+unsafe fn pktinfo_dst(msg: &libc::msghdr) -> Option<Ipv6Addr> {
+    let mut cmsg = libc::CMSG_FIRSTHDR(msg);
+    while !cmsg.is_null() {
+        if (*cmsg).cmsg_level == libc::IPPROTO_IPV6
+            && (*cmsg).cmsg_type == libc::IPV6_PKTINFO
+            && (*cmsg).cmsg_len >= libc::CMSG_LEN(size_of::<libc::in6_pktinfo>() as u32) as usize
+        {
+            let info = std::ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast::<libc::in6_pktinfo>());
+            return Some(Ipv6Addr::from(info.ipi6_addr.s6_addr));
+        }
+        cmsg = libc::CMSG_NXTHDR(msg, cmsg);
+    }
+    None
 }
 
 /// Pins the calling thread to `explicit` CPU if set, else the `worker`-th allowed CPU (wrapping).

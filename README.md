@@ -141,12 +141,14 @@ sysctl -w net.ipv4.ip_forward=1 net.ipv6.conf.all.forwarding=1
 
 ## Performance
 
-Measured inside a single 4-vCPU VM (AMD EPYC-Genoa, Linux 7.2) running Entry (`--cpus 0-1`), a stateful `nftables` firewall, Exit (`--cpus 2-3`), and `iperf3 -P 8` across isolated network namespaces in Docker with `--conns 2` (outer MTU `1420`):
+Measured inside a single 4-vCPU VM (AMD EPYC-Genoa, Linux 7.2) running Entry, a stateful `nftables` firewall, Exit, and `iperf3 -P 8` across isolated network namespaces in Docker (outer MTU `1420`):
 
-| Outer family | Inner IPv4 upload | Inner IPv6 download | Entry RSS | Exit RSS |
-|---|---|---|---|---|
-| IPv4 (TUN MTU 1380) | 2.30 Gbit/s | 2.29 Gbit/s | ~2.9 MB | ~2.9 MB |
-| IPv6 (TUN MTU 1360) | 2.00 Gbit/s | 1.99 Gbit/s | ~3.0 MB | ~2.9 MB |
+| `--conns` (CPU pinning) | Outer family | Inner IPv4 upload | Inner IPv6 download | Entry RSS | Exit RSS |
+|---|---|---|---|---|---|
+| `2` (`0-1` / `2-3`) | IPv4 (TUN MTU 1380) | 2.20 Gbit/s | 2.88 Gbit/s | ~3.1 MB | ~3.1 MB |
+| `2` (`0-1` / `2-3`) | IPv6 (TUN MTU 1360) | 1.92 Gbit/s | 2.33 Gbit/s | ~3.1 MB | ~3.1 MB |
+| `4` (shared 4 vCPUs) | IPv4 (TUN MTU 1380) | 2.19 Gbit/s | 2.97 Gbit/s | ~3.3 MB | ~3.3 MB |
+| `4` (shared 4 vCPUs) | IPv6 (TUN MTU 1360) | 2.30 Gbit/s | 2.68 Gbit/s | ~3.4 MB | ~3.3 MB |
 
 Stripped release binary size is ~800 KB.
 

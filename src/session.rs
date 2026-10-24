@@ -131,6 +131,10 @@ impl Session {
         self.state
     }
 
+    pub fn mss(&self) -> u16 {
+        self.cfg.mss
+    }
+
     pub fn start(&mut self, now: Instant, out: &mut impl Sink) {
         if self.cfg.mode == Mode::Entry {
             self.connect(now, out);
