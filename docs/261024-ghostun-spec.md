@@ -73,7 +73,7 @@ Design and deliver `ghostun`: a high-performance, low-memory L3-over-FakeTCP tun
 - Compile the system as one `ghostun` executable. Select the role with `ghostun entry` / `ghostun exit`, or with `mode = "entry" | "exit"` in the configuration file.
 - Remove legacy reference directories from the repository and organize the core modules directly under the project root: CLI/configuration, Netlink/TUN device management, Netfilter lifecycle, zero-copy packet encoding/decoding and BPF generation, the FakeTCP session state machine, and pinned Entry/Exit worker loops.
 - Expose operational settings through CLI and configuration files. The mandatory 32-byte `auth_key` is TOML-only, encoded as 64 hexadecimal characters and validated before networking. Explicit CLI arguments take precedence over other `--config` values:
-  - `--tun <NAME>`: name of the inner TUN to create and bind; alias `--tun-name`, default `ghostun0`. Supports isolated instances on one host.
+  - `--tun <NAME>`: name of the inner TUN to create and bind; default `ghostun0`. Supports isolated instances on one host.
   - `--tun-ipv4 <CIDR>` / `--tun-ipv6 <CIDR>`: inner addresses. Entry defaults to `10.200.0.1/30` and `fd00:200::1/126`; Exit defaults to `10.200.0.2/30` and `fd00:200::2/126`.
   - `--conns <N>`: number of persistent outer FakeTCP connections and pinned worker threads; defaults to the system CPU core count.
   - `--outer-mtu <MTU>` / `--tun-mtu <MTU>`: explicit outer physical-path MTU or inner TUN MTU.

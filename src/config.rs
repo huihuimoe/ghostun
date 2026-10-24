@@ -7,17 +7,17 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use argh::{FromArgValue, FromArgs};
 use serde::Deserialize;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, FromArgValue)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
     Entry,
     Exit,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, ValueEnum)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, FromArgValue)]
 #[serde(rename_all = "lowercase")]
 pub enum OuterFamily {
     #[default]
@@ -196,80 +196,66 @@ impl Config {
     }
 }
 
-#[derive(Parser, Debug)]
-#[command(
+#[derive(FromArgs, Debug)]
+#[argh(
     name = "ghostun",
-    version,
-    about = "L3-over-FakeTCP tunnel with per-core BPF steering"
+    description = "L3-over-FakeTCP tunnel with per-core BPF steering.",
+    help_triggers("-h", "--help", "help")
 )]
 struct Cli {
-    /// TOML configuration file; CLI flags override its values.
-    #[arg(long, global = true, value_name = "PATH")]
+    /// print version information and exit
+    #[argh(switch, short = 'V')]
+    version: bool,
+    /// TOML configuration file; CLI flags override its values
+    #[argh(option, arg_name = "PATH")]
     config: Option<PathBuf>,
-    #[command(subcommand)]
-    role: Option<Role>,
-}
-
-#[derive(Subcommand, Debug)]
-enum Role {
-    /// Entry node: dials the exit node.
-    Entry {
-        /// Exit node outer address.
-        #[arg(long, value_name = "IP:PORT")]
-        remote: Option<SocketAddr>,
-        #[command(flatten)]
-        common: Common,
-    },
-    /// Exit node: accepts entry connections and NATs inner traffic.
-    Exit {
-        /// Outer FakeTCP listen port.
-        #[arg(long, value_name = "PORT")]
-        listen: Option<u16>,
-        /// Outer address family; entry derives it from --remote [default: ipv4].
-        #[arg(long, value_enum)]
-        outer_family: Option<OuterFamily>,
-        #[command(flatten)]
-        common: Common,
-    },
-}
-
-#[derive(Args, Debug, Default)]
-struct Common {
-    /// Inner TUN interface name [default: ghostun0].
-    #[arg(long = "tun", visible_alias = "tun-name", value_name = "NAME")]
+    /// node role: entry or exit
+    #[argh(positional)]
+    role: Option<Mode>,
+    /// exit node outer address (entry only)
+    #[argh(option, arg_name = "IP:PORT")]
+    remote: Option<SocketAddr>,
+    /// outer FakeTCP listen port (exit only)
+    #[argh(option, arg_name = "PORT")]
+    listen: Option<u16>,
+    /// outer address family; entry derives it from --remote [default: ipv4]
+    #[argh(option)]
+    outer_family: Option<OuterFamily>,
+    /// inner TUN interface name [default: ghostun0]
+    #[argh(option, long = "tun", arg_name = "NAME")]
     tun_name: Option<String>,
-    /// Inner IPv4 address [default: entry 10.200.0.1/30, exit 10.200.0.2/30].
-    #[arg(long, value_name = "CIDR")]
+    /// inner IPv4 address [default: entry 10.200.0.1/30, exit 10.200.0.2/30]
+    #[argh(option, arg_name = "CIDR")]
     tun_ipv4: Option<String>,
-    /// Inner IPv6 address [default: entry fd00:200::1/126, exit fd00:200::2/126].
-    #[arg(long, value_name = "CIDR")]
+    /// inner IPv6 address [default: entry fd00:200::1/126, exit fd00:200::2/126]
+    #[argh(option, arg_name = "CIDR")]
     tun_ipv6: Option<String>,
-    /// Outer connections = worker threads; must match on both ends [default: CPU count].
-    #[arg(long, value_name = "N")]
+    /// outer connections = worker threads; must match on both ends [default: CPU count]
+    #[argh(option, arg_name = "N")]
     conns: Option<u16>,
-    /// Outer path MTU [default: egress interface MTU, fallback 1500].
-    #[arg(long, value_name = "MTU")]
+    /// outer path MTU [default: egress interface MTU, fallback 1500]
+    #[argh(option, arg_name = "MTU")]
     outer_mtu: Option<u32>,
-    /// Inner TUN MTU [default: outer MTU - 40 for IPv4, - 60 for IPv6].
-    #[arg(long, value_name = "MTU")]
+    /// inner TUN MTU [default: outer MTU - 40 for IPv4, - 60 for IPv6]
+    #[argh(option, arg_name = "MTU")]
     tun_mtu: Option<u32>,
-    /// Outer egress interface [default: from routing table].
-    #[arg(long, value_name = "IFACE")]
+    /// outer egress interface [default: from routing table]
+    #[argh(option, arg_name = "IFACE")]
     iface: Option<String>,
-    /// First outer source port of the entry port pool [default: 32768].
-    #[arg(long, value_name = "PORT")]
+    /// first outer source port of the entry port pool [default: 32768]
+    #[argh(option, arg_name = "PORT")]
     base_port: Option<u16>,
-    /// Health ping interval in seconds [default: 5].
-    #[arg(long, value_name = "SECS")]
+    /// health ping interval in seconds [default: 5]
+    #[argh(option, arg_name = "SECS")]
     ping_interval: Option<u64>,
-    /// Reconnect after this many seconds without traffic from the peer [default: 15].
-    #[arg(long, value_name = "SECS")]
+    /// reconnect after this many seconds without traffic from the peer [default: 15]
+    #[argh(option, arg_name = "SECS")]
     dead_timeout: Option<u64>,
-    /// Do not configure inner IPv6.
-    #[arg(long)]
+    /// do not configure inner IPv6
+    #[argh(switch)]
     no_ipv6: bool,
-    /// Do not touch nftables or sysctl.
-    #[arg(long)]
+    /// do not touch nftables or sysctl
+    #[argh(switch)]
     no_netfilter: bool,
 }
 
@@ -301,13 +287,36 @@ pub fn load() -> Result<Config, String> {
     parse_from(std::env::args_os())
 }
 
-/// `--help`/`--version` and usage errors exit the process through clap, like any CLI.
+/// `--help`/`--version` and usage errors exit the process, like any CLI.
 pub fn parse_from<I, T>(args: I) -> Result<Config, String>
 where
     I: IntoIterator<Item = T>,
-    T: Into<OsString> + Clone,
+    T: Into<OsString>,
 {
-    let cli = Cli::try_parse_from(args).unwrap_or_else(|e| e.exit());
+    let owned: Vec<String> = args
+        .into_iter()
+        .map(|arg| {
+            arg.into()
+                .into_string()
+                .map_err(|_| "CLI arguments must be valid UTF-8".to_owned())
+        })
+        .collect::<Result<_, _>>()?;
+    let strs: Vec<&str> = owned.iter().map(String::as_str).collect();
+    let (cmd, rest) = strs.split_first().unwrap_or((&"ghostun", &[]));
+    let cli = Cli::from_args(&[cmd], rest).unwrap_or_else(|early_exit| match early_exit.status {
+        Ok(()) => {
+            println!("{}", early_exit.output);
+            std::process::exit(0);
+        }
+        Err(()) => {
+            eprintln!("{}", early_exit.output);
+            std::process::exit(1);
+        }
+    });
+    if cli.version {
+        println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+        std::process::exit(0);
+    }
     let file = match &cli.config {
         Some(path) => {
             let text = std::fs::read_to_string(path)
@@ -318,30 +327,18 @@ where
         }
         None => File::default(),
     };
-    let (mode, common, remote, listen, outer_family) = match cli.role {
-        Some(Role::Entry { remote, common }) => (Mode::Entry, common, remote, None, None),
-        Some(Role::Exit {
-            listen,
-            outer_family,
-            common,
-        }) => (Mode::Exit, common, None, listen, outer_family),
-        None => (
-            file.mode
-                .ok_or("missing role: use `entry`/`exit` or set `mode` in the config file")?,
-            Common::default(),
-            None,
-            None,
-            None,
-        ),
-    };
-    if file.mode.is_some_and(|m| m != mode) {
+    let mode = cli
+        .role
+        .or(file.mode)
+        .ok_or("missing role: use `entry`/`exit` or set `mode` in the config file")?;
+    if cli.role.is_some() && file.mode.is_some_and(|m| m != mode) {
         return Err(format!(
             "role {mode:?} conflicts with `mode` in the config file"
         ));
     }
-    let remote = remote.or(file.remote);
-    let listen = listen.or(file.listen);
-    let outer_family = outer_family.or(file.outer_family);
+    let remote = cli.remote.or(file.remote);
+    let listen = cli.listen.or(file.listen);
+    let outer_family = cli.outer_family.or(file.outer_family);
     if mode == Mode::Entry && outer_family.is_some() {
         return Err(
             "`outer_family` is only valid in exit mode; entry uses the remote address family"
@@ -360,18 +357,17 @@ where
         Mode::Entry => ("10.200.0.1/30", "fd00:200::1/126"),
         Mode::Exit => ("10.200.0.2/30", "fd00:200::2/126"),
     };
-    let tun_ipv4 = common
+    let tun_ipv4 = cli
         .tun_ipv4
         .or(file.tun_ipv4)
         .as_deref()
         .unwrap_or(v4_default)
         .parse()?;
-    let tun_ipv6 = if common.no_ipv6 || file.no_ipv6 {
+    let tun_ipv6 = if cli.no_ipv6 || file.no_ipv6 {
         None
     } else {
         Some(
-            common
-                .tun_ipv6
+            cli.tun_ipv6
                 .or(file.tun_ipv6)
                 .as_deref()
                 .unwrap_or(v6_default)
@@ -386,22 +382,20 @@ where
             .as_deref()
             .ok_or("missing TOML `auth_key`")?
             .parse()?,
-        tun_name: common
+        tun_name: cli
             .tun_name
             .or(file.tun_name)
             .unwrap_or_else(|| "ghostun0".into()),
         tun_ipv4,
         tun_ipv6,
-        conns: common.conns.or(file.conns).unwrap_or(default_conns),
-        outer_mtu: common.outer_mtu.or(file.outer_mtu),
-        tun_mtu: common.tun_mtu.or(file.tun_mtu),
-        iface: common.iface.or(file.iface),
-        base_port: common.base_port.or(file.base_port).unwrap_or(32768),
-        ping_interval: Duration::from_secs(
-            common.ping_interval.or(file.ping_interval).unwrap_or(5),
-        ),
-        dead_timeout: Duration::from_secs(common.dead_timeout.or(file.dead_timeout).unwrap_or(15)),
-        netfilter: !(common.no_netfilter || file.no_netfilter),
+        conns: cli.conns.or(file.conns).unwrap_or(default_conns),
+        outer_mtu: cli.outer_mtu.or(file.outer_mtu),
+        tun_mtu: cli.tun_mtu.or(file.tun_mtu),
+        iface: cli.iface.or(file.iface),
+        base_port: cli.base_port.or(file.base_port).unwrap_or(32768),
+        ping_interval: Duration::from_secs(cli.ping_interval.or(file.ping_interval).unwrap_or(5)),
+        dead_timeout: Duration::from_secs(cli.dead_timeout.or(file.dead_timeout).unwrap_or(15)),
+        netfilter: !(cli.no_netfilter || file.no_netfilter),
         remote,
         listen,
         outer_family,
@@ -578,7 +572,7 @@ mod tests {
     #[test]
     fn all_flags_apply() {
         let c = entry(&[
-            "--tun-name",
+            "--tun",
             "wan7",
             "--tun-ipv4",
             "10.9.0.1/24",
@@ -615,7 +609,6 @@ mod tests {
             (Duration::from_secs(2), Duration::from_secs(7))
         );
         assert!(!c.netfilter);
-        assert_eq!(entry(&["--tun", "t1"]).unwrap().tun_name, "t1");
     }
 
     #[test]
@@ -657,6 +650,16 @@ mod tests {
         assert_eq!(c.tun_name, "fromcli");
         assert_eq!(c.dead_timeout, Duration::from_secs(30));
         assert_eq!(c.remote, Some("203.0.113.1:80".parse().unwrap()));
+        let c = with_file(
+            "override-file-mode",
+            &format!("mode = \"entry\"\n{toml}"),
+            &["--conns", "7"],
+        )
+        .unwrap();
+        assert_eq!(
+            (c.mode, c.conns, c.tun_name.as_str()),
+            (Mode::Entry, 7, "fromfile")
+        );
     }
 
     #[test]

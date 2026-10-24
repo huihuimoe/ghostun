@@ -11,10 +11,10 @@ name = "ghostun"
 path = "src/main.rs"
 
 [dependencies]
-clap = { version = "4", features = ["derive"] }
+argh = "0.1.19"
 libc = "0.2"
 log = "0.4"
-env_logger = "0.11"
+env_logger = { version = "0.11", default-features = false, features = ["humantime"] }
 serde = { version = "1", features = ["derive"] }
 toml = "1.1.8"
 hmac = "0.13.0"

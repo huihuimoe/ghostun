@@ -1,42 +1,35 @@
 # ghostun
 
-High-performance, low-memory L3-over-FakeTCP tunnel for Linux. One binary, two roles:
+`ghostun` is a lightweight Linux L3-over-FakeTCP tunnel for paths behind stateful firewalls that drop UDP or cap concurrent TCP connections.
 
-- **entry** — runs next to your proxy server. The proxy sends decrypted outbound traffic into the `ghostun0` TUN device.
-- **exit** — decapsulates and lets the kernel `MASQUERADE` the traffic to the internet. No user-space proxy runs there.
+One binary runs in two roles:
 
-Built for paths behind stateful firewalls that drop non-TCP traffic, cap concurrent TCP connections, and silently drop conntrack state. Design and rationale: [`docs/261024-ghostun-spec.md`](docs/261024-ghostun-spec.md).
+- **Entry** sits next to your proxy server and exposes a `ghostun0` TUN device.
+- **Exit** decapsulates traffic from the tunnel and NATs it to the internet.
 
 ```mermaid
 flowchart LR
-  C[clients] --> P[proxy on entry] -->|bind ghostun0| E[ghostun entry]
-  E ==>|N fake TCP connections| FW{{stateful firewall}} ==> X[ghostun exit]
-  X -->|ghostun0 + MASQUERADE| I[internet]
+  C[Clients] --> P[Proxy on Entry] -->|bind ghostun0| E[ghostun entry]
+  E ==>|N FakeTCP connections| FW{{Stateful firewall}} ==> X[ghostun exit]
+  X -->|ghostun0 + MASQUERADE| I[Internet]
 ```
 
-## How it works
+## Requirements
 
-- **One multi-queue TUN, raw outer sockets.** Inner packets cross the TUN boundary once per node. Outer frames use `SOCK_RAW` with `IP_HDRINCL` (IPv4) or `IPV6_HDRINCL` (IPv6): 40 B or 60 B of IP + TCP headers, no outer TUN, no outer NAT.
-- **Exactly N steady-state outer connections.** `--conns N` workers, each pinned to one CPU, own one authenticated connection (SYN with MSS, SACK_PERM, WScale 14). Candidate handshakes may temporarily add conntrack entries; authenticated replacement resets the retired tuple.
-- **Kernel steering.** Each worker's raw socket has a classic BPF filter, so worker `i` only receives its own connection (entry: `dport % N == i`, exit: `sport % N == i`). No locks or channels between cores.
-- **No outer retransmission.** Inner TCP handles loss, so there is no TCP-over-TCP meltdown. Sequence and ack numbers advance for every frame. A bare ACK goes out after 1 MiB of one-way data, which keeps the firewall's window tracking satisfied.
-- **Unframed data, separate control.** Payloads starting with `0x01` or `0x02` are health ping/pong frames; `0x03` identifies connection-time authentication. IPv4/IPv6 packets start with `0x4`/`0x6`, so data frames carry no extra framing.
-- **Self-healing.** Both sides ping every `--ping-interval`. If the entry hears nothing for `--dead-timeout`, it sends 2 RSTs on the old tuple, moves to the next source port of its residue class, and authenticates again. The exit answers stray non-SYN data with RST, triggering reconnection without waiting for the Entry dead timer.
-- **Independent inner and outer families.** Inner IPv4 and IPv6 work over either IPv4 or IPv6 outer transport. Each instance uses one outer family, without simultaneous dual-stack listening or automatic family switching.
-- **Mandatory mutual authentication.** Each worker proves possession of the same random 32-byte key after the ordinary TCP handshake. Authentication adds about two setup RTTs, not steady-state MACs, data headers, or exchanges. Unauthenticated candidates cannot replace or keep an active session alive.
+- Linux with `CAP_NET_ADMIN` and `CAP_NET_RAW` (or root)
+- `iproute2` (`ip`) and `nftables` (`nft`, unless `--no-netfilter` is set)
+- Inbound TCP allowed on the Exit `--listen` port
 
 ## Build
 
 ```sh
-cargo build --release        # target/release/ghostun, ~2 MB, ~4 MB RSS at runtime
-docker build -t ghostun .    # Chainguard rust build stage, wolfi-base runtime (~50 MB)
+cargo build --release --locked
+docker build -t ghostun .
 ```
-
-Runtime needs `ip` (iproute2) and, unless `--no-netfilter` is set, `nft` (nftables). It also needs `CAP_NET_ADMIN` + `CAP_NET_RAW` (in practice, root).
 
 ## Quick start
 
-Generate a key-only config once, then securely copy the same file to both nodes. This uses standard Linux tools; the key is not passed through process arguments:
+1. Generate a shared 32-byte key file (`0600`) and copy it to both hosts:
 
 ```sh
 umask 077
@@ -47,31 +40,26 @@ umask 077
 } > auth.toml
 ```
 
+2. Start Exit and Entry (`--conns` must match on both ends):
+
 ```sh
-# exit (public IP 203.0.113.10)
+# Exit (IPv4 outer)
 ghostun --config auth.toml exit --listen 443 --conns 4
 
-# entry
+# Entry (IPv4 outer)
 ghostun --config auth.toml entry --remote 203.0.113.10:443 --conns 4
 ```
 
-For an IPv6 outer path:
+For an IPv6 outer path, set `--outer-family ipv6` on Exit and pass a bracketed IPv6 address on Entry:
 
 ```sh
-# exit (public IPv6 address 2001:db8::10)
 ghostun --config auth.toml exit --listen 443 --outer-family ipv6 --conns 4
-
-# entry: bracket the IPv6 literal; its family is selected automatically
 ghostun --config auth.toml entry --remote '[2001:db8::10]:443' --conns 4
 ```
 
-Exit defaults to `--outer-family ipv4`. `--outer-family` / TOML `outer_family` is Exit-only; Entry derives the family from `remote`. `--no-ipv6` disables only inner IPv6 and does not disable an IPv6 outer path. Remote addresses must be IP literals, not hostnames.
+3. Bind your proxy outbound to `ghostun0` (Entry does not alter system routes):
 
-`--conns` **must be identical on both ends**. Allow inbound TCP to the listen port on the exit.
-
-The entry does not change your routing table. Point the proxy at the TUN device instead.
-
-sing-box:
+**sing-box**
 
 ```json
 {
@@ -83,7 +71,7 @@ sing-box:
 }
 ```
 
-xray:
+**xray**
 
 ```json
 {
@@ -93,106 +81,34 @@ xray:
 }
 ```
 
-Several instances can share a host if each one has a different `--tun` name, inner subnet, and port (`--listen` on exit; `--base-port` range on entry).
+## CLI and configuration
 
-## CLI
-
-```
-ghostun --config PATH entry --remote IP:PORT [options]
-ghostun --config PATH exit  --listen PORT    [options]
-ghostun --config PATH          # role taken from `mode` in the file
+```text
+ghostun [options] [entry|exit]
 ```
 
-| Flag | Default | Meaning |
+| Flag | Default | Description |
 |---|---|---|
-| `--tun`, `--tun-name NAME` | `ghostun0` | Inner TUN device name (`[A-Za-z0-9_.-]`, ≤15 chars) |
-| `--tun-ipv4 CIDR` | entry `10.200.0.1/30`, exit `10.200.0.2/30` | Inner IPv4 address |
-| `--tun-ipv6 CIDR` | entry `fd00:200::1/126`, exit `fd00:200::2/126` | Inner IPv6 address |
-| `--no-ipv6` | off | No inner IPv6. If the kernel has IPv6 disabled, ghostun logs a warning and continues without it |
-| `--conns N` | CPU count | Outer connections = pinned worker threads (1–256) |
-| `--outer-mtu MTU` | egress interface MTU, else 1500 | Outer path MTU |
-| `--tun-mtu MTU` | `outer_mtu - 40` (IPv4 outer), `outer_mtu - 60` (IPv6 outer) | Inner MTU (≥1280 with inner IPv6); must fit the outer MTU |
-| `--iface IFACE` | from routing table | Outer egress interface. Entry: source address. Exit: also limits masquerade to this interface |
-| `--base-port PORT` | `32768` | Entry: lowest outer source port |
-| `--ping-interval SECS` | `5` | Health ping period |
-| `--dead-timeout SECS` | `15` | Silence before reconnect (entry) or dropping the peer (exit) |
-| `--no-netfilter` | off | Do not touch nftables or sysctl |
-| `--remote IP:PORT` | — | Entry only, required |
-| `--listen PORT` | — | Exit only, required |
-| `--outer-family ipv4\|ipv6` | `ipv4` | Exit only: outer transport family; Entry uses `--remote` |
+| `--config PATH` | — | TOML configuration file (required for `auth_key`) |
+| `--remote IP:PORT` | — | Entry only: Exit outer address (IP literal) |
+| `--listen PORT` | — | Exit only: outer listen port |
+| `--outer-family ipv4\|ipv6` | `ipv4` | Exit only: outer transport family (Entry derives it from `--remote`) |
+| `--conns N` | CPU count | Number of pinned workers and outer connections (`1..=256`) |
+| `--tun NAME` | `ghostun0` | Inner TUN device name (`[A-Za-z0-9_.-]`, up to 15 chars) |
+| `--tun-ipv4 CIDR` | `10.200.0.1/30` / `.2/30` | Inner IPv4 address (Entry / Exit) |
+| `--tun-ipv6 CIDR` | `fd00:200::1/126` / `::2/126` | Inner IPv6 address (Entry / Exit) |
+| `--no-ipv6` | off | Disable inner IPv6 |
+| `--outer-mtu MTU` | egress MTU or `1500` | Outer path MTU |
+| `--tun-mtu MTU` | `outer_mtu - 40` / `- 60` | Inner TUN MTU (IPv4 / IPv6 outer overhead) |
+| `--iface IFACE` | route lookup | Outer egress interface |
+| `--base-port PORT` | `32768` | Entry only: starting source port |
+| `--ping-interval SECS` | `5` | Health probe interval |
+| `--dead-timeout SECS` | `15` | Silence timeout before reconnecting |
+| `--no-netfilter` | off | Skip automatic `nftables` and `sysctl` setup |
+| `-V`, `--version` | — | Print version and exit |
+| `-h`, `--help` | — | Show help and exit |
 
-Logging: `RUST_LOG=debug ghostun ...` (default `info`).
-
-## Config file
-
-Both roles require a file-only `auth_key`: exactly 64 hexadecimal characters encoding 32 random bytes. A missing or malformed key is rejected before networking starts. There is no CLI key argument, password mode, bypass, or legacy fallback. Keep configuration files mode `0600`; never use a public example key. Start with the generated `auth.toml` above and add the settings below.
-
-Other TOML keys are the long flag names in snake_case. CLI flags override the file. Unknown keys are rejected. See [`deploy/config.example.toml`](deploy/config.example.toml).
-
-```toml
-mode = "exit"
-listen = 443
-conns = 4
-iface = "eth0"
-```
-
-## Authentication and security
-
-- The key is shared by one trust domain. Any holder may replace a session, including from a changed source address; there are no individual identities, permissions, or revocation. Avoid duplicate Entry deployments with the same key.
-- Authentication protects admission, not established packets: there is no tunnel encryption, per-packet integrity, or established-packet replay protection. On-path attackers or attackers able to forge accepted data, health frames, or RSTs remain outside this protection.
-- Stateless candidates cannot reserve the only authentication slot, but this is not DDoS protection or scanner invisibility. Optional operator-managed source allowlists remain defense in depth, not a requirement for fixed Entry addresses.
-- Rotate keys by securely updating both configuration files and restarting both peers. Hot rotation and unauthenticated-version interoperability are unsupported.
-
-Wire format, replay handling, and retry rules: [`docs/261024-handshake-auth-spec.md`](docs/261024-handshake-auth-spec.md).
-
-## MTU and MSS
-
-The tunnel adds 40 bytes over outer IPv4 or 60 bytes over outer IPv6, so the default TUN MTU is `outer_mtu - overhead`:
-
-| Outer MTU | TUN MTU over IPv4 | TUN MTU over IPv6 |
-|---|---|---|
-| 1500 | 1460 | 1440 |
-| 1492 | 1452 | 1432 |
-| 1420 | 1380 | 1360 |
-
-Inner TCP SYNs crossing `ghostun0` get their MSS clamped to the route MTU (`tcp option maxseg size set rt mtu`). Set `--outer-mtu` if the real path MTU is lower than the local interface MTU; there is no automatic path-MTU adjustment or tunnel fragmentation/reassembly layer.
-
-Before changing networking, ghostun rejects explicit or detected MTUs that cannot carry the configured inner packets. With inner IPv6 enabled, the TUN MTU must be at least 1280: this requires outer MTU ≥1320 over IPv4 or ≥1340 over IPv6. Outer IPv6 itself requires MTU ≥1280. An explicit `--tun-mtu` cannot exceed `outer_mtu - overhead`.
-
-## Netfilter
-
-Without `--no-netfilter`, ghostun owns the table `inet ghostun_<tun>` (for example `ghostun_ghostun0`):
-
-- On start, it deletes any stale table left by a crash and creates a new one, atomically.
-- On SIGINT/SIGTERM, it deletes the table. The TUN device has no `IFF_PERSIST`, so the kernel removes it even after SIGKILL. In that case, the table remains until the next start.
-
-Equivalent rules if you manage the firewall yourself (`--no-netfilter`), shown here for the exit with listen port 443:
-
-```nft
-table inet ghostun_ghostun0 {
-    chain output {
-        type filter hook output priority filter; policy accept;
-        # The kernel has no socket for the tunnel tuples and would RST the peer.
-        # ghostun's own RSTs carry fwmark 0x67687374 and pass.
-        meta nfproto ipv4 tcp sport 443 tcp flags rst meta mark != 0x67687374 drop
-        oifname "ghostun0" tcp flags syn tcp option maxseg size set rt mtu
-    }
-    chain forward {
-        type filter hook forward priority filter; policy accept;
-        oifname "ghostun0" tcp flags syn tcp option maxseg size set rt mtu
-        iifname "ghostun0" tcp flags syn tcp option maxseg size set rt mtu
-    }
-    chain postrouting {   # exit only
-        type nat hook postrouting priority srcnat; policy accept;
-        ip saddr 10.200.0.0/30 oifname != "ghostun0" masquerade
-        ip6 saddr fd00:200::/126 oifname != "ghostun0" masquerade
-    }
-}
-```
-
-On the entry, the RST rule matches the outer tuple instead: `ip daddr <exit_ip> tcp dport <exit_port> tcp sport >= <base_port>`. For IPv6 outer transport, use `ip6 daddr` on Entry and `meta nfproto ipv6` in the Exit RST rule above. Inner masquerade rules remain independent of the outer family. Exit also needs `net.ipv4.ip_forward=1` (and `net.ipv6.conf.all.forwarding=1` for inner IPv6). Ghostun sets these on start unless they are already set.
-
-Ghostun configures the TUN before installing firewall rules. If the kernel rejects inner IPv6 configuration, it logs a warning and continues with inner IPv4, without accessing IPv6 forwarding sysctls or installing IPv6 masquerade rules. This does not change the selected outer family: an IPv6 outer path still requires kernel IPv6 support.
+All CLI options can be placed in the TOML file using `snake_case` keys (`mode = "entry"` or `"exit"`). Explicit CLI flags override file values. See [`deploy/config.example.toml`](deploy/config.example.toml).
 
 ## Deployment
 
@@ -201,39 +117,43 @@ Ghostun configures the TUN before installing firewall rules. If the kernel rejec
 ```sh
 install -m755 target/release/ghostun /usr/local/bin/
 install -d -m700 /etc/ghostun
-install -m600 deploy/config.example.toml /etc/ghostun/entry.toml  # edit; add the generated auth_key
+install -m600 deploy/config.example.toml /etc/ghostun/entry.toml  # set auth_key and role settings
 install -m644 deploy/ghostun-entry.service /etc/systemd/system/
 systemctl enable --now ghostun-entry
 ```
 
-Use `exit.toml` and `ghostun-exit.service` on the exit. Both files must contain the same generated `auth_key` before starting the services.
+Use `exit.toml` and `deploy/ghostun-exit.service` on the Exit host.
 
 ### Docker Compose
 
 ```sh
 cd deploy
-install -m600 config.example.toml entry.toml   # edit; add the generated auth_key
+install -m600 config.example.toml entry.toml   # set auth_key and role settings
 docker compose -f docker-compose.entry.yml up -d --build
 ```
 
-The containers use host networking with `NET_ADMIN`, `NET_RAW` and `/dev/net/tun`. `/proc/sys` is read-only inside them, so enable forwarding on the exit host first:
+For Exit, enable IP forwarding on the host before starting `docker-compose.exit.yml`:
 
 ```sh
 sysctl -w net.ipv4.ip_forward=1 net.ipv6.conf.all.forwarding=1
 ```
 
-## Troubleshooting
+## Performance
 
-- **Firewall connection count**: on a box that sees the traffic, `conntrack -L -p tcp --dport <listen>` should show exactly N `ESTABLISHED` entries.
-- **`peer silent ..., reconnecting` loops**: check `--conns` matches on both ends, the exit port is reachable, and nothing else on the hosts answers or drops the tunnel tuples.
-- **Large transfers stall but ping works**: the path MTU is below the interface MTU. Set `--outer-mtu`.
+Measured inside a single 4-vCPU VM (AMD EPYC-Genoa, Linux 7.2) running Entry, a stateful `nftables` firewall, Exit, and `iperf3 -P 8` across isolated network namespaces in Docker (outer MTU `1420`):
 
-## Testing
+| `--conns` | Outer family | Inner IPv4 upload | Inner IPv6 download | Entry RSS | Exit RSS |
+|---|---|---|---|---|---|
+| `2` | IPv4 (TUN MTU 1380) | 1.25 Gbit/s | 1.30 Gbit/s | ~3.0 MB | ~3.0 MB |
+| `2` | IPv6 (TUN MTU 1360) | 1.25 Gbit/s | 1.14 Gbit/s | ~2.9 MB | ~2.9 MB |
+| `4` | IPv4 (TUN MTU 1380) | 1.89 Gbit/s | 2.31 Gbit/s | ~3.0 MB | ~3.0 MB |
+| `4` | IPv6 (TUN MTU 1360) | 1.74 Gbit/s | 1.78 Gbit/s | ~3.0 MB | ~3.0 MB |
 
-See [tests/README.md](tests/README.md) for unit tests and isolated network integration tests.
+Stripped release binary size is ~800 KB.
 
-## What to handle separately
+## Operational notes
 
-- **Confidentiality:** ghostun does not encrypt tunnel traffic. Use encryption outside the tunnel when the traffic requires it.
-- **Application-layer filtering:** ghostun does not disguise payloads as TLS, HTTP, or another application protocol. Use a transport designed for that environment if the network inspects application payloads.
-- **Proxy services:** keep proxy protocol termination, client authentication, and traffic accounting in your proxy software; ghostun does not provide them.
+- **MTU:** Outer headers take 40 bytes over IPv4 and 60 bytes over IPv6. If your path MTU is lower than the NIC MTU (for example PPPoE `1492` or cloud VPC `1420`) and large transfers stall while ping works, set `--outer-mtu`.
+- **Firewall rules:** Unless `--no-netfilter` is set, `ghostun` manages `table inet ghostun_<tun>` (kernel RST suppression, MSS clamping, and Exit masquerade) and cleans it up on `SIGINT`/`SIGTERM`.
+- **Security boundary:** `auth_key` authenticates tunnel handshakes so stray clients cannot claim worker slots. `ghostun` does not encrypt traffic or disguise payloads as TLS/HTTP; keep encryption and client authentication in your proxy layer.
+- **Further docs:** [Testing guide](tests/README.md), [architecture spec](docs/261024-ghostun-spec.md), and [authentication spec](docs/261024-handshake-auth-spec.md).
