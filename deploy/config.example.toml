@@ -1,0 +1,46 @@
+# ghostun configuration. Every key is optional unless noted; CLI flags override file values.
+# Durations are integer seconds.
+
+# Role (required unless given as the `entry` / `exit` subcommand).
+mode = "entry"
+
+# --- entry only (required) ---
+# Outer address of the exit node. IPv6 example: "[2001:db8::10]:443".
+remote = "203.0.113.10:443"
+
+# --- exit only (required) ---
+# Outer FakeTCP listen port. Allow inbound TCP to it on the exit host.
+# listen = 443
+# Outer transport family (exit only; entry derives it from remote).
+# outer_family = "ipv4"  # or "ipv6"; one family per instance
+
+# Inner TUN interface; bind your proxy outbound to it (SO_BINDTODEVICE).
+tun_name = "ghostun0"
+
+# Inner addresses. Defaults: entry 10.200.0.1/30 + fd00:200::1/126, exit 10.200.0.2/30 + fd00:200::2/126.
+# tun_ipv4 = "10.200.0.1/30"
+# tun_ipv6 = "fd00:200::1/126"
+# no_ipv6 = false  # inner IPv6 only; independent of the outer family
+
+# Outer connections = worker threads, one per CPU. MUST be identical on entry and exit.
+# Default: number of CPUs.
+# conns = 4
+
+# Outer path MTU (default: MTU of the egress interface, else 1500) and inner TUN MTU
+# (default: outer_mtu - 40 for outer IPv4, outer_mtu - 60 for outer IPv6).
+# Inner IPv6 requires tun_mtu >= 1280, hence outer_mtu >= 1320 (IPv4) or 1340 (IPv6).
+# outer_mtu = 1500
+# tun_mtu = 1460
+
+# Outer egress interface. Default: from the routing table.
+# iface = "eth0"
+
+# Entry: first source port of the outer port pool. Worker i uses ports p >= base_port with p % conns == i.
+# base_port = 32768
+
+# Health ping period and the silence after which the entry resets and reconnects on a new port.
+# ping_interval = 5
+# dead_timeout = 15
+
+# Skip nftables/sysctl management (you then provide the rules yourself, see README).
+# no_netfilter = false

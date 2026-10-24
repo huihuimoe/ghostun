@@ -1,0 +1,19 @@
+services:
+  ghostun-entry:
+    build: ..
+    image: ghostun:latest
+    container_name: ghostun-entry
+    restart: unless-stopped
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    devices:
+      - /dev/net/tun
+    environment:
+      RUST_LOG: info
+    volumes:
+      - ./entry.toml:/etc/ghostun/config.toml:ro
+    command: ["--config", "/etc/ghostun/config.toml"]
+    stop_signal: SIGTERM
+    stop_grace_period: 10s

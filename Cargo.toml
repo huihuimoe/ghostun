@@ -1,0 +1,26 @@
+[package]
+name = "ghostun"
+version = "0.1.0"
+edition = "2021"
+description = "High-performance, low-memory L3-over-FakeTCP tunnel with per-core BPF steering"
+license = "MIT"
+readme = "README.md"
+
+[[bin]]
+name = "ghostun"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+log = "0.4"
+env_logger = "0.11"
+serde = { version = "1", features = ["derive"] }
+toml = "1.1.8"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
