@@ -1,7 +1,7 @@
 #!/bin/bash
 # End-to-end smoke test over real kernels:
 #   entry --veth-- fw (stateful nftables, strict conntrack) --veth-- exit --veth-- inet
-# Needs root plus ip, nft, conntrack, ping, iperf3. Run it in a disposable privileged container (see README "Testing").
+# Needs root plus ip, nft, conntrack, ping, iperf3. Disposable container only; see tests/README.md.
 set -euo pipefail
 
 BIN=$(realpath "${BIN:-target/release/ghostun}")
@@ -17,6 +17,10 @@ esac
 LOG=${LOG:-/tmp/ghostun-e2e}
 TABLE=ghostun_ghostun0
 mkdir -p "$LOG"
+umask 077
+# Public test-only keys, never deployment credentials.
+printf "auth_key = '%064d'\n" 1 >"$LOG/auth.toml"
+printf "auth_key = '%064d'\n" 2 >"$LOG/wrong.toml"
 
 ns() { ip netns exec "$@"; }
 pass() { echo "PASS: $*"; }
@@ -44,6 +48,8 @@ setup() {
     veth exit x1 10.3.0.1/24 inet i0 10.3.0.2/24
     ns exit ip -6 addr add fd00:3::1/64 dev x1 nodad
     ns inet ip -6 addr add fd00:3::2/64 dev i0 nodad
+    ns inet ip route add 10.2.0.0/24 via 10.3.0.1
+    ns inet ip -6 route add fd00:2::/64 via fd00:3::1
     ns entry ip route add default via 10.1.0.254
     ns exit ip route add default via 10.2.0.254
 
@@ -75,23 +81,38 @@ table inet fw {
 EOF
 }
 
-start() {
+start_entry() {
     # Not via ns(): backgrounding a shell function makes $! a subshell, not ghostun.
-    ip netns exec exit "$BIN" exit --listen 443 --outer-family "$OUTER_FAMILY" --conns "$N" --ping-interval 1 --dead-timeout $DEAD >"$LOG/exit.log" 2>&1 &
-    EXIT_PID=$!
-    ip netns exec entry "$BIN" entry --remote "$REMOTE" --iface e0 --conns "$N" --ping-interval 1 --dead-timeout $DEAD >"$LOG/entry.log" 2>&1 &
+    ip netns exec entry "$BIN" --config "$LOG/auth.toml" entry --remote "$REMOTE" --iface e0 --conns "$N" --ping-interval 1 --dead-timeout $DEAD >"$LOG/entry.log" 2>&1 &
     ENTRY_PID=$!
     PIDS="$EXIT_PID $ENTRY_PID"
+}
+
+route_inner() {
     for _ in $(seq 50); do
+        kill -0 "$ENTRY_PID" "$EXIT_PID" 2>/dev/null || fail "startup failed"
         ns entry ip link show ghostun0 >/dev/null 2>&1 && ns exit ip link show ghostun0 >/dev/null 2>&1 && break
         sleep 0.1
     done
-    # Upstream proxies bind ghostun0; for the test, route the "internet" through it instead.
+    # Upstream proxies bind ghostun0; route the test internet through it instead.
     ns entry ip route add 10.3.0.0/24 dev ghostun0
     ns entry ip -6 route add fd00:3::/64 dev ghostun0
 }
 
+start() {
+    ip netns exec exit "$BIN" --config "$LOG/auth.toml" exit --listen 443 --outer-family "$OUTER_FAMILY" --conns "$N" --ping-interval 1 --dead-timeout $DEAD >"$LOG/exit.log" 2>&1 &
+    EXIT_PID=$!
+    PIDS="$EXIT_PID"
+    start_entry
+    route_inner
+}
+
 established() { ns fw conntrack -L -f "$OUTER_FAMILY" -p tcp --state ESTABLISHED 2>/dev/null | grep -c 'dport=443' || true; }
+
+outer_tuples() {
+    ns fw conntrack -L -f "$OUTER_FAMILY" -p tcp --state ESTABLISHED 2>/dev/null |
+        awk '{ n=0; for (i=1; i<=NF; i++) if ($i ~ /^(src|dst|sport|dport)=/) { printf "%s%s", $i, ++n == 4 ? ORS : OFS; if (n == 4) break } }' | sort
+}
 
 # Seconds until an inner ping succeeds, or fails after $1 seconds.
 wait_ping() {
@@ -130,6 +151,77 @@ pass "bulk TCP: v4 up $(grep -E 'SUM.*receiver' "$LOG/iperf4.log" | awk '{print 
 c=$(established)
 [[ $c == "$N" ]] || fail "firewall tracks $c outer connections, want $N"
 pass "firewall conntrack holds exactly $N ESTABLISHED outer connections"
+
+before=$(outer_tuples)
+ip netns exec inet "$BIN" --config "$LOG/wrong.toml" entry --remote "$REMOTE" --iface i0 --tun unauth0 --conns "$N" --base-port 50000 --ping-interval 1 --dead-timeout $DEAD >"$LOG/wrong.log" 2>&1 &
+WRONG_PID=$!
+PIDS="$PIDS $WRONG_PID"
+for _ in $(seq 50); do
+    kill -0 "$WRONG_PID" 2>/dev/null || fail "wrong-key client failed to start"
+    ns inet ip link show unauth0 >/dev/null 2>&1 && break
+    sleep 0.1
+done
+if ns inet ping -I unauth0 -c2 -W1 10.200.0.2 >"$LOG/wrong-ping.log" 2>&1; then
+    fail "wrong-key client forwarded inner traffic"
+fi
+ns entry ping -c3 -i0.2 -W1 10.3.0.2 >/dev/null || fail "wrong-key client disrupted the active tunnel"
+[[ $(outer_tuples) == "$before" ]] || fail "wrong-key client changed active outer tuples"
+kill -TERM "$WRONG_PID"
+wait "$WRONG_PID" || fail "wrong-key client shutdown"
+PIDS="$EXIT_PID $ENTRY_PID"
+! ns inet ip link show unauth0 >/dev/null 2>&1 || fail "wrong-key TUN survived shutdown"
+! ns inet nft list table inet ghostun_unauth0 >/dev/null 2>&1 || fail "wrong-key firewall table survived shutdown"
+pass "wrong-key client cannot forward or replace active connections"
+
+# Real kernel TCP handshakes and unauthenticated Hellos, with no extra test tools.
+for _ in $(seq 32); do
+    ns inet timeout 2 bash -c '
+        exec 3<>/dev/tcp/"$1"/443
+        printf "\003\001\001%032d" 0 >&3
+        exec 3>&-
+    ' _ "$EXIT_IP" >/dev/null 2>&1 || fail "unauthenticated handshake injection failed"
+done
+ns entry ping -c3 -i0.2 -W1 10.3.0.2 >/dev/null || fail "unauthenticated handshakes disrupted forwarding"
+[[ $(outer_tuples) == "$before" ]] || fail "unauthenticated handshakes rotated active tuples"
+pass "32 unauthenticated handshakes leave legitimate forwarding and tuples unchanged"
+
+# Kill Entry without sending RST, then change its public source address. The old
+# Exit session remains until an authenticated replacement or its ordinary timeout.
+kill -KILL "$ENTRY_PID"
+wait "$ENTRY_PID" 2>/dev/null || [[ $? == 137 ]] || fail "unexpected killed Entry status"
+PIDS="$EXIT_PID"
+if [[ $OUTER_FAMILY == ipv4 ]]; then
+    ns entry ip addr add 10.1.0.2/24 dev e0
+    ns entry ip addr del 10.1.0.1/24 dev e0
+    ns entry ip route replace default via 10.1.0.254 src 10.1.0.2
+else
+    ns entry ip -6 addr add fd00:1::2/64 dev e0 nodad
+    ns entry ip -6 addr del fd00:1::1/64 dev e0
+    ns entry ip -6 route replace default via fd00:1::fe src fd00:1::2
+fi
+# Drop Hello while allowing the complete ordinary TCP handshake. This also
+# exercises real conntrack acceptance of retransmitted authentication sequence ranges.
+ns fw nft -f - <<'EOF'
+table inet auth_loss {
+    chain forward {
+        type filter hook forward priority -10; policy accept;
+        tcp dport 443 @th,160,24 0x030101 drop
+    }
+}
+EOF
+start_entry
+route_inner
+if ns entry ping -c1 -W1 10.3.0.2 >/dev/null 2>&1; then fail "transport handshake granted access without authentication"; fi
+ns fw nft delete table inet auth_loss
+t=$(wait_ping $((DEAD + 10))) || fail "no authenticated recovery after source-address change and lost Hello"
+sleep 1
+[[ $(established) == "$N" ]] || fail "source-address replacement leaked old conntrack slots"
+[[ $(outer_tuples) != "$before" ]] || fail "Entry source-address change was not observed"
+pass "authenticated source-address replacement and Hello-loss recovery in ${t}s; $N ESTABLISHED"
+printf 'OBSERVE: Entry '
+awk '/^VmRSS:/ { print $0 }' "/proc/$ENTRY_PID/status"
+printf 'OBSERVE: Exit '
+awk '/^VmRSS:/ { print $0 }' "/proc/$EXIT_PID/status"
 
 # Firewall silently forgets every connection.
 ns fw conntrack -F >/dev/null 2>&1

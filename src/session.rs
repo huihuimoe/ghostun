@@ -1,23 +1,26 @@
 //! Per-worker FakeTCP session: handshake, seq/ack upkeep, health ping/pong and reconnect.
 //! Pure logic: frames in, frames out through [`Sink`]; the worker owns all I/O.
 
+use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
-use crate::config::{Mode, OuterFamily};
+use crate::auth::{self, Auth, Isns, CHALLENGE_LEN, FINISHED_LEN, HELLO_LEN, PROOF_LEN};
+use crate::config::{AuthKey, Mode, OuterFamily};
 use crate::pkt::{self, flags, TcpMeta, CTRL_LEN, CTRL_PING, CTRL_PONG, MAX_OVERHEAD};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
     Closed,
     SynSent,
-    SynReceived,
+    Authenticating,
     Established,
 }
 
 #[derive(Clone, Debug)]
 pub struct SessionConfig {
     pub mode: Mode,
+    pub auth_key: AuthKey,
     pub local_ip: IpAddr,
     /// Exit node address; entry only.
     pub remote: Option<SocketAddr>,
@@ -43,8 +46,30 @@ pub const SYN_RETRY: Duration = Duration::from_secs(1);
 const WINDOW: u16 = 65535;
 const IDLE: Duration = Duration::from_secs(3600);
 
+struct EntryAuth {
+    frame: [u8; PROOF_LEN],
+    len: usize,
+    seq: u32,
+}
+
+struct Completion {
+    request: TcpMeta,
+    proof: [u8; PROOF_LEN],
+    finished: [u8; FINISHED_LEN],
+}
+
+fn emit(scratch: &mut [u8], meta: &TcpMeta, payload: &[u8], id: u16, out: &mut impl Sink) {
+    let overhead = OuterFamily::of(meta.src.ip()).overhead();
+    scratch[overhead..overhead + payload.len()].copy_from_slice(payload);
+    let len = pkt::write_headers(scratch, meta, payload.len(), id);
+    out.send(&scratch[..len], meta.dst.ip());
+}
+
 pub struct Session {
     cfg: SessionConfig,
+    auth: Auth,
+    pending: Option<EntryAuth>,
+    completion: Option<Completion>,
     state: State,
     local: SocketAddr,
     peer: Option<SocketAddr>,
@@ -59,7 +84,7 @@ pub struct Session {
     ip_id: u16,
     rng: u64,
     nonce: u64,
-    scratch: [u8; MAX_OVERHEAD + 16],
+    scratch: [u8; MAX_OVERHEAD + PROOF_LEN],
 }
 
 /// `a` is later than `b` in 32-bit sequence space.
@@ -68,7 +93,8 @@ fn seq_after(a: u32, b: u32) -> bool {
 }
 
 impl Session {
-    pub fn new(cfg: SessionConfig, now: Instant, seed: u64) -> Self {
+    pub fn new(cfg: SessionConfig, now: Instant, seed: u64) -> io::Result<Self> {
+        let auth = Auth::new(&cfg.auth_key, cfg.mode, now, cfg.dead_timeout)?;
         let (local, peer) = match cfg.mode {
             Mode::Entry => {
                 let (first, count) = port_pool(&cfg);
@@ -77,8 +103,11 @@ impl Session {
             }
             Mode::Exit => (SocketAddr::new(cfg.local_ip, cfg.listen_port), None),
         };
-        Session {
+        Ok(Session {
             cfg,
+            auth,
+            pending: None,
+            completion: None,
             state: State::Closed,
             local,
             peer,
@@ -93,8 +122,8 @@ impl Session {
             ip_id: seed as u16,
             rng: seed ^ 0x9e37_79b9_7f4a_7c15,
             nonce: 0,
-            scratch: [0; MAX_OVERHEAD + 16],
-        }
+            scratch: [0; MAX_OVERHEAD + PROOF_LEN],
+        })
     }
 
     #[cfg(test)]
@@ -132,40 +161,67 @@ impl Session {
         let m = p.meta;
         match self.cfg.mode {
             Mode::Entry => {
-                if Some(m.src) != self.peer || m.dst.port() != self.local.port() {
+                if Some(m.src) != self.peer || m.dst != self.local {
+                    return None;
+                }
+                if matches!(self.state, State::SynSent | State::Authenticating)
+                    && now.duration_since(self.last_rx) >= self.cfg.dead_timeout
+                {
+                    self.reconnect(now, true, out);
                     return None;
                 }
                 if m.flags & flags::RST != 0 {
-                    if matches!(self.state, State::SynSent | State::Established) {
+                    if self.state != State::Closed {
                         self.reconnect(now, false, out);
                     }
                     return None;
                 }
-                match self.state {
-                    State::SynSent => {
-                        if m.flags & (flags::SYN | flags::ACK) == flags::SYN | flags::ACK
-                            && m.ack == self.snd_nxt
-                        {
-                            self.rcv_nxt = m.seq.wrapping_add(1);
-                            self.established(now);
-                            self.send_ctrl(flags::ACK, &[], out);
-                        }
-                        None
-                    }
-                    State::Established if m.flags & flags::SYN != 0 => {
-                        // Our handshake ACK was lost and the exit retransmitted SYN-ACK.
+                if self.state == State::SynSent {
+                    if m.flags & (flags::SYN | flags::ACK) == flags::SYN | flags::ACK
+                        && m.ack == self.snd_nxt
+                        && p.payload.is_empty()
+                    {
+                        self.irs = m.seq;
+                        self.rcv_nxt = m.seq.wrapping_add(1);
+                        self.state = State::Authenticating;
                         self.send_ctrl(flags::ACK, &[], out);
-                        None
+                        self.snd_nxt = self.snd_nxt.wrapping_add(HELLO_LEN as u32);
+                        self.next_syn = now + SYN_RETRY;
+                        self.send_pending(out);
                     }
-                    State::Established => self.on_segment(now, &m, p.payload, out),
-                    State::Closed | State::SynReceived => None,
+                    return None;
                 }
+                if m.flags & flags::SYN != 0 {
+                    if matches!(self.state, State::Authenticating | State::Established)
+                        && m.seq == self.irs
+                        && m.ack == self.iss.wrapping_add(1)
+                    {
+                        self.send_ctrl(flags::ACK, &[], out);
+                    }
+                    return None;
+                }
+                if m.flags & flags::ACK == 0 {
+                    return None;
+                }
+                if self.state == State::Authenticating {
+                    self.on_auth_reply(now, &m, p.payload, out);
+                    return None;
+                }
+                if p.payload.first() == Some(&auth::CONTROL) {
+                    return None;
+                }
+                if self.state == State::Established {
+                    return self.on_segment(now, &m, p.payload, out);
+                }
+                None
             }
             Mode::Exit => {
                 if m.dst.port() != self.cfg.listen_port {
                     return None;
                 }
-                let from_peer = Some(m.src) == self.peer;
+                let from_peer = self.state == State::Established
+                    && Some(m.src) == self.peer
+                    && m.dst == self.local;
                 if m.flags & flags::RST != 0 {
                     if from_peer {
                         self.close();
@@ -173,21 +229,24 @@ impl Session {
                     return None;
                 }
                 if m.flags & flags::SYN != 0 {
-                    if m.flags & flags::ACK == 0 {
-                        self.accept(now, &m, out);
+                    if m.flags & flags::ACK == 0 && p.payload.is_empty() {
+                        self.accept_syn(now, &m, out);
                     }
                     return None;
                 }
-                if !from_peer || self.state == State::Closed {
-                    // Tell an entry that lost its session here to reconnect instead of waiting for its dead timer.
-                    self.send_rst_to(m.dst, m.src, m.ack, out);
+                if m.flags & flags::ACK == 0 {
                     return None;
                 }
-                if self.state == State::SynReceived {
-                    if m.flags & flags::ACK == 0 || m.ack != self.snd_nxt {
-                        return None;
+                if p.payload.first() == Some(&auth::CONTROL) {
+                    self.on_auth_request(now, &m, p.payload, out);
+                    return None;
+                }
+                if !from_peer {
+                    // A transport ACK alone neither admits nor keeps a candidate alive.
+                    if !p.payload.is_empty() {
+                        self.send_rst_to(m.dst, m.src, m.ack, out);
                     }
-                    self.established(now);
+                    return None;
                 }
                 self.on_segment(now, &m, p.payload, out)
             }
@@ -197,6 +256,7 @@ impl Session {
     pub fn on_tick(&mut self, now: Instant, out: &mut impl Sink) {
         let dead = now.saturating_duration_since(self.last_rx) >= self.cfg.dead_timeout;
         match (self.cfg.mode, self.state) {
+            (Mode::Entry, State::Closed) if now >= self.next_syn => self.connect(now, out),
             (_, State::Closed) => {}
             (Mode::Entry, _) if dead => {
                 log::warn!(
@@ -214,6 +274,10 @@ impl Session {
                 self.next_syn = now + SYN_RETRY;
                 self.send_syn(out);
             }
+            (Mode::Entry, State::Authenticating) if now >= self.next_syn => {
+                self.next_syn = now + SYN_RETRY;
+                self.send_pending(out);
+            }
             (_, State::Established) if now >= self.next_ping => {
                 self.next_ping = now + self.cfg.ping_interval;
                 self.nonce = self.nonce.wrapping_add(1);
@@ -229,9 +293,9 @@ impl Session {
     pub fn next_deadline(&self) -> Instant {
         let dead = self.last_rx + self.cfg.dead_timeout;
         match self.state {
+            State::Closed if self.cfg.mode == Mode::Entry => self.next_syn,
             State::Closed => self.last_rx.max(Instant::now()) + IDLE,
-            State::SynSent => dead.min(self.next_syn),
-            State::SynReceived => dead,
+            State::SynSent | State::Authenticating => dead.min(self.next_syn),
             State::Established => dead.min(self.next_ping),
         }
     }
@@ -245,6 +309,8 @@ impl Session {
 
     fn close(&mut self) {
         self.state = State::Closed;
+        self.pending = None;
+        self.completion = None;
         if self.cfg.mode == Mode::Exit {
             self.peer = None;
         }
@@ -252,6 +318,7 @@ impl Session {
 
     fn established(&mut self, now: Instant) {
         self.state = State::Established;
+        self.last_rx = now;
         self.unacked = 0;
         self.next_ping = now + self.cfg.ping_interval;
         log::info!(
@@ -269,10 +336,10 @@ impl Session {
         payload: &'a [u8],
         out: &mut impl Sink,
     ) -> Option<&'a [u8]> {
-        self.last_rx = now;
         if payload.is_empty() {
             return None;
         }
+        self.last_rx = now;
         let end = m.seq.wrapping_add(payload.len() as u32);
         if seq_after(end, self.rcv_nxt) {
             self.rcv_nxt = end;
@@ -296,36 +363,174 @@ impl Session {
         }
     }
 
-    fn accept(&mut self, now: Instant, m: &TcpMeta, out: &mut impl Sink) {
-        // A late retransmission must not reset a connection whose data sequence has advanced.
-        let duplicate = matches!(self.state, State::SynReceived | State::Established)
+    fn accept_syn(&mut self, now: Instant, m: &TcpMeta, out: &mut impl Sink) {
+        let duplicate = self.state == State::Established
             && Some(m.src) == self.peer
             && m.dst == self.local
             && m.seq == self.irs;
-        if !duplicate {
-            if self.peer.is_some_and(|p| p != m.src) {
-                log::info!(
-                    "worker {}: replacing peer {:?} with {}",
-                    self.cfg.worker,
-                    self.peer,
-                    m.src
-                );
-            }
-            self.peer = Some(m.src);
-            self.local = m.dst;
-            self.irs = m.seq;
-            self.rcv_nxt = m.seq.wrapping_add(1);
-            self.iss = self.next_isn();
-            self.snd_nxt = self.iss.wrapping_add(1);
-            self.state = State::SynReceived;
+        let meta = TcpMeta {
+            src: m.dst,
+            dst: m.src,
+            seq: if duplicate {
+                self.iss
+            } else {
+                self.auth.syn_cookie(now, m)
+            },
+            ack: m.seq.wrapping_add(1),
+            flags: flags::SYN | flags::ACK,
+            window: WINDOW,
+        };
+        let id = self.next_ip_id();
+        let len = pkt::write_syn(&mut self.scratch, &meta, self.cfg.mss, id);
+        out.send(&self.scratch[..len], meta.dst.ip());
+    }
+
+    fn on_auth_reply(&mut self, now: Instant, m: &TcpMeta, payload: &[u8], out: &mut impl Sink) {
+        if m.flags != flags::PSH | flags::ACK {
+            return;
         }
-        self.last_rx = now;
-        self.send_syn(out);
+        let Some(pending) = self.pending.as_ref() else {
+            return;
+        };
+        let isns = Isns {
+            entry: self.iss,
+            exit: self.irs,
+        };
+        if pending.len == HELLO_LEN {
+            if m.seq != self.irs.wrapping_add(1) || m.ack != self.snd_nxt {
+                return;
+            }
+            let Some(proof) = self.auth.proof(isns, &pending.frame[3..HELLO_LEN], payload) else {
+                return;
+            };
+            self.rcv_nxt = m.seq.wrapping_add(CHALLENGE_LEN as u32);
+            self.pending = Some(EntryAuth {
+                frame: proof,
+                len: PROOF_LEN,
+                seq: self.snd_nxt,
+            });
+            self.snd_nxt = self.snd_nxt.wrapping_add(PROOF_LEN as u32);
+            self.next_syn = now + SYN_RETRY;
+            self.send_pending(out);
+        } else if m.seq == self.irs.wrapping_add(1 + CHALLENGE_LEN as u32)
+            && m.ack == self.snd_nxt
+            && self.auth.finished(isns, &pending.frame, payload)
+        {
+            self.rcv_nxt = self.irs.wrapping_add(1 + auth::EXIT_BYTES);
+            self.pending = None;
+            self.established(now);
+            self.send_ctrl(flags::ACK, &[], out);
+        }
+    }
+
+    fn on_auth_request(&mut self, now: Instant, m: &TcpMeta, payload: &[u8], out: &mut impl Sink) {
+        if m.flags != flags::PSH | flags::ACK {
+            return;
+        }
+        if auth::is_message(payload, auth::HELLO, HELLO_LEN) {
+            match self.auth.challenge(now, m, payload) {
+                Ok(Some(challenge)) => {
+                    let meta = TcpMeta {
+                        src: m.dst,
+                        dst: m.src,
+                        seq: m.ack,
+                        ack: m.seq.wrapping_add(HELLO_LEN as u32),
+                        flags: flags::PSH | flags::ACK,
+                        window: WINDOW,
+                    };
+                    let id = self.next_ip_id();
+                    emit(&mut self.scratch, &meta, &challenge, id, out);
+                }
+                Err(e) => log::error!("worker {}: authentication randomness: {e}", self.cfg.worker),
+                Ok(None) => {}
+            }
+            return;
+        }
+        if self.state == State::Established
+            && self
+                .completion
+                .as_ref()
+                .is_some_and(|c| c.request == *m && payload == &c.proof[..])
+        {
+            self.send_completion(out);
+            return;
+        }
+        let Some(verified) = self.auth.accept(now, m, payload) else {
+            return;
+        };
+        // Do not reset a reused tuple: conntrack may already associate it with this handshake.
+        if self.state == State::Established && (self.peer != Some(m.src) || self.local != m.dst) {
+            self.send_rsts(out);
+        }
+        self.local = m.dst;
+        self.peer = Some(m.src);
+        self.iss = verified.isns.exit;
+        self.irs = verified.isns.entry;
+        self.snd_nxt = self.iss.wrapping_add(1 + auth::EXIT_BYTES);
+        self.rcv_nxt = self.irs.wrapping_add(1 + auth::ENTRY_BYTES);
+        self.completion = Some(Completion {
+            request: *m,
+            proof: payload.try_into().unwrap(),
+            finished: verified.finished,
+        });
+        self.established(now);
+        self.send_completion(out);
+    }
+
+    fn send_pending(&mut self, out: &mut impl Sink) {
+        let Some(peer) = self.peer else { return };
+        let id = self.next_ip_id();
+        let mut meta = self.meta(peer, flags::PSH | flags::ACK);
+        let Some(pending) = self.pending.as_ref() else {
+            return;
+        };
+        meta.seq = pending.seq;
+        emit(
+            &mut self.scratch,
+            &meta,
+            &pending.frame[..pending.len],
+            id,
+            out,
+        );
+    }
+
+    fn send_completion(&mut self, out: &mut impl Sink) {
+        let id = self.next_ip_id();
+        let completion = self
+            .completion
+            .as_ref()
+            .expect("successful proof has a completion");
+        let request = completion.request;
+        let meta = TcpMeta {
+            src: request.dst,
+            dst: request.src,
+            seq: request.ack,
+            ack: request.seq.wrapping_add(PROOF_LEN as u32),
+            flags: flags::PSH | flags::ACK,
+            window: WINDOW,
+        };
+        emit(&mut self.scratch, &meta, &completion.finished, id, out);
     }
 
     fn connect(&mut self, now: Instant, out: &mut impl Sink) {
+        let hello = match auth::hello() {
+            Ok(frame) => frame,
+            Err(e) => {
+                log::error!("worker {}: authentication randomness: {e}", self.cfg.worker);
+                self.close();
+                self.next_syn = now + SYN_RETRY;
+                return;
+            }
+        };
         self.iss = self.next_isn();
         self.snd_nxt = self.iss.wrapping_add(1);
+        let mut frame = [0; PROOF_LEN];
+        frame[..HELLO_LEN].copy_from_slice(&hello);
+        self.pending = Some(EntryAuth {
+            frame,
+            len: HELLO_LEN,
+            seq: self.snd_nxt,
+        });
         self.rcv_nxt = 0;
         self.state = State::SynSent;
         self.last_rx = now;
@@ -362,18 +567,10 @@ impl Session {
 
     fn send_syn(&mut self, out: &mut impl Sink) {
         let Some(peer) = self.peer else { return };
-        let syn_flags = match self.cfg.mode {
-            Mode::Entry => flags::SYN,
-            Mode::Exit => flags::SYN | flags::ACK,
-        };
         let meta = TcpMeta {
             seq: self.iss,
-            ack: if self.cfg.mode == Mode::Exit {
-                self.irs.wrapping_add(1)
-            } else {
-                0
-            },
-            ..self.meta(peer, syn_flags)
+            ack: 0,
+            ..self.meta(peer, flags::SYN)
         };
         let id = self.next_ip_id();
         let len = pkt::write_syn(&mut self.scratch, &meta, self.cfg.mss, id);
@@ -386,10 +583,7 @@ impl Session {
         self.snd_nxt = self.snd_nxt.wrapping_add(payload.len() as u32);
         self.unacked = 0;
         let id = self.next_ip_id();
-        let overhead = OuterFamily::of(self.local.ip()).overhead();
-        self.scratch[overhead..overhead + payload.len()].copy_from_slice(payload);
-        let len = pkt::write_headers(&mut self.scratch, &meta, payload.len(), id);
-        out.send(&self.scratch[..len], peer.ip());
+        emit(&mut self.scratch, &meta, payload, id, out);
     }
 
     fn send_rst_to(&mut self, local: SocketAddr, to: SocketAddr, seq: u32, out: &mut impl Sink) {
@@ -477,6 +671,7 @@ mod tests {
     fn cfg(mode: Mode, worker: u16, conns: u16) -> SessionConfig {
         SessionConfig {
             mode,
+            auth_key: AuthKey([0xa7; 32]),
             local_ip: if mode == Mode::Entry {
                 ENTRY_IP
             } else {
@@ -505,8 +700,8 @@ mod tests {
             let t = Instant::now();
             Pair {
                 t,
-                entry: Session::new(cfg(Mode::Entry, worker, conns), t, seed),
-                exit: Session::new(cfg(Mode::Exit, worker, conns), t, seed + 1),
+                entry: Session::new(cfg(Mode::Entry, worker, conns), t, seed).unwrap(),
+                exit: Session::new(cfg(Mode::Exit, worker, conns), t, seed + 1).unwrap(),
             }
         }
 
@@ -549,11 +744,442 @@ mod tests {
             .map(|(len, _)| buf[..len].to_vec())
     }
 
+    struct AuthExchange {
+        syn: Vec<u8>,
+        ack: Vec<u8>,
+        hello: Vec<u8>,
+        challenge: Vec<u8>,
+    }
+
+    fn start_auth(entry: &mut Session, exit: &mut Session, now: Instant) -> AuthExchange {
+        let mut wire = Wire::default();
+        entry.start(now, &mut wire);
+        let syn = wire.take().remove(0);
+        exit.on_outer(now, &syn, &mut wire);
+        let syn_ack = wire.take().remove(0);
+        entry.on_outer(now, &syn_ack, &mut wire);
+        let mut frames = wire.take();
+        let ack = frames.remove(0);
+        let hello = frames.remove(0);
+        exit.on_outer(now, &ack, &mut wire);
+        exit.on_outer(now, &hello, &mut wire);
+        let challenge = wire.take().remove(0);
+        AuthExchange {
+            syn,
+            ack,
+            hello,
+            challenge,
+        }
+    }
+
+    fn frame(meta: TcpMeta, payload: &[u8]) -> Vec<u8> {
+        let overhead = OuterFamily::of(meta.src.ip()).overhead();
+        let mut buf = vec![0; overhead + payload.len()];
+        buf[overhead..].copy_from_slice(payload);
+        pkt::write_headers(&mut buf, &meta, payload.len(), 0);
+        buf
+    }
+
+    #[test]
+    fn old_proofs_fail_against_a_fresh_handshake_and_challenge() {
+        let mut pair = Pair::new(0, 1, 91);
+        let first = start_auth(&mut pair.entry, &mut pair.exit, pair.t);
+        let mut wire = Wire::default();
+        pair.entry.on_outer(pair.t, &first.challenge, &mut wire);
+        let old_proof = wire.take().remove(0);
+        pair.t += Duration::from_secs(1);
+        pair.entry = Session::new(cfg(Mode::Entry, 0, 1), pair.t, 92).unwrap();
+        let second = start_auth(&mut pair.entry, &mut pair.exit, pair.t);
+        let stale_reply = frame(
+            parsed(&second.challenge).meta,
+            parsed(&first.challenge).payload,
+        );
+        pair.entry.on_outer(pair.t, &stale_reply, &mut wire);
+        assert!(wire.take().is_empty());
+        pair.entry.on_outer(pair.t, &second.challenge, &mut wire);
+        let proof = wire.take().remove(0);
+        let replay = frame(parsed(&proof).meta, parsed(&old_proof).payload);
+        pair.exit.on_outer(pair.t, &replay, &mut wire);
+        assert!(wire.take().is_empty());
+        assert!(encap(&mut pair.exit, &[0x45; 20], 40).is_none());
+        let mut body = parsed(&proof).payload.to_vec();
+        body[147..].copy_from_slice(&parsed(&old_proof).payload[147..]);
+        pair.exit
+            .on_outer(pair.t, &frame(parsed(&proof).meta, &body), &mut wire);
+        assert!(wire.take().is_empty());
+        pair.pump(vec![proof]);
+        let data = encap(&mut pair.entry, &[0x45; 20], 40).unwrap();
+        assert_eq!(
+            pair.exit.on_outer(pair.t, &data, &mut wire),
+            Some(&[0x45; 20][..])
+        );
+    }
+
+    #[test]
+    fn finished_received_at_or_after_the_attempt_deadline_cannot_authorize() {
+        for delay in [
+            Duration::from_secs(15) - MS,
+            Duration::from_secs(15),
+            Duration::from_secs(16),
+        ] {
+            let mut pair = Pair::new(0, 1, 111);
+            let exchange = start_auth(&mut pair.entry, &mut pair.exit, pair.t);
+            let mut wire = Wire::default();
+            pair.entry.on_outer(pair.t, &exchange.challenge, &mut wire);
+            let proof = wire.take().remove(0);
+            pair.exit.on_outer(pair.t, &proof, &mut wire);
+            let finished = wire.take().remove(0);
+            pair.entry.on_outer(pair.t + delay, &finished, &mut wire);
+            let data = encap(&mut pair.entry, &[0x45; 20], 40);
+            if delay < Duration::from_secs(15) {
+                assert!(data.is_some());
+            } else {
+                assert!(
+                    data.is_none(),
+                    "receive processing must enforce the deadline before on_tick"
+                );
+                let outgoing = wire.take();
+                let syn = outgoing
+                    .iter()
+                    .find(|f| parsed(f).meta.flags == flags::SYN)
+                    .unwrap();
+                assert_ne!(parsed(syn).meta.src.port(), parsed(&proof).meta.src.port());
+            }
+        }
+    }
+
+    #[test]
+    fn authentication_timeout_rotates_the_port_and_expired_cookies_cannot_admit() {
+        let mut pair = Pair::new(0, 1, 101);
+        let exchange = start_auth(&mut pair.entry, &mut pair.exit, pair.t);
+        let mut wire = Wire::default();
+        pair.entry.on_outer(pair.t, &exchange.challenge, &mut wire);
+        let proof = wire.take().remove(0);
+        let old = parsed(&proof).meta;
+        pair.entry.on_outer(
+            pair.t + Duration::from_secs(14),
+            &exchange.challenge,
+            &mut wire,
+        );
+        assert!(wire.take().is_empty());
+        pair.entry
+            .on_tick(pair.t + Duration::from_secs(15), &mut wire);
+        let retry = wire.take();
+        let syn = retry
+            .iter()
+            .find(|f| parsed(f).meta.flags == flags::SYN)
+            .unwrap();
+        assert_ne!(parsed(syn).meta.src.port(), old.src.port());
+        assert!(encap(&mut pair.entry, &[0x45; 20], 40).is_none());
+        pair.exit
+            .on_outer(pair.t + Duration::from_secs(30) + MS, &proof, &mut wire);
+        assert!(wire.take().is_empty());
+        assert!(encap(&mut pair.exit, &[0x45; 20], 40).is_none());
+        pair.t += Duration::from_secs(31);
+        pair.entry = Session::new(cfg(Mode::Entry, 0, 1), pair.t, 102).unwrap();
+        pair.connect();
+        let data = encap(&mut pair.entry, &[0x45; 20], 40).unwrap();
+        assert_eq!(
+            pair.exit.on_outer(pair.t, &data, &mut wire),
+            Some(&[0x45; 20][..])
+        );
+    }
+
+    #[test]
+    fn each_lost_authentication_message_recovers_without_reconsuming_sequence_space() {
+        use std::collections::{BTreeMap, VecDeque};
+        for lost_kind in [auth::HELLO, auth::CHALLENGE, auth::PROOF, auth::FINISHED] {
+            let mut pair = Pair::new(0, 1, 81);
+            let mut wire = Wire::default();
+            pair.entry.start(pair.t, &mut wire);
+            let syn = wire.take().remove(0);
+            let entry_isn = parsed(&syn).meta.seq;
+            let mut exit_isn = None;
+            let mut queue = VecDeque::from([(true, syn)]);
+            let mut dropped = false;
+            let mut requests = BTreeMap::new();
+            let mut proof = None;
+            for round in 0..3 {
+                let now = pair.t + Duration::from_secs(round);
+                let mut count = 0;
+                while let Some((to_exit, packet)) = queue.pop_front() {
+                    count += 1;
+                    assert!(count < 100, "authentication must not form a response loop");
+                    let p = parsed(&packet);
+                    if p.meta.flags == flags::SYN | flags::ACK {
+                        exit_isn = Some(p.meta.seq);
+                    }
+                    if p.payload.first() == Some(&auth::CONTROL) {
+                        let kind = p.payload[2];
+                        if to_exit {
+                            let value = (p.meta, p.payload.to_vec());
+                            if let Some(previous) = requests.insert(kind, value.clone()) {
+                                assert_eq!(previous, value);
+                            }
+                            if kind == auth::PROOF {
+                                proof = Some(packet.clone());
+                            }
+                        }
+                        if kind == lost_kind && !dropped {
+                            dropped = true;
+                            continue;
+                        }
+                    }
+                    if to_exit {
+                        pair.exit.on_outer(now, &packet, &mut wire);
+                    } else {
+                        pair.entry.on_outer(now, &packet, &mut wire);
+                    }
+                    queue.extend(wire.take().into_iter().map(|f| (!to_exit, f)));
+                }
+                pair.entry.on_tick(now + SYN_RETRY, &mut wire);
+                queue.extend(wire.take().into_iter().map(|f| (true, f)));
+            }
+            assert!(dropped);
+            pair.t += Duration::from_secs(3);
+            let first = encap(&mut pair.entry, &[0x45; 100], 40).unwrap();
+            let back = encap(&mut pair.exit, &[0x60; 80], 40).unwrap();
+            assert_eq!(parsed(&first).meta.seq, entry_isn.wrapping_add(215));
+            assert_eq!(parsed(&back).meta.seq, exit_isn.unwrap().wrapping_add(191));
+            assert_eq!(
+                pair.exit.on_outer(pair.t, &first, &mut wire),
+                Some(&[0x45; 100][..])
+            );
+            assert_eq!(
+                pair.entry.on_outer(pair.t, &back, &mut wire),
+                Some(&[0x60; 80][..])
+            );
+            pair.exit.on_outer(pair.t, &proof.unwrap(), &mut wire);
+            for duplicate in wire.take() {
+                pair.entry.on_outer(pair.t, &duplicate, &mut wire);
+            }
+            let after = encap(&mut pair.entry, &[0x45; 1], 40).unwrap();
+            assert_eq!(
+                parsed(&after).meta.seq,
+                parsed(&first).meta.seq.wrapping_add(100)
+            );
+            assert_eq!(
+                parsed(&after).meta.ack,
+                parsed(&back).meta.seq.wrapping_add(80)
+            );
+        }
+    }
+
+    #[test]
+    fn legitimate_replacement_survives_unrelated_attempts_and_old_proof_replays() {
+        let mut pair = Pair::new(0, 1, 71);
+        let original = start_auth(&mut pair.entry, &mut pair.exit, pair.t);
+        let mut wire = Wire::default();
+        pair.entry.on_outer(pair.t, &original.challenge, &mut wire);
+        let old_proof = wire.take().remove(0);
+        pair.pump(vec![old_proof.clone()]);
+        let mut config = cfg(Mode::Entry, 0, 1);
+        config.local_ip = "203.0.113.7".parse().unwrap();
+        let mut replacement = Session::new(config, pair.t, 72).unwrap();
+        let now = pair.t + Duration::from_secs(1);
+        let exchange = start_auth(&mut replacement, &mut pair.exit, now);
+        replacement.on_outer(now, &exchange.challenge, &mut wire);
+        let proof = wire.take().remove(0);
+        for i in 0..128 {
+            let mut wrong = cfg(Mode::Entry, 0, 1);
+            wrong.local_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 20 + i));
+            wrong.auth_key = AuthKey([0xb8; 32]);
+            let mut wrong = Session::new(wrong, now, u64::from(i) + 100).unwrap();
+            let attempt = start_auth(&mut wrong, &mut pair.exit, now);
+            wrong.on_outer(now, &attempt.challenge, &mut wire);
+            assert!(wire.take().is_empty());
+            let data = encap(&mut pair.exit, &[0x45; 20], 40).unwrap();
+            assert_eq!(
+                pair.entry.on_outer(now, &data, &mut wire),
+                Some(&[0x45; 20][..])
+            );
+        }
+        pair.exit.on_outer(now, &proof, &mut wire);
+        let mut promoted = wire.take();
+        let resets: Vec<_> = promoted
+            .iter()
+            .filter(|f| parsed(f).meta.flags & flags::RST != 0)
+            .collect();
+        assert_eq!(
+            resets.len(),
+            2,
+            "verified replacement must release the old firewall tuple"
+        );
+        assert!(resets
+            .iter()
+            .all(|f| parsed(f).meta.dst == parsed(&original.syn).meta.src));
+        let finished = promoted.pop().unwrap();
+        replacement.on_outer(now, &finished, &mut wire);
+        wire.take();
+        let inner = [0x60; 40];
+        let data = encap(&mut replacement, &inner, 40).unwrap();
+        assert_eq!(pair.exit.on_outer(now, &data, &mut wire), Some(&inner[..]));
+        pair.exit.on_outer(now, &old_proof, &mut wire);
+        pair.exit.on_outer(now, &original.hello, &mut wire);
+        wire.take();
+        let reply = encap(&mut pair.exit, &inner, 40).unwrap();
+        assert_eq!(parsed(&reply).meta.dst, parsed(&proof).meta.src);
+        assert_eq!(
+            replacement.on_outer(now, &reply, &mut wire),
+            Some(&inner[..])
+        );
+    }
+
+    #[test]
+    fn unauthenticated_candidates_cannot_replace_or_keep_an_active_peer_alive() {
+        let mut pair = Pair::new(0, 1, 61);
+        let original = start_auth(&mut pair.entry, &mut pair.exit, pair.t);
+        let mut wire = Wire::default();
+        pair.entry.on_outer(pair.t, &original.challenge, &mut wire);
+        let proof = wire.take().remove(0);
+        pair.pump(vec![proof.clone()]);
+        let before = parsed(&encap(&mut pair.exit, &[0x45; 7], 40).unwrap()).meta;
+        let mut candidate = cfg(Mode::Entry, 0, 1);
+        candidate.local_ip = "192.0.2.77".parse().unwrap();
+        candidate.auth_key = AuthKey([0xb8; 32]);
+        let mut candidate = Session::new(candidate, pair.t, 62).unwrap();
+        let now = pair.t + Duration::from_secs(14);
+        let exchange = start_auth(&mut candidate, &mut pair.exit, now);
+        candidate.on_outer(now, &exchange.challenge, &mut wire);
+        assert!(wire.take().is_empty());
+        for packet in [
+            &original.syn,
+            &original.ack,
+            &original.hello,
+            &proof,
+            &exchange.hello,
+        ] {
+            assert!(pair.exit.on_outer(now, packet, &mut wire).is_none());
+            wire.take();
+        }
+        let mut invalid = parsed(&proof).payload.to_vec();
+        invalid[178] ^= 1;
+        assert!(pair
+            .exit
+            .on_outer(now, &frame(parsed(&proof).meta, &invalid), &mut wire)
+            .is_none());
+        assert!(pair
+            .exit
+            .on_outer(
+                now,
+                &frame(parsed(&exchange.hello).meta, &[0x45; 20]),
+                &mut wire
+            )
+            .is_none());
+        let after = encap(&mut pair.exit, &[0x60; 40], 40).unwrap();
+        assert_eq!(parsed(&after).meta.dst, before.dst);
+        assert_eq!(parsed(&after).meta.seq, before.seq.wrapping_add(7));
+        assert_eq!(
+            pair.entry.on_outer(now, &after, &mut wire),
+            Some(&[0x60; 40][..])
+        );
+        pair.exit
+            .on_tick(pair.t + Duration::from_secs(15), &mut wire);
+        assert!(
+            encap(&mut pair.exit, &[0x45; 20], 40).is_none(),
+            "candidate traffic must not postpone active expiry"
+        );
+        pair.exit
+            .on_outer(pair.t + Duration::from_secs(16), &proof, &mut wire);
+        assert!(
+            encap(&mut pair.exit, &[0x45; 20], 40).is_none(),
+            "a completed proof must not resurrect an expired peer"
+        );
+    }
+
+    #[test]
+    fn invalid_or_reflected_proofs_cannot_authorize_either_role() {
+        let mut pair = Pair::new(0, 1, 51);
+        let exchange = start_auth(&mut pair.entry, &mut pair.exit, pair.t);
+        let challenge = parsed(&exchange.challenge);
+        let mut malformed = Vec::new();
+        for index in [1, 2, 19, 146] {
+            let mut body = challenge.payload.to_vec();
+            body[index] ^= 0xff;
+            malformed.push(body);
+        }
+        malformed.push(challenge.payload[..146].to_vec());
+        malformed.push([challenge.payload, &[0]].concat());
+        let mut wire = Wire::default();
+        for body in malformed {
+            pair.entry
+                .on_outer(pair.t, &frame(challenge.meta, &body), &mut wire);
+            assert!(wire.take().is_empty());
+            assert!(encap(&mut pair.entry, &[0x45; 20], 40).is_none());
+        }
+        pair.entry.on_outer(pair.t, &exchange.challenge, &mut wire);
+        let proof = wire.take().remove(0);
+        let request = parsed(&proof);
+        let mut reflected = request.payload.to_vec();
+        reflected[147..179].copy_from_slice(&request.payload[115..147]);
+        let mut malformed = vec![
+            reflected,
+            request.payload[..178].to_vec(),
+            [request.payload, &[0]].concat(),
+        ];
+        for index in [1, 2, 3, 11, 51, 83, 178] {
+            let mut body = request.payload.to_vec();
+            body[index] ^= 0xff;
+            malformed.push(body);
+        }
+        for body in malformed {
+            assert!(pair
+                .exit
+                .on_outer(pair.t, &frame(request.meta, &body), &mut wire)
+                .is_none());
+            assert!(wire.take().is_empty());
+            assert!(encap(&mut pair.exit, &[0x60; 40], 40).is_none());
+        }
+        assert!(pair
+            .exit
+            .on_outer(pair.t, &frame(request.meta, &[0x45; 20]), &mut wire)
+            .is_none());
+        wire.take();
+        pair.exit.on_outer(pair.t, &proof, &mut wire);
+        let finished = wire.take().remove(0);
+        let parsed_finished = parsed(&finished);
+        let mut bad = parsed_finished.payload.to_vec();
+        bad[11..].copy_from_slice(&request.payload[147..]);
+        pair.entry
+            .on_outer(pair.t, &frame(parsed_finished.meta, &bad), &mut wire);
+        assert!(encap(&mut pair.entry, &[0x45; 20], 40).is_none());
+        pair.entry.on_outer(pair.t, &finished, &mut wire);
+        let inner = [0x45; 20];
+        let packet = encap(&mut pair.entry, &inner, 40).unwrap();
+        assert_eq!(
+            pair.exit.on_outer(pair.t, &packet, &mut wire),
+            Some(&inner[..])
+        );
+    }
+
+    #[test]
+    fn mismatched_keys_deny_forwarding_in_both_directions() {
+        let mut pair = Pair::new(0, 1, 41);
+        let mut wrong = cfg(Mode::Entry, 0, 1);
+        wrong.auth_key = AuthKey([0xb8; 32]);
+        pair.entry = Session::new(wrong, pair.t, 41).unwrap();
+        let exchange = start_auth(&mut pair.entry, &mut pair.exit, pair.t);
+        let mut wire = Wire::default();
+        pair.entry.on_outer(pair.t, &exchange.challenge, &mut wire);
+        assert!(
+            wire.take().is_empty(),
+            "Entry must not prove itself to an untrusted Exit"
+        );
+        assert!(encap(&mut pair.entry, &[0x45; 20], 40).is_none());
+        assert!(encap(&mut pair.exit, &[0x60; 40], 40).is_none());
+        pair.entry
+            .on_tick(pair.t + Duration::from_secs(15), &mut wire);
+        assert!(wire
+            .take()
+            .iter()
+            .any(|f| parsed(f).meta.flags == flags::SYN));
+    }
+
     #[test]
     fn entry_source_port_stays_in_worker_residue_class() {
         for seed in 0..50 {
             let t = Instant::now();
-            let mut s = Session::new(cfg(Mode::Entry, 3, 4), t, seed * 7919);
+            let mut s = Session::new(cfg(Mode::Entry, 3, 4), t, seed * 7919).unwrap();
             let mut w = Wire::default();
             s.start(t, &mut w);
             let port = parsed(&w.take()[0]).meta.src.port();
@@ -563,7 +1189,7 @@ mod tests {
     }
 
     #[test]
-    fn handshake_carries_options_and_establishes_both_sides() {
+    fn handshake_options_are_preserved_but_forwarding_requires_mutual_authentication() {
         let mut p = Pair::new(1, 4, 42);
         let mut w = Wire::default();
         p.entry.start(p.t, &mut w);
@@ -576,7 +1202,7 @@ mod tests {
 
         let mut w = Wire::default();
         assert!(p.exit.on_outer(p.t, &syn[0], &mut w).is_none());
-        assert_eq!(p.exit.state(), State::SynReceived);
+        assert!(encap(&mut p.exit, &[0x45; 20], 40).is_none());
         let synack = w.take();
         let sa = parsed(&synack[0]);
         assert_eq!(sa.meta.flags, flags::SYN | flags::ACK);
@@ -585,10 +1211,11 @@ mod tests {
 
         let mut w = Wire::default();
         p.entry.on_outer(p.t, &synack[0], &mut w);
-        assert_eq!(p.entry.state(), State::Established);
+        assert!(encap(&mut p.entry, &[0x45; 20], 40).is_none());
         let ack = w.take();
         assert_eq!(parsed(&ack[0]).meta.flags, flags::ACK);
-        p.exit.on_outer(p.t, &ack[0], &mut Wire::default());
+        p.pump(ack);
+        assert_eq!(p.entry.state(), State::Established);
         assert_eq!(p.exit.state(), State::Established);
         let reply = encap(&mut p.exit, &[0x45; 20], 40).unwrap();
         assert_eq!(parsed(&reply).meta.dst, s.meta.src);
@@ -608,8 +1235,8 @@ mod tests {
                 entry.remote = Some("[2001:db8:2::1]:443".parse().unwrap());
                 let mut exit = cfg(Mode::Exit, 0, 2);
                 exit.local_ip = "::".parse().unwrap();
-                p.entry = Session::new(entry, p.t, 7);
-                p.exit = Session::new(exit, p.t, 8);
+                p.entry = Session::new(entry, p.t, 7).unwrap();
+                p.exit = Session::new(exit, p.t, 8).unwrap();
             }
             p.connect();
             let overhead = if ipv6 { 60 } else { 40 };
@@ -644,7 +1271,7 @@ mod tests {
 
     #[test]
     fn encap_drops_until_established() {
-        let mut s = Session::new(cfg(Mode::Entry, 0, 1), Instant::now(), 1);
+        let mut s = Session::new(cfg(Mode::Entry, 0, 1), Instant::now(), 1).unwrap();
         assert!(encap(&mut s, &[0x45; 20], 40).is_none());
         s.start(Instant::now(), &mut Wire::default());
         assert!(encap(&mut s, &[0x45; 20], 40).is_none());
@@ -754,7 +1381,7 @@ mod tests {
         let mut c = cfg(Mode::Entry, 1, 2);
         c.base_port = 65530;
         let t = Instant::now();
-        let mut s = Session::new(c, t, 2); // pool: 65531, 65533, 65535
+        let mut s = Session::new(c, t, 2).unwrap(); // pool: 65531, 65533, 65535
         let mut w = Wire::default();
         s.start(t, &mut w);
         assert_eq!(parsed(&w.take()[0]).meta.src.port(), 65535);
@@ -766,7 +1393,7 @@ mod tests {
     #[test]
     fn syn_is_retried_then_port_rotates_after_dead_timeout() {
         let t = Instant::now();
-        let mut s = Session::new(cfg(Mode::Entry, 0, 1), t, 1);
+        let mut s = Session::new(cfg(Mode::Entry, 0, 1), t, 1).unwrap();
         let mut w = Wire::default();
         s.start(t, &mut w);
         let first = parsed(&w.take()[0]).meta;
@@ -791,7 +1418,7 @@ mod tests {
         let mut p = Pair::new(0, 1, 17);
         p.connect();
         // Exit lost its state (e.g. restarted).
-        p.exit = Session::new(cfg(Mode::Exit, 0, 1), p.t, 99);
+        p.exit = Session::new(cfg(Mode::Exit, 0, 1), p.t, 99).unwrap();
         let data = encap(&mut p.entry, &[0x45; 20], 40).unwrap();
         let mut w = Wire::default();
         assert!(p.exit.on_outer(p.t, &data, &mut w).is_none());
@@ -844,8 +1471,8 @@ mod tests {
     #[test]
     fn duplicate_syn_gets_identical_synack() {
         let t = Instant::now();
-        let mut entry = Session::new(cfg(Mode::Entry, 0, 1), t, 1);
-        let mut exit = Session::new(cfg(Mode::Exit, 0, 1), t, 2);
+        let mut entry = Session::new(cfg(Mode::Entry, 0, 1), t, 1).unwrap();
+        let mut exit = Session::new(cfg(Mode::Exit, 0, 1), t, 2).unwrap();
         let mut w = Wire::default();
         entry.start(t, &mut w);
         let syn = w.take().remove(0);
@@ -874,8 +1501,8 @@ mod tests {
                 let t = Instant::now();
                 let mut p = Pair {
                     t,
-                    entry: Session::new(entry, t, 31),
-                    exit: Session::new(exit, t, 32),
+                    entry: Session::new(entry, t, 31).unwrap(),
+                    exit: Session::new(exit, t, 32).unwrap(),
                 };
                 let mut w = Wire::default();
                 p.entry.start(p.t, &mut w);
@@ -884,8 +1511,7 @@ mod tests {
                 let synack = w.take().remove(0);
                 let original = parsed(&synack).meta;
                 p.entry.on_outer(p.t, &synack, &mut w);
-                let ack = w.take().remove(0);
-                p.exit.on_outer(p.t, &ack, &mut w);
+                p.pump(w.take());
 
                 if data_first {
                     let inner = [0x45; 100];
@@ -909,7 +1535,7 @@ mod tests {
                 assert_eq!(p.entry.on_outer(p.t, &reply, &mut w), Some(&inner[..]));
                 let expected = original
                     .seq
-                    .wrapping_add(1 + if data_first { 100 } else { 0 });
+                    .wrapping_add(1 + auth::EXIT_BYTES + if data_first { 100 } else { 0 });
                 assert_eq!(parsed(&data).meta.ack, expected);
                 assert_eq!(parsed(&reply).meta.seq, expected);
             }
@@ -921,7 +1547,7 @@ mod tests {
         let mut p = Pair::new(0, 1, 31);
         let original = p.connect();
         p.t += Duration::from_secs(2);
-        p.entry = Session::new(cfg(Mode::Entry, 0, 1), p.t, 31 + 32768);
+        p.entry = Session::new(cfg(Mode::Entry, 0, 1), p.t, 31 + 32768).unwrap();
         let mut w = Wire::default();
         p.entry.start(p.t, &mut w);
         let frames = w.take();

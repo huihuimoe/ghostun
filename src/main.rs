@@ -1,3 +1,4 @@
+mod auth;
 mod config;
 mod netfilter;
 mod pkt;
@@ -10,7 +11,7 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use config::{Config, Mode};
-use session::SessionConfig;
+use session::{Session, SessionConfig};
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
@@ -120,6 +121,9 @@ fn run(mut cfg: Config) -> Result<(), String> {
     };
 
     let mut slots = Vec::with_capacity(n);
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64);
     for (i, tun) in tuns.into_iter().enumerate() {
         let id = i as u16;
         let filter = match cfg.mode {
@@ -132,6 +136,7 @@ fn run(mut cfg: Config) -> Result<(), String> {
             sys::raw_socket(cfg.outer_family, &filter).map_err(|e| format!("raw socket: {e}"))?;
         let scfg = SessionConfig {
             mode: cfg.mode,
+            auth_key: cfg.auth_key.clone(),
             local_ip: outer.local_ip,
             remote: cfg.remote,
             listen_port,
@@ -142,15 +147,18 @@ fn run(mut cfg: Config) -> Result<(), String> {
             ping_interval: cfg.ping_interval,
             dead_timeout: cfg.dead_timeout,
         };
-        slots.push((scfg, tun, raw));
+        let session = Session::new(scfg, std::time::Instant::now(), seed ^ ((id as u64) << 48))
+            .map_err(|e| format!("initializing worker {id} authentication: {e}"))?;
+        slots.push((session, tun, raw));
     }
+    let family = cfg.outer_family;
     let workers: Vec<_> = slots
         .into_iter()
         .enumerate()
-        .map(|(i, (scfg, tun, raw))| {
+        .map(|(i, (session, tun, raw))| {
             std::thread::Builder::new()
                 .name(format!("ghostun-w{i}"))
-                .spawn(move || worker::run(i, scfg, tun, raw, &STOP))
+                .spawn(move || worker::run(i, family, session, tun, raw, &STOP))
                 .expect("spawning worker thread")
         })
         .collect();

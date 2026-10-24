@@ -120,9 +120,42 @@ impl<A: CidrAddr> FromStr for Cidr<A> {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct AuthKey(pub [u8; 32]);
+
+impl fmt::Debug for AuthKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AuthKey([REDACTED])")
+    }
+}
+
+impl FromStr for AuthKey {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let invalid = || "`auth_key` must contain exactly 64 hexadecimal characters".to_owned();
+        if text.len() != 64 {
+            return Err(invalid());
+        }
+        let mut bytes = [0; 32];
+        for (byte, pair) in bytes.iter_mut().zip(text.as_bytes().as_chunks::<2>().0) {
+            let digit = |ch: u8| match ch {
+                b'0'..=b'9' => Some(ch - b'0'),
+                b'a'..=b'f' => Some(ch - b'a' + 10),
+                b'A'..=b'F' => Some(ch - b'A' + 10),
+                _ => None,
+            };
+            *byte =
+                (digit(pair[0]).ok_or_else(invalid)? << 4) | digit(pair[1]).ok_or_else(invalid)?;
+        }
+        Ok(Self(bytes))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
     pub mode: Mode,
+    pub auth_key: AuthKey,
     pub tun_name: String,
     pub tun_ipv4: Cidr<Ipv4Addr>,
     pub tun_ipv6: Option<Cidr<Ipv6Addr>>,
@@ -240,10 +273,11 @@ struct Common {
     no_netfilter: bool,
 }
 
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct File {
     mode: Option<Mode>,
+    auth_key: Option<String>,
     tun_name: Option<String>,
     tun_ipv4: Option<String>,
     tun_ipv6: Option<String>,
@@ -278,7 +312,9 @@ where
         Some(path) => {
             let text = std::fs::read_to_string(path)
                 .map_err(|e| format!("reading {}: {e}", path.display()))?;
-            toml::from_str::<File>(&text).map_err(|e| format!("parsing {}: {e}", path.display()))?
+            // TOML's display output includes source lines, which can contain the key.
+            toml::from_str::<File>(&text)
+                .map_err(|_| format!("parsing {}: invalid TOML configuration", path.display()))?
         }
         None => File::default(),
     };
@@ -345,6 +381,11 @@ where
     let default_conns = std::thread::available_parallelism().map_or(1, |n| n.get().min(256) as u16);
     let cfg = Config {
         mode,
+        auth_key: file
+            .auth_key
+            .as_deref()
+            .ok_or("missing TOML `auth_key`")?
+            .parse()?,
         tun_name: common
             .tun_name
             .or(file.tun_name)
@@ -427,7 +468,7 @@ mod tests {
     use super::*;
 
     fn parse(args: &[&str]) -> Result<Config, String> {
-        parse_from(std::iter::once("ghostun").chain(args.iter().copied()))
+        with_file(&format!("cli-{:?}", std::thread::current().id()), "", args)
     }
 
     fn entry(extra: &[&str]) -> Result<Config, String> {
@@ -437,14 +478,67 @@ mod tests {
     }
 
     fn with_file(name: &str, toml: &str, args: &[&str]) -> Result<Config, String> {
+        with_raw_file(
+            name,
+            &format!("auth_key = '{}'\n{toml}", "a7".repeat(32)),
+            args,
+        )
+    }
+
+    fn with_raw_file(name: &str, toml: &str, args: &[&str]) -> Result<Config, String> {
         let path =
             std::env::temp_dir().join(format!("ghostun-test-{}-{name}.toml", std::process::id()));
         std::fs::write(&path, toml).unwrap();
         let mut all = vec!["--config", path.to_str().unwrap()];
         all.extend_from_slice(args);
-        let r = parse(&all);
+        let r = parse_from(std::iter::once("ghostun").chain(all.iter().copied()));
         std::fs::remove_file(&path).unwrap();
         r
+    }
+
+    #[test]
+    fn both_roles_require_an_auth_key() {
+        for args in [
+            vec!["ghostun", "entry", "--remote", "203.0.113.9:443"],
+            vec!["ghostun", "exit", "--listen", "443"],
+        ] {
+            assert!(parse_from(args).is_err(), "a missing key must fail closed");
+        }
+    }
+
+    #[test]
+    fn key_validation_never_discloses_secret_material() {
+        let key = "a7B9".repeat(16);
+        for role in [
+            "mode = 'entry'\nremote = '192.0.2.1:443'",
+            "mode = 'exit'\nlisten = 443",
+        ] {
+            let config =
+                with_raw_file("valid-key", &format!("auth_key = '{key}'\n{role}"), &[]).unwrap();
+            assert!(!format!("{config:?}").contains(&key));
+            for bad in [
+                String::new(),
+                "password".into(),
+                "a".repeat(63),
+                "a".repeat(65),
+                "g".repeat(64),
+                "é".repeat(32),
+            ] {
+                let error =
+                    with_raw_file("invalid-key", &format!("auth_key = '{bad}'\n{role}"), &[])
+                        .unwrap_err();
+                if !bad.is_empty() {
+                    assert!(!error.contains(&bad));
+                }
+            }
+            for invalid in [
+                format!("auth_key = '{key}'\n{role}\nbroken = ["),
+                format!("auth_key = ['{key}']\n{role}"),
+            ] {
+                let error = with_raw_file("invalid-toml", &invalid, &[]).unwrap_err();
+                assert!(!error.contains(&key));
+            }
+        }
     }
 
     #[test]
@@ -574,11 +668,7 @@ mod tests {
         )
         .unwrap_err()
         .contains("conflicts"));
-        assert!(
-            with_file("unknown", "mode = \"exit\"\nlisten = 1\nbogus = 1\n", &[])
-                .unwrap_err()
-                .contains("bogus")
-        );
+        assert!(with_file("unknown", "mode = \"exit\"\nlisten = 1\nbogus = 1\n", &[]).is_err());
         assert!(with_file("norole", "conns = 1\n", &[])
             .unwrap_err()
             .contains("missing role"));

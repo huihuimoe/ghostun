@@ -1,5 +1,7 @@
 # Ghostun Specification: High-Performance L3-over-FakeTCP Tunnel (`Entry` <-> `Exit`)
 
+Mandatory mutual authentication is defined in [the handshake authentication specification](261024-handshake-auth-spec.md). It supersedes unauthenticated admission: TCP handshake completion alone never permits forwarding or peer replacement.
+
 ## Problem Statement
 
 In the existing `Client <--> relay <--> Server` cross-border/cross-network proxy architecture, relay acts only as an L4 transparent TCP forwarder based on `splice`. All expensive proxy protocol termination—authentication, traffic accounting, TLS/AEAD encryption and decryption, and multiplexed-stream decoding—runs on the remote `Server` (the egress node). As a result, the egress node has high CPU and connection-state costs and becomes a single-machine performance bottleneck.
@@ -50,7 +52,7 @@ Design and deliver `ghostun`: a high-performance, low-memory L3-over-FakeTCP tun
 12. As a performance engineer, I want Health Ping and Health Pong control frames to be multiplexed using the first-byte version nibble (`0x0` vs. IPv4 `0x4` and IPv6 `0x6`), so that normal inner IPv4 and IPv6 data packets incur zero extra framing bytes.
 13. As a reliability engineer, I want the Entry worker to detect when an outer FakeTCP connection misses consecutive Health Pongs beyond the configured dead timeout, so that silent black-holing by an intermediate firewall is detected within seconds even when the firewall sends no `RST`.
 14. As a network engineer, I want the Entry worker to transmit `RST` packets on the old 5-tuple before rotating to a new source port (`sport % N == worker_id`) upon reconnection, so that any lingering `ESTABLISHED` entry in the intermediate firewall transitions immediately to `CLOSE` and does not leak `conntrack` quota slots.
-15. As a reliability engineer, I want the Exit worker to immediately accept a newly handshaking connection for slot $i$ (`sport % N == i`) and replace its stale peer state, so that Entry-initiated reconnections recover traffic seamlessly without manual intervention on Exit.
+15. As a reliability engineer, I want the Exit worker to immediately accept a successfully authenticated replacement for slot $i$ (`sport % N == i`), so that Entry-initiated reconnections recover traffic without waiting for the old peer's dead timeout or allowing unauthenticated takeover.
 16. As a network engineer deploying on heterogeneous networks (PPPoE `1492`, cloud VPC `1420`, jumbo frames, or standard `1500` Ethernet), I want explicit `--outer-mtu` / `--tun-mtu` flags and automatic egress-interface MTU detection, so that the inner TUN MTU fits the selected outer family's encapsulation overhead.
 17. As a network engineer, I want automatic inner TCP SYN MSS clamping to the route MTU (`tcp flags syn tcp option maxseg size set rt mtu`), so that negotiated inner segments fit after adding the 40-byte IPv4 or 60-byte IPv6 outer headers.
 18. As a proxy administrator, I want both inner IPv4 and IPv6 over either outer IPv4 or IPv6, so that the inner traffic family is independent of the available outer network.
@@ -70,7 +72,7 @@ Design and deliver `ghostun`: a high-performance, low-memory L3-over-FakeTCP tun
 
 - Compile the system as one `ghostun` executable. Select the role with `ghostun entry` / `ghostun exit`, or with `mode = "entry" | "exit"` in the configuration file.
 - Remove legacy reference directories from the repository and organize the core modules directly under the project root: CLI/configuration, Netlink/TUN device management, Netfilter lifecycle, zero-copy packet encoding/decoding and BPF generation, the FakeTCP session state machine, and pinned Entry/Exit worker loops.
-- Expose the complete configuration through CLI and configuration files. Explicit CLI arguments take precedence over `--config` values:
+- Expose operational settings through CLI and configuration files. The mandatory 32-byte `auth_key` is TOML-only, encoded as 64 hexadecimal characters and validated before networking. Explicit CLI arguments take precedence over other `--config` values:
   - `--tun <NAME>`: name of the inner TUN to create and bind; alias `--tun-name`, default `ghostun0`. Supports isolated instances on one host.
   - `--tun-ipv4 <CIDR>` / `--tun-ipv6 <CIDR>`: inner addresses. Entry defaults to `10.200.0.1/30` and `fd00:200::1/126`; Exit defaults to `10.200.0.2/30` and `fd00:200::2/126`.
   - `--conns <N>`: number of persistent outer FakeTCP connections and pinned worker threads; defaults to the system CPU core count.
@@ -118,8 +120,12 @@ Design and deliver `ghostun`: a high-performance, low-memory L3-over-FakeTCP tun
   State Machine per Worker Slot i (i in 0..N):
   [Disconnected]
      |-- (Entry sends SYN with MSS, WS=14, SACK_PERM on sport where sport % N == i) --> [SynSent]
-     |-- (Entry receives SYN+ACK, sends ACK) --> [Established]
-     |-- (Exit receives SYN on sport % N == i, sends SYN+ACK, receives data/ACK) --> [Established]
+     |-- (Entry receives SYN+ACK, sends ACK) --> [Authenticating]
+     |-- (Exit receives SYN, returns stateless SYN+ACK) --> active session unchanged
+  [Authenticating]
+     |-- Hello -> Challenge + Exit proof -> Entry proof -> Finished
+     |-- Exit verifies Entry proof --> [Established], replacing only after verification
+     |-- Entry verifies Exit proof and Finished --> [Established]
 
   In [Established]:
      - Outbound L3 packet (first nibble 0x4 or 0x6):
@@ -140,7 +146,7 @@ Design and deliver `ghostun`: a high-performance, low-memory L3-over-FakeTCP tun
   ```
 
 - **Three-way handshake options**: SYN and SYN-ACK carry MSS, Window Scale = 14 (scaling the 16-bit window by $2^{14}$, for an upper limit of approximately 1 GB), and SACK-permitted. Established data packets retain only the standard 20-byte TCP header.
-- **Duplicate SYN handling**: A retransmitted SYN with the same endpoints and initial sequence number must preserve pending or established session state. Reuse the original SYN-ACK sequence and acknowledgment numbers even after data has advanced the session. A new SYN with a different initial sequence number remains eligible to replace the old session.
+- **Duplicate SYN handling**: A retransmitted SYN cannot reset an authenticated session or refresh its liveness. For the active exchange, reuse the original SYN-ACK sequence and acknowledgment numbers even after data advances the session. A new SYN starts stateless candidate processing, never immediate replacement. Authentication replay and completion rules are defined in the authentication specification.
 - **Stateless cross-worker L3 multiplexing**: Inner L3 forwarding is stateless across workers. Even if forward and return traffic hash to different outer slots, each outer connection independently maintains its sequence window and firewall state using threshold ACKs and bidirectional Health Ping/Pong every five seconds.
 
 ### 6. Self-Contained Netfilter Lifecycle (`--no-netfilter` Opt-out)
@@ -166,6 +172,7 @@ Use **two core testing seams** to verify behavior at the highest practical abstr
    - Decouple the FakeTCP Session and packet codec from TUN/raw-socket OS I/O. Inputs are current time plus received outer frames or inner L3 packets. Observable outputs are emitted outer TCP frames, inner packets for TUN delivery, and connection state.
    - Without root, verify the three-way handshake, IPv4/IPv6 dispatch, Health Ping/Pong, threshold ACKs under one-way bulk traffic, timeout recovery that sends RST before rotating the source port within `sport % N == i`, checksums, and classic BPF rules.
    - Verify delayed duplicate SYNs before and after bidirectional data over both outer families, and verify that a genuinely new handshake on the same tuple can still establish a replacement session. Derive endpoint assertions from emitted frames rather than test-only field accessors.
+   - Require mutual authentication before forwarding; verify invalid proofs, replay resistance, candidate isolation and expiry, legitimate admission during unrelated attempts, authenticated replacement, and loss/duplicate sequence accounting.
 2. **Linux netns E2E seam: real-kernel integration**:
    - Use `ip netns` to build `entry_ns <--> fw_ns <--> exit_ns`, with strict nftables conntrack in the firewall namespace and a separate internet namespace for inner traffic. Exercise outer IPv4 and IPv6 separately, including inner IPv4/IPv6 in each run. Remove IPv4 addresses from endpoint outer interfaces in the IPv6 run.
    - Launch the compiled `ghostun entry` and `ghostun exit` processes and verify at the system boundary:
@@ -173,6 +180,7 @@ Use **two core testing seams** to verify behavior at the highest practical abstr
      - Under concurrent inner flows, inspect `/proc/net/nf_conntrack` or `conntrack -L` in the firewall namespace and verify exactly `--conns N` established outer connections.
      - Flush firewall conntrack state to simulate silent connection loss. Verify health-based detection, RST cleanup of old slots, reconnection, and restored inner traffic.
      - Send SIGTERM and verify removal of the `ghostun0` interface and `table inet ghostun_ghostun0`.
+     - Supply mandatory keys, deny wrong-key forwarding and takeover, retain active tuples during unauthenticated handshakes, and authenticate source-address replacement and recovery after lost authentication messages.
      - Disable IPv6 for new interfaces and hide its sysctl tree in private mount namespaces. Verify automatic inner IPv4 fallback for both default roles, full-MTU forwarding, and clean shutdown without accessing unavailable IPv6 forwarding controls.
    - Run the netns topology inside a privileged Docker container (`sudo docker run -d --privileged`) to avoid modifying host networking. Remove the container after testing.
 

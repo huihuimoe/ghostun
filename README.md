@@ -17,12 +17,13 @@ flowchart LR
 ## How it works
 
 - **One multi-queue TUN, raw outer sockets.** Inner packets cross the TUN boundary once per node. Outer frames use `SOCK_RAW` with `IP_HDRINCL` (IPv4) or `IPV6_HDRINCL` (IPv6): 40 B or 60 B of IP + TCP headers, no outer TUN, no outer NAT.
-- **Exactly N outer connections.** `--conns N` workers, each pinned to one CPU, own one TCP-handshaked connection (SYN with MSS, SACK_PERM, WScale 14). The firewall conntrack table only ever holds N entries for the tunnel.
+- **Exactly N steady-state outer connections.** `--conns N` workers, each pinned to one CPU, own one authenticated connection (SYN with MSS, SACK_PERM, WScale 14). Candidate handshakes may temporarily add conntrack entries; authenticated replacement resets the retired tuple.
 - **Kernel steering.** Each worker's raw socket has a classic BPF filter, so worker `i` only receives its own connection (entry: `dport % N == i`, exit: `sport % N == i`). No locks or channels between cores.
 - **No outer retransmission.** Inner TCP handles loss, so there is no TCP-over-TCP meltdown. Sequence and ack numbers advance for every frame. A bare ACK goes out after 1 MiB of one-way data, which keeps the firewall's window tracking satisfied.
-- **Zero-overhead control frames.** A payload whose first byte has high nibble `0` is a control frame (`0x01` ping, `0x02` pong + 8-byte nonce). IPv4/IPv6 packets start with `0x4`/`0x6`, so data frames carry no extra framing.
-- **Self-healing.** Both sides ping every `--ping-interval`. If the entry hears nothing for `--dead-timeout`, it sends 2 RSTs on the old tuple (the firewall frees the slot), moves to the next source port of its residue class, and handshakes again. The exit answers stray non-SYN frames with RST, so a restarted exit recovers within a round trip.
+- **Unframed data, separate control.** Payloads starting with `0x01` or `0x02` are health ping/pong frames; `0x03` identifies connection-time authentication. IPv4/IPv6 packets start with `0x4`/`0x6`, so data frames carry no extra framing.
+- **Self-healing.** Both sides ping every `--ping-interval`. If the entry hears nothing for `--dead-timeout`, it sends 2 RSTs on the old tuple, moves to the next source port of its residue class, and authenticates again. The exit answers stray non-SYN data with RST, triggering reconnection without waiting for the Entry dead timer.
 - **Independent inner and outer families.** Inner IPv4 and IPv6 work over either IPv4 or IPv6 outer transport. Each instance uses one outer family, without simultaneous dual-stack listening or automatic family switching.
+- **Mandatory mutual authentication.** Each worker proves possession of the same random 32-byte key after the ordinary TCP handshake. Authentication adds about two setup RTTs, not steady-state MACs, data headers, or exchanges. Unauthenticated candidates cannot replace or keep an active session alive.
 
 ## Build
 
@@ -35,29 +36,38 @@ Runtime needs `ip` (iproute2) and, unless `--no-netfilter` is set, `nft` (nftabl
 
 ## Quick start
 
+Generate a key-only config once, then securely copy the same file to both nodes. This uses standard Linux tools; the key is not passed through process arguments:
+
+```sh
+umask 077
+{
+    printf 'auth_key = "'
+    od -An -N32 -tx1 /dev/urandom | tr -d ' \n'
+    printf '"\n'
+} > auth.toml
+```
+
 ```sh
 # exit (public IP 203.0.113.10)
-ghostun exit --listen 443 --conns 4
+ghostun --config auth.toml exit --listen 443 --conns 4
 
 # entry
-ghostun entry --remote 203.0.113.10:443 --conns 4
+ghostun --config auth.toml entry --remote 203.0.113.10:443 --conns 4
 ```
 
 For an IPv6 outer path:
 
 ```sh
 # exit (public IPv6 address 2001:db8::10)
-ghostun exit --listen 443 --outer-family ipv6 --conns 4
+ghostun --config auth.toml exit --listen 443 --outer-family ipv6 --conns 4
 
 # entry: bracket the IPv6 literal; its family is selected automatically
-ghostun entry --remote '[2001:db8::10]:443' --conns 4
+ghostun --config auth.toml entry --remote '[2001:db8::10]:443' --conns 4
 ```
 
 Exit defaults to `--outer-family ipv4`. `--outer-family` / TOML `outer_family` is Exit-only; Entry derives the family from `remote`. `--no-ipv6` disables only inner IPv6 and does not disable an IPv6 outer path. Remote addresses must be IP literals, not hostnames.
 
 `--conns` **must be identical on both ends**. Allow inbound TCP to the listen port on the exit.
-
-Ghostun does not yet authenticate tunnel peers. Restrict the Exit port to trusted peers with external firewall rules; do not expose it as an authenticated service.
 
 The entry does not change your routing table. Point the proxy at the TUN device instead.
 
@@ -88,8 +98,8 @@ Several instances can share a host if each one has a different `--tun` name, inn
 ## CLI
 
 ```
-ghostun [--config PATH] entry --remote IP:PORT [options]
-ghostun [--config PATH] exit  --listen PORT    [options]
+ghostun --config PATH entry --remote IP:PORT [options]
+ghostun --config PATH exit  --listen PORT    [options]
 ghostun --config PATH          # role taken from `mode` in the file
 ```
 
@@ -115,7 +125,9 @@ Logging: `RUST_LOG=debug ghostun ...` (default `info`).
 
 ## Config file
 
-TOML keys are the long flag names in snake_case. CLI flags override the file. Unknown keys are rejected. See [`deploy/config.example.toml`](deploy/config.example.toml).
+Both roles require a file-only `auth_key`: exactly 64 hexadecimal characters encoding 32 random bytes. A missing or malformed key is rejected before networking starts. There is no CLI key argument, password mode, bypass, or legacy fallback. Keep configuration files mode `0600`; never use a public example key. Start with the generated `auth.toml` above and add the settings below.
+
+Other TOML keys are the long flag names in snake_case. CLI flags override the file. Unknown keys are rejected. See [`deploy/config.example.toml`](deploy/config.example.toml).
 
 ```toml
 mode = "exit"
@@ -123,6 +135,15 @@ listen = 443
 conns = 4
 iface = "eth0"
 ```
+
+## Authentication and security
+
+- The key is shared by one trust domain. Any holder may replace a session, including from a changed source address; there are no individual identities, permissions, or revocation. Avoid duplicate Entry deployments with the same key.
+- Authentication protects admission, not established packets: there is no tunnel encryption, per-packet integrity, or established-packet replay protection. On-path attackers or attackers able to forge accepted data, health frames, or RSTs remain outside this protection.
+- Stateless candidates cannot reserve the only authentication slot, but this is not DDoS protection or scanner invisibility. Optional operator-managed source allowlists remain defense in depth, not a requirement for fixed Entry addresses.
+- Rotate keys by securely updating both configuration files and restarting both peers. Hot rotation and unauthenticated-version interoperability are unsupported.
+
+Wire format, replay handling, and retry rules: [`docs/261024-handshake-auth-spec.md`](docs/261024-handshake-auth-spec.md).
 
 ## MTU and MSS
 
@@ -179,18 +200,19 @@ Ghostun configures the TUN before installing firewall rules. If the kernel rejec
 
 ```sh
 install -m755 target/release/ghostun /usr/local/bin/
-install -Dm644 deploy/config.example.toml /etc/ghostun/entry.toml   # edit it
+install -d -m700 /etc/ghostun
+install -m600 deploy/config.example.toml /etc/ghostun/entry.toml  # edit; add the generated auth_key
 install -m644 deploy/ghostun-entry.service /etc/systemd/system/
 systemctl enable --now ghostun-entry
 ```
 
-Use `exit.toml` and `ghostun-exit.service` on the exit.
+Use `exit.toml` and `ghostun-exit.service` on the exit. Both files must contain the same generated `auth_key` before starting the services.
 
 ### Docker Compose
 
 ```sh
 cd deploy
-cp config.example.toml entry.toml   # edit it
+install -m600 config.example.toml entry.toml   # edit; add the generated auth_key
 docker compose -f docker-compose.entry.yml up -d --build
 ```
 

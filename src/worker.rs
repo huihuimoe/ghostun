@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::config::OuterFamily;
-use crate::session::{Session, SessionConfig, Sink};
+use crate::session::{Session, Sink};
 use crate::sys;
 
 const BATCH: usize = 64;
@@ -29,17 +29,18 @@ fn read(fd: BorrowedFd<'_>, buf: &mut [u8]) -> Option<usize> {
 }
 
 /// Runs until `stop` is set, then resets the outer connection so firewalls free its slot.
-pub fn run(id: usize, cfg: SessionConfig, tun: OwnedFd, raw: OwnedFd, stop: &AtomicBool) {
+pub fn run(
+    id: usize,
+    family: OuterFamily,
+    mut session: Session,
+    tun: OwnedFd,
+    raw: OwnedFd,
+    stop: &AtomicBool,
+) {
     if let Err(e) = sys::pin_to_cpu(id) {
         log::warn!("worker {id}: cannot pin to CPU: {e}");
     }
-    let seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos() as u64)
-        ^ ((id as u64) << 48);
-    let family = OuterFamily::of(cfg.local_ip);
     let overhead = family.overhead();
-    let mut session = Session::new(cfg, Instant::now(), seed);
     let mut out = RawSink(raw.as_fd());
     session.start(Instant::now(), &mut out);
 

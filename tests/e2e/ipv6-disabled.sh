@@ -8,6 +8,9 @@ LOG=${LOG:-/tmp/ghostun-ipv6-disabled}
 ENTRY=ghostun-v4-entry
 EXIT=ghostun-v4-exit
 mkdir -p "$LOG"
+umask 077
+# Public fixture key, never a deployment credential.
+printf "auth_key = '%064d'\n" 1 >"$LOG/auth.toml"
 PIDS=()
 
 cleanup() {
@@ -35,13 +38,13 @@ ip netns exec "$EXIT" bash -c '
     set -e
     mount -t tmpfs tmpfs /proc/sys/net/ipv6
     exec "$@"
-' _ "$BIN" exit --listen 443 --iface x0 --conns 1 >"$LOG/exit.log" 2>&1 &
+' _ "$BIN" --config "$LOG/auth.toml" exit --listen 443 --iface x0 --conns 1 >"$LOG/exit.log" 2>&1 &
 PIDS+=("$!")
 ip netns exec "$ENTRY" bash -c '
     set -e
     mount -t tmpfs tmpfs /proc/sys/net/ipv6
     exec "$@"
-' _ "$BIN" entry --remote 192.0.2.2:443 --iface e0 --conns 1 >"$LOG/entry.log" 2>&1 &
+' _ "$BIN" --config "$LOG/auth.toml" entry --remote 192.0.2.2:443 --iface e0 --conns 1 >"$LOG/entry.log" 2>&1 &
 PIDS+=("$!")
 
 connected=false

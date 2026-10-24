@@ -1,5 +1,11 @@
-# ghostun configuration. Every key is optional unless noted; CLI flags override file values.
+# ghostun configuration. CLI flags override file values; auth_key is file-only and mandatory.
 # Durations are integer seconds.
+
+# Generate a secret once, then copy it to both peers through a secure channel:
+#   od -An -N32 -tx1 /dev/urandom | tr -d ' \n'
+# Uncomment and fill this field; no public example key is safe for deployment.
+# auth_key = "<64 hexadecimal characters from the command above>"
+# Store this file with mode 0600. Key changes require restarting both peers.
 
 # Role (required unless given as the `entry` / `exit` subcommand).
 mode = "entry"
