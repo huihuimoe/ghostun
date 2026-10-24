@@ -103,12 +103,12 @@ delete table inet {table}
 table inet {table} {{
     chain prerouting {{
         type filter hook prerouting priority raw; policy accept;
-        iifname != "{tun}" {outer_in} notrack meta pkttype set other
+        {outer_in} iifname != "{tun}" notrack meta pkttype set other
     }}
     chain output {{
         type filter hook output priority raw; policy accept;
         {outer_out} tcp flags rst meta mark != {mark} drop
-        {outer_out} notrack
+        {outer_out} notrack accept
         oifname "{tun}" {clamp}
     }}
     chain forward {{
@@ -182,8 +182,12 @@ mod tests {
         });
         assert!(
             rules.contains(
-                r#"iifname != "ghostun0" meta nfproto ipv4 tcp dport 443 notrack meta pkttype set other"#
+                r#"meta nfproto ipv4 tcp dport 443 iifname != "ghostun0" notrack meta pkttype set other"#
             ),
+            "{rules}"
+        );
+        assert!(
+            rules.contains("meta nfproto ipv4 tcp sport 443 notrack accept"),
             "{rules}"
         );
     }

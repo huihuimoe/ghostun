@@ -86,47 +86,48 @@ pub fn run(
             }
         }
         now = Instant::now();
-        busy = false;
         let mut tun_ready = fds[0].revents & libc::POLLIN != 0;
-        if fds[1].revents & libc::POLLIN != 0 {
-            for round in 0..ROUNDS {
-                let m = match sys::recv_raw_batch(raw.as_fd(), family, &mut bufs, stride, &mut lens)
-                {
-                    Ok(m) => m,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(e) => {
-                        log::debug!("worker {id}: raw receive: {e}");
-                        break;
-                    }
-                };
-                for (k, &n) in lens[..m].iter().enumerate() {
-                    if n == 0 {
-                        continue;
-                    }
-                    let frame = &bufs[k * stride..k * stride + n];
-                    if let Some(inner) = session.on_outer(now, frame, &mut out) {
-                        // SAFETY: write(2) of a slice of the stated length.
-                        if unsafe {
-                            libc::write(tun.as_raw_fd(), inner.as_ptr().cast(), inner.len())
-                        } < 0
-                        {
-                            log::debug!(
-                                "worker {id}: tun write: {}",
-                                std::io::Error::last_os_error()
-                            );
-                        } else {
-                            tun_ready = true;
+        let mut raw_ready = fds[1].revents & libc::POLLIN != 0;
+        for _ in 0..ROUNDS {
+            if raw_ready {
+                raw_ready =
+                    match sys::recv_raw_batch(raw.as_fd(), family, &mut bufs, stride, &mut lens) {
+                        Ok(m) => {
+                            for (k, &n) in lens[..m].iter().enumerate() {
+                                if n == 0 {
+                                    continue;
+                                }
+                                let frame = &bufs[k * stride..k * stride + n];
+                                if let Some(inner) = session.on_outer(now, frame, &mut out) {
+                                    // SAFETY: write(2) of a slice of the stated length.
+                                    if unsafe {
+                                        libc::write(
+                                            tun.as_raw_fd(),
+                                            inner.as_ptr().cast(),
+                                            inner.len(),
+                                        )
+                                    } < 0
+                                    {
+                                        log::debug!(
+                                            "worker {id}: tun write: {}",
+                                            std::io::Error::last_os_error()
+                                        );
+                                    } else {
+                                        tun_ready = true;
+                                    }
+                                }
+                            }
+                            m == RAW_BATCH
                         }
-                    }
-                }
-                if m < RAW_BATCH {
-                    break;
-                }
-                busy |= round + 1 == ROUNDS;
+                        Err(e) => {
+                            if e.kind() != std::io::ErrorKind::WouldBlock {
+                                log::debug!("worker {id}: raw receive: {e}");
+                            }
+                            false
+                        }
+                    };
             }
-        }
-        if tun_ready {
-            for round in 0..ROUNDS {
+            if tun_ready {
                 let mut reads = 0;
                 let mut count = 0;
                 let mut batch_dst = None;
@@ -149,12 +150,13 @@ pub fn run(
                         log::debug!("worker {id}: send to {dst}: {e}");
                     }
                 }
-                if reads < RAW_BATCH {
-                    break;
-                }
-                busy |= round + 1 == ROUNDS;
+                tun_ready = reads == RAW_BATCH;
+            }
+            if !raw_ready && !tun_ready {
+                break;
             }
         }
+        busy = raw_ready || tun_ready;
         if now >= session.next_deadline() {
             session.on_tick(now, &mut out);
         }
