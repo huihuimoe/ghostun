@@ -160,6 +160,7 @@ pub struct Config {
     pub tun_ipv4: Cidr<Ipv4Addr>,
     pub tun_ipv6: Option<Cidr<Ipv6Addr>>,
     pub conns: u16,
+    pub cpus: Option<Vec<usize>>,
     pub outer_mtu: Option<u32>,
     pub tun_mtu: Option<u32>,
     pub iface: Option<String>,
@@ -233,6 +234,9 @@ struct Cli {
     /// outer connections = worker threads; must match on both ends [default: CPU count]
     #[argh(option, arg_name = "N")]
     conns: Option<u16>,
+    /// worker CPU list or ranges, e.g. 0,1 or 2-3 [default: all usable CPUs]
+    #[argh(option, arg_name = "LIST")]
+    cpus: Option<String>,
     /// outer path MTU [default: egress interface MTU, fallback 1500]
     #[argh(option, arg_name = "MTU")]
     outer_mtu: Option<u32>,
@@ -268,6 +272,7 @@ struct File {
     tun_ipv4: Option<String>,
     tun_ipv6: Option<String>,
     conns: Option<u16>,
+    cpus: Option<String>,
     outer_mtu: Option<u32>,
     tun_mtu: Option<u32>,
     iface: Option<String>,
@@ -374,7 +379,16 @@ where
                 .parse()?,
         )
     };
-    let default_conns = std::thread::available_parallelism().map_or(1, |n| n.get().min(256) as u16);
+    let cpus = cli
+        .cpus
+        .or(file.cpus)
+        .as_deref()
+        .map(parse_cpus)
+        .transpose()?;
+    let default_conns = cpus.as_ref().map_or_else(
+        || std::thread::available_parallelism().map_or(1, |n| n.get().min(256) as u16),
+        |c| c.len().min(256) as u16,
+    );
     let cfg = Config {
         mode,
         auth_key: file
@@ -389,6 +403,7 @@ where
         tun_ipv4,
         tun_ipv6,
         conns: cli.conns.or(file.conns).unwrap_or(default_conns),
+        cpus,
         outer_mtu: cli.outer_mtu.or(file.outer_mtu),
         tun_mtu: cli.tun_mtu.or(file.tun_mtu),
         iface: cli.iface.or(file.iface),
@@ -402,6 +417,37 @@ where
     };
     validate(&cfg)?;
     Ok(cfg)
+}
+
+fn parse_cpus(spec: &str) -> Result<Vec<usize>, String> {
+    let mut out = Vec::new();
+    for part in spec.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            return Err(format!("invalid CPU list {spec:?}"));
+        }
+        if let Some((a, b)) = part.split_once('-') {
+            let start: usize = a
+                .parse()
+                .map_err(|_| format!("invalid CPU range {part:?} in {spec:?}"))?;
+            let end: usize = b
+                .parse()
+                .map_err(|_| format!("invalid CPU range {part:?} in {spec:?}"))?;
+            if start > end || end >= libc::CPU_SETSIZE as usize {
+                return Err(format!("invalid CPU range {part:?} in {spec:?}"));
+            }
+            out.extend(start..=end);
+        } else {
+            let cpu: usize = part
+                .parse()
+                .map_err(|_| format!("invalid CPU ID {part:?} in {spec:?}"))?;
+            if cpu >= libc::CPU_SETSIZE as usize {
+                return Err(format!("invalid CPU ID {part:?} in {spec:?}"));
+            }
+            out.push(cpu);
+        }
+    }
+    Ok(out)
 }
 
 fn validate(c: &Config) -> Result<(), String> {
@@ -546,6 +592,7 @@ mod tests {
             usize::from(c.conns),
             std::thread::available_parallelism().unwrap().get().min(256)
         );
+        assert_eq!(c.cpus, None);
         assert_eq!(
             (c.outer_mtu, c.tun_mtu, c.iface.as_deref()),
             (None, None, None)
@@ -580,6 +627,8 @@ mod tests {
             "fd00:9::1/64",
             "--conns",
             "3",
+            "--cpus",
+            "2-3,0",
             "--outer-mtu",
             "1492",
             "--tun-mtu",
@@ -602,6 +651,7 @@ mod tests {
             (c.conns, c.outer_mtu, c.tun_mtu),
             (3, Some(1492), Some(1400))
         );
+        assert_eq!(c.cpus.as_deref(), Some(&[2, 3, 0][..]));
         assert_eq!(c.iface.as_deref(), Some("eth1"));
         assert_eq!(c.base_port, 40000);
         assert_eq!(
@@ -709,6 +759,9 @@ mod tests {
             .contains("prefix"));
         assert!(entry(&["--tun-ipv4", "10.0.0.1"]).is_err());
         assert!(entry(&["--tun-ipv6", "fd00::1/129"]).is_err());
+        assert!(entry(&["--cpus", ""]).is_err());
+        assert!(entry(&["--cpus", "3-1"]).is_err());
+        assert!(entry(&["--cpus", "1024"]).is_err());
     }
 
     #[test]

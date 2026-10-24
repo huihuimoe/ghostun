@@ -42,18 +42,29 @@ pub fn render(spec: &NftSpec) -> String {
         OuterFamily::Ipv4 => ("ipv4", "ip"),
         OuterFamily::Ipv6 => ("ipv6", "ip6"),
     };
-    // Outer tunnel frames sent by this host; the kernel answers our raw-socket peers with RSTs.
-    let outer_out = match spec.mode {
+    // Outer tunnel frames bypass host-local conntrack; kernel-generated RSTs are dropped in raw.
+    let (outer_in, outer_out) = match spec.mode {
         Mode::Entry => {
             let r = spec.remote.expect("entry netfilter spec requires remote");
-            format!(
-                "{addr} daddr {} tcp dport {} tcp sport >= {}",
-                r.ip(),
-                r.port(),
-                spec.base_port
+            (
+                format!(
+                    "{addr} saddr {} tcp sport {} tcp dport >= {}",
+                    r.ip(),
+                    r.port(),
+                    spec.base_port
+                ),
+                format!(
+                    "{addr} daddr {} tcp dport {} tcp sport >= {}",
+                    r.ip(),
+                    r.port(),
+                    spec.base_port
+                ),
             )
         }
-        Mode::Exit => format!("meta nfproto {proto} tcp sport {}", spec.listen_port),
+        Mode::Exit => (
+            format!("meta nfproto {proto} tcp dport {}", spec.listen_port),
+            format!("meta nfproto {proto} tcp sport {}", spec.listen_port),
+        ),
     };
     let clamp = "tcp flags syn tcp option maxseg size set rt mtu";
     let mark = format!("{SOCKET_MARK:#x}");
@@ -90,9 +101,14 @@ pub fn render(spec: &NftSpec) -> String {
         r#"table inet {table} {{}}
 delete table inet {table}
 table inet {table} {{
+    chain prerouting {{
+        type filter hook prerouting priority raw; policy accept;
+        {outer_in} notrack
+    }}
     chain output {{
-        type filter hook output priority filter; policy accept;
+        type filter hook output priority raw; policy accept;
         {outer_out} tcp flags rst meta mark != {mark} drop
+        {outer_out} notrack
         oifname "{tun}" {clamp}
     }}
     chain forward {{

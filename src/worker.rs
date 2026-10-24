@@ -9,7 +9,7 @@ use crate::config::OuterFamily;
 use crate::session::{Session, Sink};
 use crate::sys;
 
-const BATCH: usize = 64;
+const BATCH: usize = 256;
 const MAX_POLL: Duration = Duration::from_millis(200);
 
 struct RawSink<'a>(BorrowedFd<'a>);
@@ -31,13 +31,14 @@ fn read(fd: BorrowedFd<'_>, buf: &mut [u8]) -> Option<usize> {
 /// Runs until `stop` is set, then resets the outer connection so firewalls free its slot.
 pub fn run(
     id: usize,
+    cpu: Option<usize>,
     family: OuterFamily,
     mut session: Session,
     tun: OwnedFd,
     raw: OwnedFd,
     stop: &AtomicBool,
 ) {
-    if let Err(e) = sys::pin_to_cpu(id) {
+    if let Err(e) = sys::pin_to_cpu(id, cpu) {
         log::warn!("worker {id}: cannot pin to CPU: {e}");
     }
     let overhead = family.overhead();
@@ -58,13 +59,19 @@ pub fn run(
             revents: 0,
         },
     ];
+    let mut now = Instant::now();
+    let mut busy = false;
     while !stop.load(Ordering::Relaxed) {
-        let wait = session
-            .next_deadline()
-            .saturating_duration_since(Instant::now())
-            .min(MAX_POLL);
-        // Round up so we never wake just before a deadline and spin.
-        let timeout = wait.as_micros().div_ceil(1000) as libc::c_int;
+        let timeout = if busy {
+            0
+        } else {
+            let wait = session
+                .next_deadline()
+                .saturating_duration_since(now)
+                .min(MAX_POLL);
+            // Round up so we never wake just before a deadline and spin.
+            wait.as_micros().div_ceil(1000) as libc::c_int
+        };
         // SAFETY: fds is a valid array of two pollfd.
         if unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout) } < 0 {
             let e = std::io::Error::last_os_error();
@@ -73,19 +80,21 @@ pub fn run(
                 break;
             }
         }
+        now = Instant::now();
+        busy = false;
         if fds[0].revents & libc::POLLIN != 0 {
-            for _ in 0..BATCH {
+            for i in 0..BATCH {
                 let Some(n) = read(tun.as_fd(), &mut buf[overhead..]) else {
                     break;
                 };
                 if let Some((len, dst)) = session.encap(&mut buf, n) {
                     out.send(&buf[..len], dst);
                 }
+                busy |= i + 1 == BATCH;
             }
         }
         if fds[1].revents & libc::POLLIN != 0 {
-            let now = Instant::now();
-            for _ in 0..BATCH {
+            for i in 0..BATCH {
                 let n = match sys::recv_raw(raw.as_fd(), family, &mut buf) {
                     Ok(n) => n,
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -105,9 +114,12 @@ pub fn run(
                         );
                     }
                 }
+                busy |= i + 1 == BATCH;
             }
         }
-        session.on_tick(Instant::now(), &mut out);
+        if now >= session.next_deadline() {
+            session.on_tick(now, &mut out);
+        }
     }
     session.shutdown(&mut out);
 }

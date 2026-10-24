@@ -79,7 +79,11 @@ fn setsockopt<T>(fd: &OwnedFd, level: libc::c_int, name: libc::c_int, value: &T)
 }
 
 /// Non-blocking raw TCP socket with caller-supplied IP headers and per-worker cBPF steering.
-pub fn raw_socket(family: OuterFamily, filter: &[libc::sock_filter]) -> io::Result<OwnedFd> {
+pub fn raw_socket(
+    family: OuterFamily,
+    bind_dev: Option<&str>,
+    filter: &[libc::sock_filter],
+) -> io::Result<OwnedFd> {
     // SAFETY: socket(2) with constant arguments; the fd is owned immediately.
     let fd = cvt(unsafe {
         libc::socket(
@@ -92,13 +96,24 @@ pub fn raw_socket(family: OuterFamily, filter: &[libc::sock_filter]) -> io::Resu
         )
     })?;
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    if let Some(dev) = bind_dev {
+        // SAFETY: `dev` points to `dev.len()` valid interface-name bytes.
+        cvt(unsafe {
+            libc::setsockopt(
+                fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_BINDTODEVICE,
+                dev.as_ptr().cast(),
+                dev.len() as libc::socklen_t,
+            )
+        })?;
+    }
     let one: libc::c_int = 1;
     match family {
         OuterFamily::Ipv4 => setsockopt(&fd, libc::IPPROTO_IP, libc::IP_HDRINCL, &one)?,
         OuterFamily::Ipv6 => {
             setsockopt(&fd, libc::IPPROTO_IPV6, libc::IPV6_HDRINCL, &one)?;
             setsockopt(&fd, libc::IPPROTO_IPV6, libc::IPV6_RECVPKTINFO, &one)?;
-            setsockopt(&fd, libc::IPPROTO_IPV6, libc::IPV6_CHECKSUM, &16i32)?;
             setsockopt(
                 &fd,
                 libc::IPPROTO_IPV6,
@@ -177,7 +192,7 @@ pub fn send_raw(fd: BorrowedFd<'_>, frame: &[u8], dst: IpAddr) -> io::Result<()>
             fd.as_raw_fd(),
             frame.as_ptr().cast(),
             frame.len(),
-            0,
+            libc::MSG_DONTWAIT,
             (&addr as *const Destination).cast(),
             len as libc::socklen_t,
         )
@@ -195,7 +210,12 @@ pub fn recv_raw(fd: BorrowedFd<'_>, family: OuterFamily, buf: &mut [u8]) -> io::
     // by the returned controllen, and the data length is checked before reading pktinfo.
     unsafe {
         if family == OuterFamily::Ipv4 {
-            let n = libc::recv(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0);
+            let n = libc::recv(
+                fd.as_raw_fd(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                libc::MSG_DONTWAIT,
+            );
             return if n < 0 {
                 Err(io::Error::last_os_error())
             } else {
@@ -215,7 +235,7 @@ pub fn recv_raw(fd: BorrowedFd<'_>, family: OuterFamily, buf: &mut [u8]) -> io::
         msg.msg_iovlen = 1;
         msg.msg_control = control.as_mut_ptr().cast();
         msg.msg_controllen = size_of_val(&control);
-        let n = libc::recvmsg(fd.as_raw_fd(), &mut msg, 0);
+        let n = libc::recvmsg(fd.as_raw_fd(), &mut msg, libc::MSG_DONTWAIT);
         if n < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -245,22 +265,27 @@ pub fn recv_raw(fd: BorrowedFd<'_>, family: OuterFamily, buf: &mut [u8]) -> io::
     }
 }
 
-/// Pins the calling thread to the `cpu`-th CPU it is allowed to run on (wrapping), so cpusets
-/// and containers with restricted CPUs still get one worker per usable core.
-pub fn pin_to_cpu(cpu: usize) -> io::Result<()> {
+/// Pins the calling thread to `explicit` CPU if set, else the `worker`-th allowed CPU (wrapping).
+pub fn pin_to_cpu(worker: usize, explicit: Option<usize>) -> io::Result<()> {
     // SAFETY: cpu_set_t is plain data; the libc CPU_* helpers stay within its bounds.
     unsafe {
-        let mut allowed: libc::cpu_set_t = std::mem::zeroed();
-        cvt(libc::sched_getaffinity(
-            0,
-            size_of::<libc::cpu_set_t>(),
-            &mut allowed,
-        ))?;
-        let usable: Vec<usize> = (0..libc::CPU_SETSIZE as usize)
-            .filter(|&c| libc::CPU_ISSET(c, &allowed))
-            .collect();
-        let Some(&target) = usable.get(cpu % usable.len().max(1)) else {
-            return Ok(());
+        let target = match explicit {
+            Some(cpu) => cpu,
+            None => {
+                let mut allowed: libc::cpu_set_t = std::mem::zeroed();
+                cvt(libc::sched_getaffinity(
+                    0,
+                    size_of::<libc::cpu_set_t>(),
+                    &mut allowed,
+                ))?;
+                let usable: Vec<usize> = (0..libc::CPU_SETSIZE as usize)
+                    .filter(|&c| libc::CPU_ISSET(c, &allowed))
+                    .collect();
+                let Some(&target) = usable.get(worker % usable.len().max(1)) else {
+                    return Ok(());
+                };
+                target
+            }
         };
         let mut set: libc::cpu_set_t = std::mem::zeroed();
         libc::CPU_SET(target, &mut set);

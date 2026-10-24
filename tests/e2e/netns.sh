@@ -9,6 +9,14 @@ N=${N:-2}
 MTU=1420
 DEAD=4
 OUTER_FAMILY=${OUTER_FAMILY:-ipv4}
+if [[ -z ${ENTRY_CPUS:-} && -z ${EXIT_CPUS:-} ]]; then
+    mapfile -t CPUS < <(awk '/^Cpus_allowed_list:/ { n=split($2, a, ","); for (i=1; i<=n; i++) if (split(a[i], r, "-") == 2) for (c=r[1]; c<=r[2]; c++) print c; else print a[i] }' /proc/self/status)
+    if ((${#CPUS[@]} >= 2 * N)); then
+        IFS=,; ENTRY_CPUS="${CPUS[*]:0:N}"; EXIT_CPUS="${CPUS[*]:N:N}"; unset IFS
+    fi
+fi
+ENTRY_CPU_ARGS=(${ENTRY_CPUS:+--cpus "$ENTRY_CPUS"})
+EXIT_CPU_ARGS=(${EXIT_CPUS:+--cpus "$EXIT_CPUS"})
 case "$OUTER_FAMILY" in
     ipv4) OVERHEAD=40; EXIT_IP=10.2.0.1; REMOTE=10.2.0.1:443; ADDR_MATCH=ip ;;
     ipv6) OVERHEAD=60; EXIT_IP=fd00:2::1; REMOTE='[fd00:2::1]:443'; ADDR_MATCH=ip6 ;;
@@ -83,7 +91,7 @@ EOF
 
 start_entry() {
     # Not via ns(): backgrounding a shell function makes $! a subshell, not ghostun.
-    ip netns exec entry "$BIN" --config "$LOG/auth.toml" entry --remote "$REMOTE" --iface e0 --conns "$N" --ping-interval 1 --dead-timeout $DEAD >"$LOG/entry.log" 2>&1 &
+    ip netns exec entry "$BIN" --config "$LOG/auth.toml" entry --remote "$REMOTE" --iface e0 --conns "$N" "${ENTRY_CPU_ARGS[@]}" --ping-interval 1 --dead-timeout $DEAD >"$LOG/entry.log" 2>&1 &
     ENTRY_PID=$!
     PIDS="$EXIT_PID $ENTRY_PID"
 }
@@ -100,7 +108,7 @@ route_inner() {
 }
 
 start() {
-    ip netns exec exit "$BIN" --config "$LOG/auth.toml" exit --listen 443 --outer-family "$OUTER_FAMILY" --conns "$N" --ping-interval 1 --dead-timeout $DEAD >"$LOG/exit.log" 2>&1 &
+    ip netns exec exit "$BIN" --config "$LOG/auth.toml" exit --listen 443 --outer-family "$OUTER_FAMILY" --conns "$N" "${EXIT_CPU_ARGS[@]}" --ping-interval 1 --dead-timeout $DEAD >"$LOG/exit.log" 2>&1 &
     EXIT_PID=$!
     PIDS="$EXIT_PID"
     start_entry

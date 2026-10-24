@@ -76,6 +76,7 @@ Design and deliver `ghostun`: a high-performance, low-memory L3-over-FakeTCP tun
   - `--tun <NAME>`: name of the inner TUN to create and bind; default `ghostun0`. Supports isolated instances on one host.
   - `--tun-ipv4 <CIDR>` / `--tun-ipv6 <CIDR>`: inner addresses. Entry defaults to `10.200.0.1/30` and `fd00:200::1/126`; Exit defaults to `10.200.0.2/30` and `fd00:200::2/126`.
   - `--conns <N>`: number of persistent outer FakeTCP connections and pinned worker threads; defaults to the system CPU core count.
+  - `--cpus <LIST>`: optional comma-separated CPU IDs or `start-end` ranges for worker thread pinning; defaults to all usable CPUs in the current affinity mask.
   - `--outer-mtu <MTU>` / `--tun-mtu <MTU>`: explicit outer physical-path MTU or inner TUN MTU.
   - `--iface <IFACE>`: outer physical egress interface, used for local outer-address and MTU detection and Exit masquerade egress selection.
   - `--base-port <PORT>`: Entry source-port pool start; default `32768`.

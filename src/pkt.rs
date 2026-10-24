@@ -105,21 +105,28 @@ pub fn parse(buf: &[u8]) -> Option<Parsed<'_>> {
     })
 }
 
-fn sum16(data: &[u8], mut acc: u32) -> u32 {
-    let (pairs, rest) = data.as_chunks::<2>();
+fn sum16(data: &[u8], acc: u32) -> u32 {
+    let mut acc = u64::from(acc);
+    let (chunks, tail) = data.as_chunks::<8>();
+    for &chunk in chunks {
+        let w = u64::from_be_bytes(chunk);
+        acc += (w >> 32) + (w & 0xffff_ffff);
+    }
+    let (pairs, rest) = tail.as_chunks::<2>();
     for &pair in pairs {
-        acc += u32::from(u16::from_be_bytes(pair));
+        acc += u64::from(u16::from_be_bytes(pair));
     }
     if let [last] = rest {
-        acc += u32::from(*last) << 8;
+        acc += u64::from(*last) << 8;
     }
-    acc
+    let mut s = (acc >> 32) + (acc & 0xffff_ffff);
+    s = (s >> 16) + (s & 0xffff);
+    ((s >> 16) + (s & 0xffff)) as u32
 }
 
 fn fold(mut acc: u32) -> u16 {
-    while acc > 0xffff {
-        acc = (acc & 0xffff) + (acc >> 16);
-    }
+    acc = (acc & 0xffff) + (acc >> 16);
+    acc = (acc & 0xffff) + (acc >> 16);
     !(acc as u16)
 }
 
@@ -235,8 +242,7 @@ impl Prog {
         self
     }
 
-    fn finish(&mut self, last_cond: u32, k: u32) -> Vec<libc::sock_filter> {
-        self.stmt(last_cond, k);
+    fn finish(&mut self) -> Vec<libc::sock_filter> {
         let reject = self.0.len() + 1;
         for (pc, ins) in self.0.iter_mut().enumerate() {
             if u32::from(ins.code) & 0x07 == libc::BPF_JMP {
@@ -262,26 +268,29 @@ const MOD: u32 = libc::BPF_ALU | libc::BPF_MOD | libc::BPF_K;
 pub fn entry_filter(exit: SocketAddr, base_port: u16, n: u16, i: u16) -> Vec<libc::sock_filter> {
     let mut p = Prog(Vec::new());
     match exit.ip() {
-        IpAddr::V4(ip) => {
-            p.stmt(LD_W_ABS, 12)
-                .stmt(JEQ, u32::from(ip))
-                .stmt(LDX_IHL, 0);
-        }
-        IpAddr::V6(ip) => {
-            // IPv6 raw socket filters see TCP at offset zero; source IP is network-header relative.
-            for (i, word) in ip.octets().as_chunks::<4>().0.iter().enumerate() {
-                p.stmt(LD_W_ABS, (libc::SKF_NET_OFF + 8 + i as i32 * 4) as u32)
-                    .stmt(JEQ, u32::from_be_bytes(*word));
-            }
-            p.stmt(libc::BPF_LDX | libc::BPF_IMM, 0);
-        }
-    }
+        IpAddr::V4(_) => p.stmt(LDX_IHL, 0),
+        IpAddr::V6(_) => p.stmt(libc::BPF_LDX | libc::BPF_IMM, 0),
+    };
+    // Check worker port residue before source address words so N-1 sockets reject early.
     p.stmt(LD_H_IND, 0)
         .stmt(JEQ, u32::from(exit.port()))
         .stmt(LD_H_IND, 2)
         .stmt(JGE, u32::from(base_port))
         .stmt(MOD, u32::from(n))
-        .finish(JEQ, u32::from(i))
+        .stmt(JEQ, u32::from(i));
+    match exit.ip() {
+        IpAddr::V4(ip) => {
+            p.stmt(LD_W_ABS, 12).stmt(JEQ, u32::from(ip));
+        }
+        IpAddr::V6(ip) => {
+            // IPv6 raw socket filters see TCP at offset zero; source IP is network-header relative.
+            for (idx, word) in ip.octets().as_chunks::<4>().0.iter().enumerate() {
+                p.stmt(LD_W_ABS, (libc::SKF_NET_OFF + 8 + idx as i32 * 4) as u32)
+                    .stmt(JEQ, u32::from_be_bytes(*word));
+            }
+        }
+    }
+    p.finish()
 }
 
 /// Exit worker `i`: `dport == listen_port && sport % n == i`.
@@ -304,7 +313,8 @@ pub fn exit_filter(
         .stmt(JEQ, u32::from(listen_port))
         .stmt(LD_H_IND, 0)
         .stmt(MOD, u32::from(n))
-        .finish(JEQ, u32::from(i))
+        .stmt(JEQ, u32::from(i))
+        .finish()
 }
 
 #[cfg(test)]
@@ -351,6 +361,10 @@ mod tests {
         assert!(tcp_checksum_ok(&buf[..len]));
         buf[OUTER_OVERHEAD + 2] ^= 0xff;
         assert!(!tcp_checksum_ok(&buf[..len]));
+        let mut max_addrs = meta(flags::ACK);
+        max_addrs.dst = "63.255.253.254:443".parse().unwrap();
+        let len = write_headers(&mut buf, &max_addrs, 3, 0);
+        assert!(ipv4_header_checksum_ok(&buf[..len]) && tcp_checksum_ok(&buf[..len]));
     }
 
     #[test]

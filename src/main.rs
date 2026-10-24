@@ -132,8 +132,11 @@ fn run(mut cfg: Config) -> Result<(), String> {
             }
             Mode::Exit => pkt::exit_filter(cfg.outer_family, listen_port, cfg.conns, id),
         };
-        let raw =
-            sys::raw_socket(cfg.outer_family, &filter).map_err(|e| format!("raw socket: {e}"))?;
+        let bind_dev = (cfg.mode == Mode::Entry)
+            .then_some(outer.dev.as_deref())
+            .flatten();
+        let raw = sys::raw_socket(cfg.outer_family, bind_dev, &filter)
+            .map_err(|e| format!("raw socket: {e}"))?;
         let scfg = SessionConfig {
             mode: cfg.mode,
             auth_key: cfg.auth_key.clone(),
@@ -152,13 +155,15 @@ fn run(mut cfg: Config) -> Result<(), String> {
         slots.push((session, tun, raw));
     }
     let family = cfg.outer_family;
+    let cpus = cfg.cpus.as_deref();
     let workers: Vec<_> = slots
         .into_iter()
         .enumerate()
         .map(|(i, (session, tun, raw))| {
+            let cpu = cpus.map(|list| list[i % list.len()]);
             std::thread::Builder::new()
                 .name(format!("ghostun-w{i}"))
-                .spawn(move || worker::run(i, family, session, tun, raw, &STOP))
+                .spawn(move || worker::run(i, cpu, family, session, tun, raw, &STOP))
                 .expect("spawning worker thread")
         })
         .collect();

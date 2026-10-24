@@ -94,6 +94,7 @@ ghostun [options] [entry|exit]
 | `--listen PORT` | — | Exit only: outer listen port |
 | `--outer-family ipv4\|ipv6` | `ipv4` | Exit only: outer transport family (Entry derives it from `--remote`) |
 | `--conns N` | CPU count | Number of pinned workers and outer connections (`1..=256`) |
+| `--cpus LIST` | all usable CPUs | Worker CPU list or ranges (e.g. `0,1` or `2-3`) |
 | `--tun NAME` | `ghostun0` | Inner TUN device name (`[A-Za-z0-9_.-]`, up to 15 chars) |
 | `--tun-ipv4 CIDR` | `10.200.0.1/30` / `.2/30` | Inner IPv4 address (Entry / Exit) |
 | `--tun-ipv6 CIDR` | `fd00:200::1/126` / `::2/126` | Inner IPv6 address (Entry / Exit) |
@@ -140,14 +141,12 @@ sysctl -w net.ipv4.ip_forward=1 net.ipv6.conf.all.forwarding=1
 
 ## Performance
 
-Measured inside a single 4-vCPU VM (AMD EPYC-Genoa, Linux 7.2) running Entry, a stateful `nftables` firewall, Exit, and `iperf3 -P 8` across isolated network namespaces in Docker (outer MTU `1420`):
+Measured inside a single 4-vCPU VM (AMD EPYC-Genoa, Linux 7.2) running Entry (`--cpus 0-1`), a stateful `nftables` firewall, Exit (`--cpus 2-3`), and `iperf3 -P 8` across isolated network namespaces in Docker with `--conns 2` (outer MTU `1420`):
 
-| `--conns` | Outer family | Inner IPv4 upload | Inner IPv6 download | Entry RSS | Exit RSS |
-|---|---|---|---|---|---|
-| `2` | IPv4 (TUN MTU 1380) | 1.25 Gbit/s | 1.30 Gbit/s | ~3.0 MB | ~3.0 MB |
-| `2` | IPv6 (TUN MTU 1360) | 1.25 Gbit/s | 1.14 Gbit/s | ~2.9 MB | ~2.9 MB |
-| `4` | IPv4 (TUN MTU 1380) | 1.89 Gbit/s | 2.31 Gbit/s | ~3.0 MB | ~3.0 MB |
-| `4` | IPv6 (TUN MTU 1360) | 1.74 Gbit/s | 1.78 Gbit/s | ~3.0 MB | ~3.0 MB |
+| Outer family | Inner IPv4 upload | Inner IPv6 download | Entry RSS | Exit RSS |
+|---|---|---|---|---|
+| IPv4 (TUN MTU 1380) | 2.30 Gbit/s | 2.29 Gbit/s | ~2.9 MB | ~2.9 MB |
+| IPv6 (TUN MTU 1360) | 2.00 Gbit/s | 1.99 Gbit/s | ~3.0 MB | ~2.9 MB |
 
 Stripped release binary size is ~800 KB.
 
