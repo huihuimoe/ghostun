@@ -208,34 +208,38 @@ pub fn hello_params(hello: &[u8]) -> io::Result<Params> {
     })
 }
 
+fn transcript(hello: &[u8]) -> [u8; 91] {
+    let mut buf = [0; 91];
+    buf[..14].copy_from_slice(b"ghostun-tcp\x01\x01\x02");
+    buf[14..58].copy_from_slice(hello);
+    buf
+}
+
 pub struct Handshake {
     key: Hmac<Sha256>,
-    hello: Vec<u8>,
-    transcript: Vec<u8>,
+    transcript: [u8; 91],
     expected: u8,
 }
 
 impl Handshake {
-    pub fn entry(key: &AuthKey, p: Params) -> io::Result<(Self, Vec<u8>)> {
-        let mut hello = vec![1];
-        hello.extend_from_slice(b"GTCP\x01");
-        for v in [p.worker, p.conns, p.mtu] {
-            hello.extend_from_slice(&v.to_be_bytes());
-        }
-        hello.resize(44, 0);
+    pub fn entry(key: &AuthKey, p: Params) -> io::Result<(Self, [u8; 44])> {
+        let mut hello = [0; 44];
+        hello[..6].copy_from_slice(b"\x01GTCP\x01");
+        hello[6..8].copy_from_slice(&p.worker.to_be_bytes());
+        hello[8..10].copy_from_slice(&p.conns.to_be_bytes());
+        hello[10..12].copy_from_slice(&p.mtu.to_be_bytes());
         random(&mut hello[12..])?;
         Ok((
             Self {
                 key: Hmac::new_from_slice(&key.0).unwrap(),
-                hello: hello.clone(),
-                transcript: Vec::new(),
+                transcript: transcript(&hello),
                 expected: 2,
             },
             hello,
         ))
     }
 
-    pub fn exit(key: &AuthKey, p: Params, hello: &[u8]) -> io::Result<(Self, Vec<u8>)> {
+    pub fn exit(key: &AuthKey, p: Params, hello: &[u8]) -> io::Result<(Self, [u8; 65])> {
         let peer = hello_params(hello)?;
         if peer.worker != p.worker || peer.worker >= p.conns {
             return Err(invalid("invalid worker ID"));
@@ -243,23 +247,18 @@ impl Handshake {
         if peer.conns != p.conns || peer.mtu != p.mtu {
             return Err(invalid("incompatible peer conns or effective TUN MTU"));
         }
-        let mut challenge = vec![2; 33];
-        random(&mut challenge[1..])?;
-        let mut auth = Self {
+        let mut challenge = [0; 65];
+        challenge[0] = 2;
+        random(&mut challenge[1..33])?;
+        let mut transcript = transcript(hello);
+        transcript[58..].copy_from_slice(&challenge[..33]);
+        let auth = Self {
             key: Hmac::new_from_slice(&key.0).unwrap(),
-            hello: hello.to_vec(),
-            transcript: Vec::new(),
+            transcript,
             expected: 3,
         };
-        auth.set_transcript(&challenge);
-        challenge.extend_from_slice(&auth.tag(b"ghostun-tcp-v1/exit"));
+        challenge[33..].copy_from_slice(&auth.tag(b"ghostun-tcp-v1/exit"));
         Ok((auth, challenge))
-    }
-
-    fn set_transcript(&mut self, challenge: &[u8]) {
-        self.transcript = b"ghostun-tcp\x01\x01\x02".to_vec();
-        self.transcript.extend_from_slice(&self.hello);
-        self.transcript.extend_from_slice(&challenge[..33]);
     }
 
     fn mac(&self, domain: &[u8]) -> Hmac<Sha256> {
@@ -275,14 +274,14 @@ impl Handshake {
         self.expected == 0
     }
 
-    pub fn receive(&mut self, payload: &[u8]) -> io::Result<Option<Vec<u8>>> {
+    pub fn receive(&mut self, payload: &[u8]) -> io::Result<Option<[u8; 33]>> {
         let expected_len = if self.expected == 2 { 65 } else { 33 };
         if payload.len() != expected_len || payload[0] != self.expected || self.done() {
             return Err(invalid("illegal authentication message or phase"));
         }
         let (domain, next, reply, reply_domain): (&[u8], u8, u8, &[u8]) = match self.expected {
             2 => {
-                self.set_transcript(payload);
+                self.transcript[58..].copy_from_slice(&payload[..33]);
                 (b"ghostun-tcp-v1/exit", 4, 3, b"ghostun-tcp-v1/entry")
             }
             3 => (b"ghostun-tcp-v1/entry", 5, 4, b"ghostun-tcp-v1/finished"),
@@ -294,13 +293,12 @@ impl Handshake {
             .verify_slice(&payload[payload.len() - 32..])
             .map_err(|_| invalid("authentication proof verification failed"))?;
         self.expected = next;
-        Ok(if reply == 0 {
-            None
-        } else {
-            let mut msg = vec![reply];
-            msg.extend_from_slice(&self.tag(reply_domain));
-            Some(msg)
-        })
+        Ok((reply != 0).then(|| {
+            let mut msg = [0; 33];
+            msg[0] = reply;
+            msg[1..].copy_from_slice(&self.tag(reply_domain));
+            msg
+        }))
     }
 }
 

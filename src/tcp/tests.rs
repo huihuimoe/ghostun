@@ -72,7 +72,7 @@ fn mutual_authentication_rejects_wrong_keys_reflection_replay_and_parameters() {
         let (_, hello) = Handshake::entry(&key, p).unwrap();
         assert!(Handshake::exit(&key, params(), &hello).is_err());
     }
-    let mut unsupported = hello.clone();
+    let mut unsupported = hello;
     unsupported[5] = 2;
     assert!(wire::hello_params(&unsupported).is_err());
 }
