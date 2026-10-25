@@ -4,7 +4,7 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::mem::{size_of, MaybeUninit};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -37,21 +37,31 @@ struct IfReqFlags {
     flags: libc::c_short,
     _pad: [u8; 22],
 }
+impl IfReqFlags {
+    fn new(flags: libc::c_int) -> Self {
+        Self {
+            name: [0; libc::IFNAMSIZ],
+            flags: flags as libc::c_short,
+            _pad: [0; 22],
+        }
+    }
+}
 
-/// Opens `queues` non-blocking queue fds of one multi-queue TUN device. Without `IFF_PERSIST` the
-/// kernel destroys the device when the last fd closes, including on SIGKILL.
+fn tun_ioctl(fd: BorrowedFd<'_>, request: libc::Ioctl, req: &mut IfReqFlags) -> io::Result<()> {
+    // SAFETY: `request` is a TUN ioctl reading/writing an `ifreq`-sized struct that outlives the call.
+    cvt(unsafe { libc::ioctl(fd.as_raw_fd(), request, req as *mut IfReqFlags) }).map(drop)
+}
+
+/// Opens `queues` non-blocking, initially detached queue fds of one multi-queue TUN device.
+/// Without `IFF_PERSIST` the kernel destroys the device when the last fd closes, including on SIGKILL.
 pub fn create_tun(name: &str, queues: usize) -> io::Result<Vec<OwnedFd>> {
-    let mut req = IfReqFlags {
-        name: [0; libc::IFNAMSIZ],
-        flags: (libc::IFF_TUN | libc::IFF_NO_PI | libc::IFF_MULTI_QUEUE) as libc::c_short,
-        _pad: [0; 22],
-    };
     if name.is_empty() || name.len() >= libc::IFNAMSIZ {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "invalid interface name",
         ));
     }
+    let mut req = IfReqFlags::new(libc::IFF_TUN | libc::IFF_NO_PI | libc::IFF_MULTI_QUEUE);
     req.name[..name.len()].copy_from_slice(name.as_bytes());
     (0..queues)
         .map(|_| {
@@ -63,17 +73,22 @@ pub fn create_tun(name: &str, queues: usize) -> io::Result<Vec<OwnedFd>> {
                 )
             })?;
             let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-            // SAFETY: TUNSETIFF reads/writes an ifreq-sized struct that outlives the call.
-            cvt(unsafe {
-                libc::ioctl(
-                    fd.as_raw_fd(),
-                    libc::TUNSETIFF as _,
-                    &mut req as *mut IfReqFlags,
-                )
-            })?;
+            tun_ioctl(fd.as_fd(), libc::TUNSETIFF as _, &mut req)?;
+            set_tun_queue(fd.as_fd(), false)?;
             Ok(fd)
         })
         .collect()
+}
+
+/// Attaches or detaches one multi-queue TUN fd so the kernel only hashes inner flows onto
+/// `Established` workers instead of black-holing `1/N` of traffic into reconnecting slots.
+pub fn set_tun_queue(fd: BorrowedFd<'_>, attach: bool) -> io::Result<()> {
+    let mut req = IfReqFlags::new(if attach {
+        libc::IFF_ATTACH_QUEUE
+    } else {
+        libc::IFF_DETACH_QUEUE
+    });
+    tun_ioctl(fd, libc::TUNSETQUEUE as _, &mut req)
 }
 
 fn setsockopt<T>(fd: &OwnedFd, level: libc::c_int, name: libc::c_int, value: &T) -> io::Result<()> {

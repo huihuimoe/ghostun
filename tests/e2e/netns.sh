@@ -266,7 +266,8 @@ printf "auth_key = '%064d'\n" 2 >"$LOG/auth.toml"
 kill -HUP "$ENTRY_PID"
 sleep 0.4
 if ((N > 1)); then
-    ns entry ping -c2 -i0.2 -W1 10.3.0.2 >/dev/null || fail "mid-rotation disrupted forwarding on sibling workers"
+    ns entry ping -c2 -i0.2 -W1 10.3.0.2 >/dev/null || fail "mid-rotation disrupted IPv4 forwarding on sibling workers"
+    ns entry ping -6 -c2 -i0.2 -W1 fd00:3::2 >/dev/null || fail "mid-rotation disrupted IPv6 forwarding on sibling workers"
 fi
 printf "auth_key = '%064d'\n" 1 >"$LOG/auth.toml"
 kill -HUP "$ENTRY_PID"
@@ -283,7 +284,8 @@ printf "auth_key = '%064d'\n" 3 >"$LOG/auth.toml"
 kill -HUP "$ENTRY_PID"
 sleep 0.4
 if ((N > 1)); then
-    ns entry ping -c2 -i0.2 -W1 10.3.0.2 >/dev/null || fail "rolling reload disrupted forwarding before Exit reloaded"
+    ns entry ping -c2 -i0.2 -W1 10.3.0.2 >/dev/null || fail "rolling reload disrupted IPv4 forwarding before Exit reloaded"
+    ns entry ping -6 -c2 -i0.2 -W1 fd00:3::2 >/dev/null || fail "rolling reload disrupted IPv6 forwarding before Exit reloaded"
 fi
 kill -HUP "$EXIT_PID"
 for _ in $(seq 150); do

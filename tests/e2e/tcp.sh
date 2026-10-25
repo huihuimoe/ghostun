@@ -280,7 +280,10 @@ worker_cpus() {
 [[ $(worker_cpus "$EXIT_PID") == 0,1 ]] || fail "Exit affinity reload"
 printf "auth_key = '%064d'\nping_interval = 1\ndead_timeout = 4\n" 3 >"$LOG/auth.toml"
 write_configs
-kill -HUP "$ENTRY_PID" "$EXIT_PID"
+kill -HUP "$ENTRY_PID"
+sleep 0.4
+check_data
+kill -HUP "$EXIT_PID"
 wait_ping 30 >/dev/null || fail "key reload"
 # Wait until both workers, not merely one ping flow, have completed rolling reload.
 for _ in $(seq 150); do

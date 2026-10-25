@@ -72,6 +72,35 @@ impl Control {
         self.applied_gen.store(generation, Ordering::Release);
     }
 
+    fn apply(
+        &self,
+        id: usize,
+        cpu: &mut Option<usize>,
+        applied_gen: &mut u64,
+        now: Instant,
+        session: &mut Session,
+        out: &mut impl Sink,
+    ) -> bool {
+        let mut wait = self.wait_for_established.load(Ordering::Relaxed);
+        if let Some((gen, reload)) = self.take_reload(*applied_gen) {
+            if reload.cpu != *cpu {
+                *cpu = reload.cpu;
+                pin(id, *cpu);
+            }
+            let prior_wait = wait && !session.is_established();
+            wait = session.reload(
+                now,
+                reload.auth_key,
+                reload.ping_interval,
+                reload.dead_timeout,
+                out,
+            ) || prior_wait;
+            *applied_gen = gen;
+        }
+        wait
+    }
+
+    #[cfg(test)]
     pub fn sync(
         &self,
         id: usize,
@@ -81,31 +110,8 @@ impl Control {
         session: &mut Session,
         out: &mut impl Sink,
     ) {
-        let mut new_gen = None;
-        if let Some((gen, reload)) = self.take_reload(*applied_gen) {
-            if reload.cpu != *cpu {
-                *cpu = reload.cpu;
-                pin(id, *cpu);
-            }
-            let prior_wait =
-                self.wait_for_established.load(Ordering::Relaxed) && !session.is_established();
-            let wait = session.reload(
-                now,
-                reload.auth_key,
-                reload.ping_interval,
-                reload.dead_timeout,
-                out,
-            );
-            *applied_gen = gen;
-            self.wait_for_established
-                .store(wait || prior_wait, Ordering::Release);
-            new_gen = Some(gen);
-        }
-        self.established
-            .store(session.is_established(), Ordering::Release);
-        if let Some(gen) = new_gen {
-            self.applied_gen.store(gen, Ordering::Release);
-        }
+        let wait = self.apply(id, cpu, applied_gen, now, session, out);
+        self.report(*applied_gen, session.is_established(), wait);
     }
 }
 
@@ -113,6 +119,15 @@ pub fn pin(id: usize, cpu: Option<usize>) {
     if let Some(target) = cpu {
         if let Err(e) = sys::pin_to_cpu(target) {
             log::warn!("worker {id}: cannot pin to CPU: {e}");
+        }
+    }
+}
+
+pub fn sync_tun_queue(id: usize, tun: BorrowedFd<'_>, attached: &mut bool, established: bool) {
+    if *attached != established {
+        match sys::set_tun_queue(tun, established) {
+            Ok(()) => *attached = established,
+            Err(e) => log::warn!("worker {id}: TUN queue attach={established}: {e}"),
         }
     }
 }
@@ -148,6 +163,7 @@ pub fn run(
     let stride = (overhead + usize::from(session.mss()) + OPT_HEADROOM).max(MIN_STRIDE);
     let mut out = RawSink(raw.as_fd());
     session.start(Instant::now(), &mut out);
+    let mut attached = false;
 
     // Reserve the selected outer headers in each slot so TUN payloads never need to be moved.
     let mut bufs = vec![0u8; RAW_BATCH * stride];
@@ -265,7 +281,10 @@ pub fn run(
         if now >= session.next_deadline() {
             session.on_tick(now, &mut out);
         }
-        ctrl.sync(id, &mut cpu, &mut applied_gen, now, &mut session, &mut out);
+        let wait = ctrl.apply(id, &mut cpu, &mut applied_gen, now, &mut session, &mut out);
+        let established = session.is_established();
+        sync_tun_queue(id, tun.as_fd(), &mut attached, established);
+        ctrl.report(applied_gen, established, wait);
     }
     session.shutdown(&mut out);
 }

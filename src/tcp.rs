@@ -5,7 +5,7 @@ mod wire;
 
 use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -489,6 +489,7 @@ impl Worker {
         worker::pin(id, cpu);
         let mut generation = 0;
         let mut wait = false;
+        let mut attached = false;
         let mut connection: Option<Connection> = None;
         let mut retry_at = Instant::now();
         let mut backoff = Backoff { failures: 0 };
@@ -606,6 +607,7 @@ impl Worker {
                 }
             }
             let established = connection.as_ref().is_some_and(|c| c.auth.is_none());
+            worker::sync_tun_queue(id, self.tun.as_fd(), &mut attached, established);
             ctrl.report(generation, established, wait);
             if !established && can_io(fds[0], libc::POLLIN, READ_READY) {
                 let mut drained = 0;
