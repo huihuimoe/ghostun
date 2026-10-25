@@ -1,20 +1,37 @@
 # Testing
 
-Run unit tests directly on the host. Run privileged network tests inside a disposable Docker container so host networking is never touched:
+Run unit tests on the host. Run privileged network tests
+inside a disposable Docker container.
+Build outputs and logs below stay in the checkout's ignored `target/` directory.
 
 ```sh
 cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings
+cargo fmt --check
+cargo build --release --locked
+sudo docker build -f tests/Dockerfile -t ghostun-e2e .
 
-docker build -t ghostun .
-docker run --rm --privileged -v "$PWD":/src:ro -w /src --entrypoint sh ghostun -c \
-  'apk add -q bash conntrack-tools iputils iperf3 mount &&
-   for family in ipv4 ipv6; do
-     BIN=/usr/local/bin/ghostun OUTER_FAMILY=$family bash tests/e2e/netns.sh || exit
-   done &&
-   BIN=/usr/local/bin/ghostun bash tests/e2e/ipv6-disabled.sh'
+sudo docker run -d --name ghostun-e2e --privileged --network none \
+  -v "$PWD":/src -w /src -e BIN=/src/target/release/ghostun ghostun-e2e -c "sleep infinity"
+sudo docker exec ghostun-e2e bash -c '
+    set -e
+    for family in ipv4 ipv6; do
+      LOG=/src/target/e2e-faketcp-$family OUTER_FAMILY=$family bash tests/e2e/netns.sh
+      for relay in 0 1; do
+        LOG=/src/target/e2e-tcp-$family-$relay OUTER_FAMILY=$family RELAY=$relay bash tests/e2e/tcp.sh
+      done
+    done
+    for transport in faketcp tcp; do
+      LOG=/src/target/e2e-noipv6-$transport TRANSPORT=$transport bash tests/e2e/ipv6-disabled.sh
+    done'
 ```
 
-## Suites
+The container needs four usable CPUs. Inspect logs under `target/` with
+`sudo docker exec ghostun-e2e cat <log-path>`, then remove the container with
+`sudo docker rm -f ghostun-e2e`.
 
-- **[`e2e/netns.sh`](e2e/netns.sh)** — Builds `entry ↔ firewall ↔ exit ↔ internet` network namespaces for `OUTER_FAMILY=ipv4` and `ipv6`. Verifies mutual authentication, wrong-key rejection, inner dual-stack ping and bulk TCP, exact `--conns` conntrack state, recovery after conntrack flush or blackhole, and clean `SIGTERM` teardown.
-- **[`e2e/ipv6-disabled.sh`](e2e/ipv6-disabled.sh)** — Disables kernel IPv6 on new interfaces and masks `/proc/sys/net/ipv6` to verify that default Entry and Exit configs fall back cleanly to inner IPv4.
+- `e2e/netns.sh`: FakeTCP forwarding, authentication, firewall recovery, reload and cleanup.
+- `e2e/tcp.sh`: direct/relayed TCP, exact bidirectional IPv4/IPv6 TCP/UDP payloads,
+  rejection and admission limits, takeover, restarts, blackholes, reload and cleanup.
+- `e2e/ipv6-disabled.sh`: IPv4 fallback with kernel IPv6 disabled, for both transports.
+- Rust tests cover deterministic framing, authentication and bounded backpressure.

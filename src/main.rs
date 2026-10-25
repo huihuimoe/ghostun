@@ -1,9 +1,10 @@
 mod auth;
 mod config;
+mod faketcp;
 mod netfilter;
 mod pkt;
-mod session;
 mod sys;
+mod tcp;
 mod worker;
 
 use std::net::IpAddr;
@@ -12,8 +13,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use config::{Config, Mode};
-use session::{Session, SessionConfig};
+use config::{Config, Mode, Transport};
+use faketcp::{Session, SessionConfig};
 
 static STOP: AtomicBool = AtomicBool::new(false);
 static RELOAD: AtomicBool = AtomicBool::new(false);
@@ -83,7 +84,8 @@ fn run(mut cfg: Config) -> Result<(), String> {
     let mss = (outer.mtu - cfg.outer_family.overhead() as u32) as u16;
     let listen_port = cfg.listen.unwrap_or(0);
     log::info!(
-        "{:?} mode: outer {} via {} (mtu {}), tun {} mtu {}, {} conns",
+        "{:?} {:?} mode: outer {} via {} (mtu {}), tun {} mtu {}, {} conns",
+        cfg.transport,
         cfg.mode,
         outer.local_ip,
         outer.dev.as_deref().unwrap_or("?"),
@@ -93,6 +95,9 @@ fn run(mut cfg: Config) -> Result<(), String> {
         cfg.conns
     );
 
+    if cfg.transport == Transport::Tcp && cfg.base_port_explicit {
+        log::warn!("tcp transport: explicitly configured base_port is ignored; kernel assigns source ports");
+    }
     let n = usize::from(cfg.conns);
     let tuns = sys::create_tun(&cfg.tun_name, n)
         .map_err(|e| format!("creating TUN {}: {e}", cfg.tun_name))?;
@@ -112,6 +117,7 @@ fn run(mut cfg: Config) -> Result<(), String> {
     let guard = if cfg.netfilter {
         let spec = netfilter::NftSpec {
             mode: cfg.mode,
+            transport: cfg.transport,
             outer_family: cfg.outer_family,
             tun_name: cfg.tun_name.clone(),
             remote: cfg.remote,
@@ -126,11 +132,30 @@ fn run(mut cfg: Config) -> Result<(), String> {
         None
     };
 
+    enum Start {
+        Fake(Box<Session>, std::os::fd::OwnedFd, std::os::fd::OwnedFd),
+        Tcp(Box<tcp::Worker>),
+    }
+    let listener = if cfg.transport == Transport::Tcp && cfg.mode == Mode::Exit {
+        Some(tcp::Listener::bind(&cfg, tun_mtu as u16).map_err(|e| format!("tcp listener: {e}"))?)
+    } else {
+        None
+    };
     let mut slots = Vec::with_capacity(n);
     let seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos() as u64);
     for (i, tun) in tuns.into_iter().enumerate() {
+        if cfg.transport == Transport::Tcp {
+            slots.push(Start::Tcp(Box::new(tcp::Worker::new(
+                i,
+                cfg.clone(),
+                tun_mtu as u16,
+                tun,
+                listener.as_ref(),
+            ))));
+            continue;
+        }
         let id = i as u16;
         let filter = match cfg.mode {
             Mode::Entry => {
@@ -158,13 +183,13 @@ fn run(mut cfg: Config) -> Result<(), String> {
         };
         let session = Session::new(scfg, std::time::Instant::now(), seed ^ ((id as u64) << 48))
             .map_err(|e| format!("initializing worker {id} authentication: {e}"))?;
-        slots.push((session, tun, raw));
+        slots.push(Start::Fake(Box::new(session), tun, raw));
     }
     let family = cfg.outer_family;
     let default_cpus = sys::usable_cpus();
     let mut controls = Vec::with_capacity(n);
     let mut workers = Vec::with_capacity(n);
-    for (i, (session, tun, raw)) in slots.into_iter().enumerate() {
+    for (i, start) in slots.into_iter().enumerate() {
         let cpu = cpu_for(&cfg, &default_cpus, i);
         let ctrl = Arc::new(worker::Control::new(cpu));
         let worker_ctrl = Arc::clone(&ctrl);
@@ -172,11 +197,19 @@ fn run(mut cfg: Config) -> Result<(), String> {
         workers.push(
             std::thread::Builder::new()
                 .name(format!("ghostun-w{i}"))
-                .spawn(move || worker::run(i, family, session, tun, raw, &STOP, &worker_ctrl))
+                .spawn(move || match start {
+                    Start::Fake(session, tun, raw) => {
+                        worker::run(i, family, *session, tun, raw, &STOP, &worker_ctrl)
+                    }
+                    Start::Tcp(tcp) => tcp.run(&STOP, &worker_ctrl),
+                })
                 .expect("spawning worker thread"),
         );
     }
 
+    if let Some(listener) = listener {
+        workers.push(listener.spawn(&STOP).expect("spawning TCP accept thread"));
+    }
     let mut generation = 0u64;
     let mut rolling = None;
     while !STOP.load(Ordering::Relaxed) {
@@ -291,7 +324,7 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
     use crate::config::AuthKey;
-    use crate::session::Sink;
+    use crate::faketcp::Sink;
     use std::net::{Ipv4Addr, SocketAddr};
     use std::time::Instant;
 

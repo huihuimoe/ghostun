@@ -3,12 +3,13 @@
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use crate::config::{Cidr, Mode, OuterFamily};
+use crate::config::{Cidr, Mode, OuterFamily, Transport};
 use crate::sys::{self, SOCKET_MARK};
 
 #[derive(Clone, Debug)]
 pub struct NftSpec {
     pub mode: Mode,
+    pub transport: Transport,
     pub outer_family: OuterFamily,
     pub tun_name: String,
     /// Entry: exit node outer address.
@@ -96,12 +97,9 @@ pub fn render(spec: &NftSpec) -> String {
             )
         }
     };
-    // Declaring the table first makes the delete succeed when it does not exist yet.
-    format!(
-        r#"table inet {table} {{}}
-delete table inet {table}
-table inet {table} {{
-    chain prerouting {{
+    let outer_rules = if spec.transport == Transport::Faketcp {
+        format!(
+            r#"chain prerouting {{
         type filter hook prerouting priority raw; policy accept;
         {outer_in} iifname != "{tun}" notrack meta pkttype set other
     }}
@@ -110,7 +108,22 @@ table inet {table} {{
         {outer_out} tcp flags rst meta mark != {mark} drop
         {outer_out} notrack accept
         oifname "{tun}" {clamp}
-    }}
+    }}"#
+        )
+    } else {
+        format!(
+            r#"chain output {{
+        type filter hook output priority filter; policy accept;
+        oifname "{tun}" {clamp}
+    }}"#
+        )
+    };
+    // Declaring the table first makes the delete succeed when it does not exist yet.
+    format!(
+        r#"table inet {table} {{}}
+delete table inet {table}
+table inet {table} {{
+    {outer_rules}
     chain forward {{
         type filter hook forward priority filter; policy accept;
         oifname "{tun}" {clamp}
@@ -171,6 +184,7 @@ mod tests {
         assert_eq!(table_name("wan.1-a"), "ghostun_wan_1_a");
         let rules = render(&NftSpec {
             mode: Mode::Exit,
+            transport: Transport::Faketcp,
             outer_family: OuterFamily::Ipv4,
             tun_name: "ghostun0".into(),
             remote: None,

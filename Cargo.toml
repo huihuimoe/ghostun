@@ -2,7 +2,7 @@
 name = "ghostun"
 version = "0.1.0"
 edition = "2021"
-description = "High-performance, low-memory L3-over-FakeTCP tunnel with per-core BPF steering"
+description = "L3 tunnel with FakeTCP and relay-compatible TCP transports"
 license = "AGPL-3.0-or-later"
 readme = "README.md"
 

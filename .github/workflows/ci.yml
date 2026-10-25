@@ -28,10 +28,37 @@ jobs:
           components: rustfmt, clippy
       - name: Check test scripts, formatting, lints, and unit tests
         run: |
-          bash -n tests/e2e/netns.sh tests/e2e/ipv6-disabled.sh
+          bash -n tests/e2e/*.sh
+          python3 -c 'import ast, pathlib; [ast.parse(p.read_text()) for p in pathlib.Path("tests/e2e").glob("*.py")]'
           cargo fmt --check
           cargo clippy --locked --all-targets -- -D warnings
           cargo test --locked
+      - name: Build network test binary and image
+        run: |
+          cargo build --release --locked
+          sudo docker build -f tests/Dockerfile -t ghostun-e2e .
+      - name: Run isolated network tests
+        run: |
+          sudo docker run -d --name ghostun-e2e --privileged --network none \
+            -v "$PWD":/src -w /src -e BIN=/src/target/release/ghostun \
+            ghostun-e2e -c 'sleep infinity'
+          sudo docker exec ghostun-e2e bash -c '
+            set -e
+            for family in ipv4 ipv6; do
+              LOG=/src/target/e2e-faketcp-$family OUTER_FAMILY=$family bash tests/e2e/netns.sh
+              for relay in 0 1; do
+                LOG=/src/target/e2e-tcp-$family-$relay OUTER_FAMILY=$family RELAY=$relay bash tests/e2e/tcp.sh
+              done
+            done
+            for transport in faketcp tcp; do
+              LOG=/src/target/e2e-noipv6-$transport TRANSPORT=$transport bash tests/e2e/ipv6-disabled.sh
+            done'
+      - name: Remove network test container
+        if: always()
+        run: |
+          if sudo docker container inspect ghostun-e2e >/dev/null 2>&1; then
+            sudo docker rm -f ghostun-e2e
+          fi
 
   release:
     needs: test

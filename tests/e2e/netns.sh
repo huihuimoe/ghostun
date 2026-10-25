@@ -270,7 +270,8 @@ if ((N > 1)); then
 fi
 printf "auth_key = '%064d'\n" 1 >"$LOG/auth.toml"
 kill -HUP "$ENTRY_PID"
-for _ in $(seq 40); do
+# Conntrack may retain an RST-closed tuple briefly in ESTABLISHED for challenge ACKs.
+for _ in $(seq 150); do
     [[ $(established) == "$N" ]] && grep -q "configuration reload complete (generation 2)" "$LOG/entry.log" && break
     sleep 0.1
 done
@@ -285,7 +286,7 @@ if ((N > 1)); then
     ns entry ping -c2 -i0.2 -W1 10.3.0.2 >/dev/null || fail "rolling reload disrupted forwarding before Exit reloaded"
 fi
 kill -HUP "$EXIT_PID"
-for _ in $(seq 50); do
+for _ in $(seq 150); do
     grep -q "configuration reload complete (generation 3)" "$LOG/entry.log" &&
         grep -q "configuration reload complete (generation 1)" "$LOG/exit.log" &&
         [[ $(established) == "$N" ]] && break

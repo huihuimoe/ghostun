@@ -1,6 +1,6 @@
 # ghostun
 
-`ghostun` is a lightweight Linux L3-over-FakeTCP tunnel for paths behind stateful firewalls that drop UDP or cap concurrent TCP connections.
+`ghostun` is a lightweight Linux L3 tunnel over FakeTCP or TCP. Use TCP for routes with a terminating TCP relay.
 
 One binary runs in two roles:
 
@@ -8,10 +8,18 @@ One binary runs in two roles:
 - **Exit** decapsulates traffic from the tunnel and NATs it to the internet.
 
 ```mermaid
-flowchart LR
-  C[Clients] --> P[Proxy on Entry] -->|bind ghostun0| E[ghostun entry]
-  E ==>|N FakeTCP connections| FW{{Stateful firewall}} ==> X[ghostun exit]
-  X -->|ghostun0 + MASQUERADE| I[Internet]
+flowchart TB
+  subgraph upstream[" "]
+    direction LR
+    C[Clients] --> P[Proxy on Entry] -->|bind ghostun0| E[ghostun entry]
+  end
+  subgraph downstream[" "]
+    direction LR
+    FW{{Stateful firewall}} ==> X[ghostun exit] -->|ghostun0 + MASQUERADE| I[Internet]
+  end
+  upstream ==>|N FakeTCP or TCP connections| downstream
+  style upstream fill:none,stroke:none
+  style downstream fill:none,stroke:none
 ```
 
 ## Requirements
@@ -59,6 +67,11 @@ ghostun --config auth.toml exit --listen 443 --outer-family ipv6 --conns 4
 ghostun --config auth.toml entry --remote '[2001:db8::10]:443' --conns 4
 ```
 
+FakeTCP is the default. For direct TCP or a terminating TCP relay, add
+`--transport tcp` on both peers and point Entry at Exit or the relay.
+Both peers must use the same `--conns` and effective `--tun-mtu`.
+Changing transport requires a restart.
+
 3. Bind your proxy outbound to `ghostun0` (Entry does not alter system routes):
 
 **sing-box**
@@ -91,6 +104,7 @@ ghostun [options] [entry|exit]
 
 | Flag | Default | Description |
 |---|---|---|
+| `--transport faketcp\|tcp` | `faketcp` | One outer transport per instance; restart to change |
 | `--config PATH` | — | TOML configuration file (required for `auth_key`) |
 | `--remote IP:PORT` | — | Entry only: Exit outer address (IP literal) |
 | `--listen PORT` | — | Exit only: outer listen port |
@@ -104,7 +118,7 @@ ghostun [options] [entry|exit]
 | `--outer-mtu MTU` | egress MTU or `1500` | Outer path MTU |
 | `--tun-mtu MTU` | `outer_mtu - 40` / `- 60` | Inner TUN MTU (IPv4 / IPv6 outer overhead) |
 | `--iface IFACE` | route lookup | Outer egress interface |
-| `--base-port PORT` | `32768` | Entry only: starting source port |
+| `--base-port PORT` | `32768` | FakeTCP Entry source-port pool; TCP warns and ignores explicit values |
 | `--ping-interval SECS` | `5` | Health probe interval |
 | `--dead-timeout SECS` | `15` | Silence timeout before reconnecting |
 | `--no-netfilter` | off | Skip automatic `nftables` and `sysctl` setup |
@@ -136,7 +150,7 @@ Compose files in [`deploy/`](deploy/) use `ghcr.io/huihuimoe/ghostun:latest`:
 ```sh
 cd deploy
 install -m600 config.example.toml entry.toml   # set auth_key and role settings
-docker compose -f docker-compose.entry.yml up -d
+docker compose -f compose.entry.yml up -d
 ```
 
 **Exit:**
@@ -147,12 +161,39 @@ Enable IP forwarding on the host before starting Exit:
 sysctl -w net.ipv4.ip_forward=1 net.ipv6.conf.all.forwarding=1
 cd deploy
 install -m600 config.example.toml exit.toml    # set auth_key and role settings
-docker compose -f docker-compose.exit.yml up -d
+docker compose -f compose.exit.yml up -d
 ```
 
 ## Performance
 
-Measured inside a single 4-vCPU VM (AMD EPYC-Genoa, Linux 7.2) running Entry (`--conns 2 --cpus 0-1`), a stateful `nftables` firewall, Exit (`--conns 2 --cpus 2-3`), and 8 parallel `iperf3` streams across isolated network namespaces in Docker (outer MTU `1420`):
+### Transport comparison (100 Mbit/s)
+
+Local baseline: 4-vCPU EPYC-Genoa VM, Linux 7.2.6, isolated Docker namespaces.
+Entry uses CPUs 0–1 and Exit 2–3, with two workers each. Outer IPv4 MTU is 1420;
+TUN MTU is 1380. All three paths use the same **100 Mbit/s link cap**.
+Each direction runs four iperf3 streams for four seconds alongside 260-byte TCP
+echo requests for three seconds, with a 10 ms pause between replies. Latency shows the worst loaded p95/p99 across the IPv4/IPv6 runs.
+
+| Transport | Link | IPv4 up/down (Mbit/s) | IPv6 up/down (Mbit/s) | p95/p99 (ms) | System CPU |
+|---|---|---|---|---|---|
+| FakeTCP | Clean | 92.1 / 92.0 | 90.8 / 90.4 | 11.4 / 27.7 | 18–20% |
+| FakeTCP | +20 ms RTT, 0.1% loss/direction | 90.6 / 91.2 | 89.6 / 89.6 | 70.3 / 319.4 | 18–19% |
+| TCP direct | Clean | 86.8 / 90.7 | 86.2 / 88.1 | 16.0 / 18.6 | 10–20% |
+| TCP direct | +20 ms RTT, 0.1% loss/direction | 80.8 / 84.4 | 85.1 / 86.0 | 156.6 / 324.7 | 11–17% |
+| TCP relay | Clean | 89.0 / 89.9 | 85.8 / 89.1 | 18.4 / 39.6 | 14–27% |
+| TCP relay | +20 ms RTT, 0.1% loss/direction | 80.6 / 88.1 | 85.8 / 87.3 | 181.2 / 266.2 | 17–25% |
+
+System CPU includes kernel and other VM work. Entry/Exit RSS peaked at 3.1 MiB each.
+Sampled kernel receive/queued-send memory per outer socket peaked at 2.3/0 KiB
+(FakeTCP), 434/1084 KiB (direct TCP), and 600/1424 KiB (relayed TCP), in addition to RSS.
+TCP recovered from Exit/relay restarts in 2–13 seconds; connection and process FD
+counts returned to baseline after each cycle.
+
+### FakeTCP maximum throughput
+
+Earlier uncapped measurements: 4-vCPU EPYC-Genoa VM, Linux 7.2, isolated Docker
+namespaces with a stateful firewall, outer MTU 1420, and eight parallel iperf3
+streams. Entry uses CPUs 0–1 and Exit 2–3, with two workers each.
 
 | Scenario | Outer family | Inner IPv4 upload / download | Inner IPv6 upload / download | Tunnel packet rate |
 |---|---|---|---|---|
@@ -163,14 +204,13 @@ Measured inside a single 4-vCPU VM (AMD EPYC-Genoa, Linux 7.2) running Entry (`-
 | Small packets (128 B MSS/payload) | IPv4 (TUN MTU 1380) | 211 / 216 Mbit/s | 194 / 221 Mbit/s | 314–357 kPPS |
 | Small packets (128 B MSS/payload) | IPv6 (TUN MTU 1360) | 181 / 213 Mbit/s | 194 / 204 Mbit/s | 293–345 kPPS |
 
-Entry and Exit RSS stay at ~3.1 MB each; stripped release binary size is ~800 KB.
-
 ## Operational notes
 
 - **MTU:** Outer headers take 40 bytes over IPv4 and 60 bytes over IPv6. If your path MTU is lower than the NIC MTU (for example PPPoE `1492` or cloud VPC `1420`) and large transfers stall while ping works, set `--outer-mtu`.
-- **Firewall rules:** Unless `--no-netfilter` is set, `ghostun` manages `table inet ghostun_<tun>` (conntrack/TCP-input bypass, kernel RST suppression, MSS clamping, and Exit masquerade) and cleans it up on `SIGINT`/`SIGTERM`.
-- **Security boundary:** `auth_key` authenticates tunnel handshakes so stray clients cannot claim worker slots. `ghostun` does not encrypt traffic or disguise payloads as TLS/HTTP; keep encryption and client authentication in your proxy layer.
-- **Further docs:** [Testing guide](tests/README.md), [architecture spec](docs/261024-ghostun-spec.md), and [authentication spec](docs/261024-handshake-auth-spec.md).
+- **Firewall rules:** `ghostun` manages its own nftables table and removes it on shutdown. Both transports use inner MSS clamping and Exit masquerade. FakeTCP also bypasses conntrack and suppresses kernel RSTs. Use `--no-netfilter` to manage rules yourself.
+- **Security:** The shared key authenticates connections. Traffic is not encrypted or protected against modification; use encryption in your proxy. TCP also carries inner UDP, but loss can delay all flows sharing an outer connection.
+- **Reload:** Send `SIGHUP` to reload the key, health timers or CPU affinity. Coordinate key changes on both peers. Transport and topology changes require restart.
+- **Docs:** [Testing](tests/README.md), [architecture](docs/261024-ghostun-spec.md), [FakeTCP authentication](docs/261024-handshake-auth-spec.md), [dual transport](docs/261025-dual-transport-spec.md).
 
 ## License
 

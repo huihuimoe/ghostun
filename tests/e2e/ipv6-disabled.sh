@@ -3,6 +3,7 @@
 # Model a kernel without IPv6: new interfaces disable IPv6 and its sysctl tree is absent.
 set -euo pipefail
 
+TRANSPORT=${TRANSPORT:-faketcp}
 BIN=$(realpath "${BIN:-target/release/ghostun}")
 LOG=${LOG:-/tmp/ghostun-ipv6-disabled}
 ENTRY=ghostun-v4-entry
@@ -38,13 +39,13 @@ ip netns exec "$EXIT" bash -c '
     set -e
     mount -t tmpfs tmpfs /proc/sys/net/ipv6
     exec "$@"
-' _ "$BIN" --config "$LOG/auth.toml" exit --listen 443 --iface x0 --conns 1 >"$LOG/exit.log" 2>&1 &
+' _ "$BIN" --config "$LOG/auth.toml" exit --transport "$TRANSPORT" --listen 443 --iface x0 --conns 1 >"$LOG/exit.log" 2>&1 &
 PIDS+=("$!")
 ip netns exec "$ENTRY" bash -c '
     set -e
     mount -t tmpfs tmpfs /proc/sys/net/ipv6
     exec "$@"
-' _ "$BIN" --config "$LOG/auth.toml" entry --remote 192.0.2.2:443 --iface e0 --conns 1 >"$LOG/entry.log" 2>&1 &
+' _ "$BIN" --config "$LOG/auth.toml" entry --transport "$TRANSPORT" --remote 192.0.2.2:443 --iface e0 --conns 1 >"$LOG/entry.log" 2>&1 &
 PIDS+=("$!")
 
 connected=false

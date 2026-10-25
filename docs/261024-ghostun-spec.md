@@ -2,9 +2,11 @@
 
 Mandatory mutual authentication is defined in [the handshake authentication specification](261024-handshake-auth-spec.md). It supersedes unauthenticated admission: TCP handshake completion alone never permits forwarding or peer replacement.
 
+Transport selection and ordinary TCP relay support are defined in [the dual-transport specification](261025-dual-transport-spec.md). The FakeTCP design below requires a packet-forwarding path; a relay that terminates and recreates TCP, including a `splice` relay, requires the new `tcp` transport. Supporting that transport is specified, not yet implemented.
+
 ## Problem Statement
 
-In the existing `Client <--> relay <--> Server` cross-border/cross-network proxy architecture, relay acts only as an L4 transparent TCP forwarder based on `splice`. All expensive proxy protocol termination—authentication, traffic accounting, TLS/AEAD encryption and decryption, and multiplexed-stream decoding—runs on the remote `Server` (the egress node). As a result, the egress node has high CPU and connection-state costs and becomes a single-machine performance bottleneck.
+In the existing `Client <--> relay <--> Server` cross-border/cross-network proxy architecture, relay acts as an L4 TCP byte-stream proxy based on `splice`: it terminates the incoming TCP connection and opens a separate outgoing connection rather than preserving packets or sequence spaces. All expensive proxy protocol termination—authentication, traffic accounting, TLS/AEAD encryption and decryption, and multiplexed-stream decoding—runs on the remote `Server` (the egress node). As a result, the egress node has high CPU and connection-state costs and becomes a single-machine performance bottleneck. The original assumption that this relay could transparently carry the FakeTCP design was incorrect; the dual-transport specification resolves that conflict.
 
 Moving expensive proxy termination to the ingress node (`Entry`) and making the egress node (`Exit`) lightweight requires an L3 IP tunnel between Entry and Exit. Exit should only decapsulate tunnel traffic and use Linux kernel `MASQUERADE` NAT for internet egress. However, the intermediate network imposes strict stateful-firewall constraints:
 

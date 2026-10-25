@@ -19,6 +19,14 @@ pub enum Mode {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, FromArgValue)]
 #[serde(rename_all = "lowercase")]
+pub enum Transport {
+    #[default]
+    Faketcp,
+    Tcp,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, FromArgValue)]
+#[serde(rename_all = "lowercase")]
 pub enum OuterFamily {
     #[default]
     Ipv4,
@@ -154,6 +162,8 @@ impl FromStr for AuthKey {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
+    pub transport: Transport,
+    pub base_port_explicit: bool,
     pub mode: Mode,
     pub auth_key: AuthKey,
     pub tun_name: String,
@@ -218,7 +228,7 @@ impl Config {
 #[derive(Clone, Debug, Default, PartialEq, FromArgs)]
 #[argh(
     name = "ghostun",
-    description = "L3-over-FakeTCP tunnel with per-core BPF steering.",
+    description = "L3 tunnel over FakeTCP or relay-compatible TCP.",
     help_triggers("-h", "--help", "help")
 )]
 struct Cli {
@@ -228,13 +238,16 @@ struct Cli {
     /// TOML configuration file; CLI flags override its values
     #[argh(option, arg_name = "PATH")]
     config: Option<PathBuf>,
+    /// outer transport: faketcp or tcp [default: faketcp]
+    #[argh(option)]
+    transport: Option<Transport>,
     /// node role: entry or exit
     #[argh(positional)]
     role: Option<Mode>,
     /// exit node outer address (entry only)
     #[argh(option, arg_name = "IP:PORT")]
     remote: Option<SocketAddr>,
-    /// outer FakeTCP listen port (exit only)
+    /// outer listen port (exit only)
     #[argh(option, arg_name = "PORT")]
     listen: Option<u16>,
     /// outer address family; entry derives it from --remote [default: ipv4]
@@ -284,6 +297,7 @@ struct Cli {
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct File {
+    transport: Option<Transport>,
     mode: Option<Mode>,
     auth_key: Option<String>,
     tun_name: Option<String>,
@@ -414,6 +428,8 @@ fn build_config(cli: Cli, running_conns: Option<u16>) -> Result<Config, String> 
         )
     });
     let cfg = Config {
+        transport: cli.transport.or(file.transport).unwrap_or_default(),
+        base_port_explicit: cli.base_port.is_some() || file.base_port.is_some(),
         mode,
         auth_key: file
             .auth_key
@@ -448,6 +464,7 @@ fn build_config(cli: Cli, running_conns: Option<u16>) -> Result<Config, String> 
 fn ensure_reload_compatible(old: &Config, new: &Config) -> Result<(), String> {
     for (changed, field) in [
         (old.mode != new.mode, "mode"),
+        (old.transport != new.transport, "transport"),
         (old.outer_family != new.outer_family, "outer_family"),
         (old.tun_name != new.tun_name, "tun_name"),
         (old.tun_ipv4 != new.tun_ipv4, "tun_ipv4"),
@@ -536,7 +553,9 @@ fn validate(c: &Config) -> Result<(), String> {
             if remote.port() == 0 {
                 return Err("`remote` port must not be 0".into());
             }
-            if c.base_port < 1024 || u32::from(c.base_port) + u32::from(c.conns) > 65535 {
+            if c.transport == Transport::Faketcp
+                && (c.base_port < 1024 || u32::from(c.base_port) + u32::from(c.conns) > 65535)
+            {
                 return Err(
                     "`base_port` must be >= 1024 and leave room for `conns` ports below 65536"
                         .into(),
@@ -583,6 +602,41 @@ mod tests {
         let r = parse_from(std::iter::once("ghostun").chain(all.iter().copied()));
         std::fs::remove_file(&path).unwrap();
         r
+    }
+
+    #[test]
+    fn transport_defaults_precedence_and_validation() {
+        assert_eq!(entry(&[]).unwrap().transport, Transport::Faketcp);
+        let tcp = with_file(
+            "tcp",
+            "transport = 'tcp'\nbase_port = 1",
+            &["entry", "--remote", "192.0.2.1:443"],
+        )
+        .unwrap();
+        assert_eq!(tcp.transport, Transport::Tcp);
+        assert!(tcp.base_port_explicit);
+        assert_eq!(
+            with_file(
+                "override-transport",
+                "transport = 'tcp'",
+                &[
+                    "entry",
+                    "--remote",
+                    "192.0.2.1:443",
+                    "--transport",
+                    "faketcp"
+                ]
+            )
+            .unwrap()
+            .transport,
+            Transport::Faketcp
+        );
+        assert!(with_file(
+            "bad-transport",
+            "transport = 'udp'",
+            &["entry", "--remote", "192.0.2.1:443"]
+        )
+        .is_err());
     }
 
     #[test]
@@ -956,6 +1010,7 @@ mod tests {
 
         // Changing any immutable field is rejected.
         for bad_toml in [
+            format!("mode = 'entry'\ntransport = 'tcp'\nremote = '203.0.113.9:443'\nauth_key = '{key2}'\nconns = 2\n"),
             format!("mode = 'exit'\nlisten = 443\nauth_key = '{key2}'\nconns = 2\n"),
             format!("mode = 'entry'\nremote = '203.0.113.10:443'\nauth_key = '{key2}'\nconns = 2\n"),
             format!("mode = 'entry'\nremote = '[2001:db8::1]:443'\nauth_key = '{key2}'\nconns = 2\n"),

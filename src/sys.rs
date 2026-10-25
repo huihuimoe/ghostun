@@ -3,7 +3,7 @@
 use std::fs::File;
 use std::io::{self, Write};
 use std::mem::{size_of, MaybeUninit};
-use std::net::{IpAddr, Ipv6Addr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -195,6 +195,88 @@ fn destination(dst: IpAddr) -> (Destination, libc::socklen_t) {
             size_of::<libc::sockaddr_in6>() as libc::socklen_t,
         ),
     }
+}
+
+/// Binds a single-family kernel listener; IPv6 never silently accepts IPv4-mapped peers.
+pub fn tcp_listener(addr: SocketAddr) -> io::Result<TcpListener> {
+    let domain = if addr.is_ipv4() {
+        libc::AF_INET
+    } else {
+        libc::AF_INET6
+    };
+    // SAFETY: socket returns an owned descriptor or an error.
+    let fd = unsafe { libc::socket(domain, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    let fd = unsafe { OwnedFd::from_raw_fd(cvt(fd)?) };
+    setsockopt(&fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, &1i32)?;
+    if addr.is_ipv6() {
+        setsockopt(&fd, libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, &1i32)?;
+    }
+    let (mut raw, len) = destination(addr.ip());
+    // SAFETY: destination initializes the union member selected by the address family.
+    unsafe {
+        if addr.is_ipv4() {
+            raw.v4.sin_port = addr.port().to_be();
+        } else {
+            raw.v6.sin6_port = addr.port().to_be();
+        }
+        cvt(libc::bind(
+            fd.as_raw_fd(),
+            (&raw as *const Destination).cast(),
+            len,
+        ))?;
+        cvt(libc::listen(fd.as_raw_fd(), 128))?;
+    }
+    Ok(TcpListener::from(fd))
+}
+
+/// Starts a kernel TCP connection without blocking the worker or its attempt deadline.
+pub fn tcp_connect(remote: SocketAddr, dev: Option<&str>) -> io::Result<TcpStream> {
+    let domain = if remote.is_ipv4() {
+        libc::AF_INET
+    } else {
+        libc::AF_INET6
+    };
+    // SAFETY: constant socket flags, with immediate ownership of the returned fd.
+    let fd = unsafe {
+        libc::socket(
+            domain,
+            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0,
+        )
+    };
+    let fd = unsafe { OwnedFd::from_raw_fd(cvt(fd)?) };
+    if let Some(dev) = dev {
+        // SAFETY: interface bytes remain valid for the entire call.
+        cvt(unsafe {
+            libc::setsockopt(
+                fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_BINDTODEVICE,
+                dev.as_ptr().cast(),
+                dev.len() as libc::socklen_t,
+            )
+        })?;
+    }
+    let (mut addr, len) = destination(remote.ip());
+    // SAFETY: destination selected the matching active union field and sockaddr length.
+    unsafe {
+        match remote {
+            SocketAddr::V4(_) => addr.v4.sin_port = remote.port().to_be(),
+            SocketAddr::V6(v6) => {
+                addr.v6.sin6_port = remote.port().to_be();
+                addr.v6.sin6_scope_id = v6.scope_id();
+            }
+        }
+        if libc::connect(fd.as_raw_fd(), (&addr as *const Destination).cast(), len) < 0 {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() != Some(libc::EINPROGRESS) {
+                return Err(e);
+            }
+        }
+    }
+    let stream = TcpStream::from(fd);
+    stream.set_nodelay(true)?;
+    Ok(stream)
 }
 
 pub fn send_raw(fd: BorrowedFd<'_>, frame: &[u8], dst: IpAddr) -> io::Result<()> {

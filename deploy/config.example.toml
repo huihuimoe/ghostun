@@ -5,17 +5,20 @@
 #   od -An -N32 -tx1 /dev/urandom | tr -d ' \n'
 # Uncomment and fill this field; no public example key is safe for deployment.
 # auth_key = "<64 hexadecimal characters from the command above>"
-# Store this file with mode 0600. Key changes require restarting both peers.
+# Store this file with mode 0600. Coordinate key changes and SIGHUP on both peers.
 
 # Role (required unless given as the `entry` / `exit` subcommand).
 mode = "entry"
+
+# Exactly one outer transport per instance. Both peers must match; change requires restart.
+transport = "faketcp"  # or "tcp", which also supports terminating TCP relays
 
 # --- entry only (required) ---
 # Outer address of the exit node. IPv6 example: "[2001:db8::10]:443".
 remote = "203.0.113.10:443"
 
 # --- exit only (required) ---
-# Outer FakeTCP listen port. Allow inbound TCP to it on the exit host.
+# Outer listen port. Allow inbound TCP to it on the exit host.
 # listen = 443
 # Outer transport family (exit only; entry derives it from remote).
 # outer_family = "ipv4"  # or "ipv6"; one family per instance
@@ -38,15 +41,17 @@ tun_name = "ghostun0"
 # (default: outer_mtu - 40 for outer IPv4, outer_mtu - 60 for outer IPv6).
 # Inner IPv6 requires tun_mtu >= 1280, hence outer_mtu >= 1320 (IPv4) or 1340 (IPv6).
 # outer_mtu = 1500
+# TCP peers must have equal effective MTUs; set a common value if detected defaults differ.
 # tun_mtu = 1460
 
 # Outer egress interface. Default: from the routing table.
 # iface = "eth0"
 
-# Entry: first source port of the outer port pool. Worker i uses ports p >= base_port with p % conns == i.
+# FakeTCP Entry: first source port of the outer port pool. Worker i uses ports p >= base_port with p % conns == i.
+# TCP uses kernel-assigned ports; an explicit base_port is warned about and ignored.
 # base_port = 32768
 
-# Health ping period and the silence after which the entry resets and reconnects on a new port.
+# End-to-end health ping period and silence timeout. TCP reconnects with bounded jittered backoff.
 # ping_interval = 5
 # dead_timeout = 15
 

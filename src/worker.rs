@@ -7,7 +7,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::config::{AuthKey, OuterFamily};
-use crate::session::{Session, Sink};
+use crate::faketcp::{Session, Sink};
 use crate::sys::{self, RAW_BATCH};
 
 const ROUNDS: usize = 4;
@@ -55,6 +55,23 @@ impl Control {
                 || self.established.load(Ordering::Acquire))
     }
 
+    pub fn initial_cpu(&self) -> Option<usize> {
+        self.initial_cpu
+    }
+
+    pub fn take_reload(&self, applied: u64) -> Option<(u64, Reload)> {
+        if self.target_gen.load(Ordering::Acquire) == applied {
+            return None;
+        }
+        self.pending.lock().expect("reload lock").take()
+    }
+
+    pub fn report(&self, generation: u64, established: bool, wait: bool) {
+        self.wait_for_established.store(wait, Ordering::Release);
+        self.established.store(established, Ordering::Release);
+        self.applied_gen.store(generation, Ordering::Release);
+    }
+
     pub fn sync(
         &self,
         id: usize,
@@ -65,26 +82,24 @@ impl Control {
         out: &mut impl Sink,
     ) {
         let mut new_gen = None;
-        if self.target_gen.load(Ordering::Acquire) != *applied_gen {
-            if let Some((gen, reload)) = self.pending.lock().expect("reload lock").take() {
-                if reload.cpu != *cpu {
-                    *cpu = reload.cpu;
-                    pin(id, *cpu);
-                }
-                let prior_wait =
-                    self.wait_for_established.load(Ordering::Relaxed) && !session.is_established();
-                let wait = session.reload(
-                    now,
-                    reload.auth_key,
-                    reload.ping_interval,
-                    reload.dead_timeout,
-                    out,
-                );
-                *applied_gen = gen;
-                self.wait_for_established
-                    .store(wait || prior_wait, Ordering::Release);
-                new_gen = Some(gen);
+        if let Some((gen, reload)) = self.take_reload(*applied_gen) {
+            if reload.cpu != *cpu {
+                *cpu = reload.cpu;
+                pin(id, *cpu);
             }
+            let prior_wait =
+                self.wait_for_established.load(Ordering::Relaxed) && !session.is_established();
+            let wait = session.reload(
+                now,
+                reload.auth_key,
+                reload.ping_interval,
+                reload.dead_timeout,
+                out,
+            );
+            *applied_gen = gen;
+            self.wait_for_established
+                .store(wait || prior_wait, Ordering::Release);
+            new_gen = Some(gen);
         }
         self.established
             .store(session.is_established(), Ordering::Release);
@@ -94,7 +109,7 @@ impl Control {
     }
 }
 
-fn pin(id: usize, cpu: Option<usize>) {
+pub fn pin(id: usize, cpu: Option<usize>) {
     if let Some(target) = cpu {
         if let Err(e) = sys::pin_to_cpu(target) {
             log::warn!("worker {id}: cannot pin to CPU: {e}");
