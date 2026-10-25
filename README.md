@@ -160,3 +160,7 @@ Entry and Exit RSS stay at ~3.1 MB each; stripped release binary size is ~800 KB
 - **Firewall rules:** Unless `--no-netfilter` is set, `ghostun` manages `table inet ghostun_<tun>` (conntrack/TCP-input bypass, kernel RST suppression, MSS clamping, and Exit masquerade) and cleans it up on `SIGINT`/`SIGTERM`.
 - **Security boundary:** `auth_key` authenticates tunnel handshakes so stray clients cannot claim worker slots. `ghostun` does not encrypt traffic or disguise payloads as TLS/HTTP; keep encryption and client authentication in your proxy layer.
 - **Further docs:** [Testing guide](tests/README.md), [architecture spec](docs/261024-ghostun-spec.md), and [authentication spec](docs/261024-handshake-auth-spec.md).
+
+## License
+
+This project is licensed under the **GNU Affero General Public License v3.0** (`AGPL-3.0-or-later`). See the [LICENSE](LICENSE) file for details.
