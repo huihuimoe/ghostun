@@ -14,24 +14,24 @@ use crate::pkt::TcpMeta;
 
 pub const CONTROL: u8 = 3;
 const VERSION: u8 = 1;
-pub const HELLO: u8 = 1;
-pub const CHALLENGE: u8 = 2;
-pub const PROOF: u8 = 3;
-pub const FINISHED: u8 = 4;
+pub(crate) const HELLO: u8 = 1;
+pub(crate) const CHALLENGE: u8 = 2;
+pub(crate) const PROOF: u8 = 3;
+pub(crate) const FINISHED: u8 = 4;
 pub const HELLO_LEN: usize = 35;
-pub const CHALLENGE_LEN: usize = 147;
+const CHALLENGE_LEN: usize = 147;
 pub const PROOF_LEN: usize = 179;
-pub const FINISHED_LEN: usize = 43;
-pub const ENTRY_BYTES: u32 = (HELLO_LEN + PROOF_LEN) as u32;
-pub const EXIT_BYTES: u32 = (CHALLENGE_LEN + FINISHED_LEN) as u32;
+const FINISHED_LEN: usize = 43;
+const ENTRY_BYTES: u32 = (HELLO_LEN + PROOF_LEN) as u32;
+pub(crate) const EXIT_BYTES: u32 = (CHALLENGE_LEN + FINISHED_LEN) as u32;
 const EXIT_DOMAIN: &[u8] = b"ghostun-auth-v1/exit";
 const ENTRY_DOMAIN: &[u8] = b"ghostun-auth-v1/entry";
 const FINISHED_DOMAIN: &[u8] = b"ghostun-auth-v1/finished";
 
 #[derive(Clone, Copy)]
-pub struct Isns {
-    pub entry: u32,
-    pub exit: u32,
+struct Isns {
+    entry: u32,
+    exit: u32,
 }
 
 struct Server {
@@ -40,30 +40,52 @@ struct Server {
     accepted: u64,
 }
 
+struct EntryState {
+    frame: [u8; PROOF_LEN],
+    len: usize,
+    seq: u32,
+}
+
+struct Completion {
+    request: TcpMeta,
+    proof: [u8; PROOF_LEN],
+    finished: [u8; FINISHED_LEN],
+}
+
+pub enum EntryStep {
+    SendProof { rcv_nxt: u32, snd_nxt: u32 },
+    Established { rcv_nxt: u32 },
+}
+
+pub struct Promotion {
+    pub iss: u32,
+    pub irs: u32,
+    pub snd_nxt: u32,
+    pub rcv_nxt: u32,
+    pub finished: [u8; FINISHED_LEN],
+}
+
+pub enum ExitStep {
+    Ignore,
+    Challenge([u8; CHALLENGE_LEN]),
+    Finished([u8; FINISHED_LEN]),
+    Promote(Promotion),
+}
+
 pub struct Auth {
     key: HmacSha256,
     server: Option<Server>,
+    entry: Option<EntryState>,
+    completion: Option<Completion>,
     origin: Instant,
     timeout: Duration,
-}
-
-pub struct Verified {
-    pub isns: Isns,
-    pub finished: [u8; FINISHED_LEN],
 }
 
 fn random(bytes: &mut [u8]) -> io::Result<()> {
     getrandom::fill(bytes).map_err(|_| io::Error::other("OS cryptographic randomness unavailable"))
 }
 
-pub fn hello() -> io::Result<[u8; HELLO_LEN]> {
-    let mut frame = [0; HELLO_LEN];
-    frame[..3].copy_from_slice(&[CONTROL, VERSION, HELLO]);
-    random(&mut frame[3..])?;
-    Ok(frame)
-}
-
-pub fn is_message(payload: &[u8], kind: u8, len: usize) -> bool {
+fn is_message(payload: &[u8], kind: u8, len: usize) -> bool {
     payload.len() == len && payload[..3] == [CONTROL, VERSION, kind]
 }
 
@@ -84,6 +106,8 @@ impl Auth {
         Ok(Self {
             key: HmacSha256::new_from_slice(&key.0).expect("HMAC accepts a 32-byte key"),
             server,
+            entry: None,
+            completion: None,
             origin: now,
             timeout,
         })
@@ -92,6 +116,93 @@ impl Auth {
     pub fn reload(&mut self, key: &AuthKey, timeout: Duration) {
         self.key = HmacSha256::new_from_slice(&key.0).expect("HMAC accepts a 32-byte key");
         self.timeout = timeout;
+    }
+
+    pub fn reset(&mut self) {
+        self.entry = None;
+        self.completion = None;
+    }
+
+    pub fn begin_entry(&mut self, seq: u32) -> io::Result<()> {
+        let mut frame = [0; PROOF_LEN];
+        frame[..3].copy_from_slice(&[CONTROL, VERSION, HELLO]);
+        random(&mut frame[3..HELLO_LEN])?;
+        self.entry = Some(EntryState {
+            frame,
+            len: HELLO_LEN,
+            seq,
+        });
+        Ok(())
+    }
+
+    pub fn pending(&self) -> Option<(u32, &[u8])> {
+        self.entry.as_ref().map(|p| (p.seq, &p.frame[..p.len]))
+    }
+
+    pub fn on_entry_reply(
+        &mut self,
+        iss: u32,
+        irs: u32,
+        snd_nxt: u32,
+        m: &TcpMeta,
+        payload: &[u8],
+    ) -> Option<EntryStep> {
+        let pending = self.entry.as_ref()?;
+        let isns = Isns {
+            entry: iss,
+            exit: irs,
+        };
+        if pending.len == HELLO_LEN {
+            if m.seq != irs.wrapping_add(1) || m.ack != snd_nxt {
+                return None;
+            }
+            let proof = self.proof(isns, &pending.frame[3..HELLO_LEN], payload)?;
+            self.entry = Some(EntryState {
+                frame: proof,
+                len: PROOF_LEN,
+                seq: snd_nxt,
+            });
+            Some(EntryStep::SendProof {
+                rcv_nxt: m.seq.wrapping_add(CHALLENGE_LEN as u32),
+                snd_nxt: snd_nxt.wrapping_add(PROOF_LEN as u32),
+            })
+        } else if m.seq == irs.wrapping_add(1 + CHALLENGE_LEN as u32)
+            && m.ack == snd_nxt
+            && self.finished(isns, &pending.frame, payload)
+        {
+            self.entry = None;
+            Some(EntryStep::Established {
+                rcv_nxt: irs.wrapping_add(1 + EXIT_BYTES),
+            })
+        } else {
+            None
+        }
+    }
+
+    pub fn on_exit_request(
+        &mut self,
+        now: Instant,
+        established: bool,
+        m: &TcpMeta,
+        payload: &[u8],
+    ) -> io::Result<ExitStep> {
+        if is_message(payload, HELLO, HELLO_LEN) {
+            return Ok(match self.challenge(now, m, payload)? {
+                Some(challenge) => ExitStep::Challenge(challenge),
+                None => ExitStep::Ignore,
+            });
+        }
+        if let Some(c) = self
+            .completion
+            .as_ref()
+            .filter(|c| established && c.request == *m && payload == &c.proof[..])
+        {
+            return Ok(ExitStep::Finished(c.finished));
+        }
+        Ok(match self.accept(now, m, payload) {
+            Some(promotion) => ExitStep::Promote(promotion),
+            None => ExitStep::Ignore,
+        })
     }
 
     /// SYN cookies bind the observed tuple and Entry ISN, without storing a candidate.
@@ -116,7 +227,7 @@ impl Auth {
         u32::from_be_bytes(tag[..4].try_into().unwrap())
     }
 
-    pub fn challenge(
+    fn challenge(
         &mut self,
         now: Instant,
         meta: &TcpMeta,
@@ -162,7 +273,7 @@ impl Auth {
         Ok(Some(frame))
     }
 
-    pub fn proof(&self, isns: Isns, nonce: &[u8], challenge: &[u8]) -> Option<[u8; PROOF_LEN]> {
+    fn proof(&self, isns: Isns, nonce: &[u8], challenge: &[u8]) -> Option<[u8; PROOF_LEN]> {
         if !is_message(challenge, CHALLENGE, CHALLENGE_LEN)
             || challenge[19..51] != *nonce
             || !self.verify(EXIT_DOMAIN, isns, &challenge[3..115], &challenge[115..])
@@ -178,7 +289,7 @@ impl Auth {
     }
 
     /// A verified ticket is consumed before promotion; failed requests never move the watermark.
-    pub fn accept(&mut self, now: Instant, meta: &TcpMeta, proof: &[u8]) -> Option<Verified> {
+    fn accept(&mut self, now: Instant, meta: &TcpMeta, proof: &[u8]) -> Option<Promotion> {
         if !is_message(proof, PROOF, PROOF_LEN) {
             return None;
         }
@@ -210,10 +321,21 @@ impl Auth {
         finished[3..11].copy_from_slice(&ticket.to_be_bytes());
         finished[11..].copy_from_slice(self.sign(FINISHED_DOMAIN, isns, &proof[3..115]).as_ref());
         self.server.as_mut()?.accepted = ticket;
-        Some(Verified { isns, finished })
+        self.completion = Some(Completion {
+            request: *meta,
+            proof: proof.try_into().unwrap(),
+            finished,
+        });
+        Some(Promotion {
+            iss: isns.exit,
+            irs: isns.entry,
+            snd_nxt: isns.exit.wrapping_add(1 + EXIT_BYTES),
+            rcv_nxt: isns.entry.wrapping_add(1 + ENTRY_BYTES),
+            finished,
+        })
     }
 
-    pub fn finished(&self, isns: Isns, proof: &[u8; PROOF_LEN], payload: &[u8]) -> bool {
+    fn finished(&self, isns: Isns, proof: &[u8; PROOF_LEN], payload: &[u8]) -> bool {
         is_message(payload, FINISHED, FINISHED_LEN)
             && payload[3..11] == proof[3..11]
             && self.verify(FINISHED_DOMAIN, isns, &proof[3..115], &payload[11..])
