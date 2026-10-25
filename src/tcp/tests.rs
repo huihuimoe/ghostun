@@ -138,12 +138,35 @@ fn split_prefix_payload_coalescing_and_partial_writes_preserve_packets_and_cap()
     let mut sink = Vec::new();
     tx.flush(&mut sink).unwrap();
     assert_eq!(tx.bytes(), 0);
+    let expected_frames = sink.len() / (payload.len() + 2);
     let mut input = &sink[..];
     while !input.is_empty() {
         assert!(reader.read(&mut input).unwrap());
         assert_eq!(reader.payload(), payload);
         reader.clear();
     }
+    struct CountingRead<'a> {
+        inner: &'a [u8],
+        calls: usize,
+    }
+    impl Read for CountingRead<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.calls += 1;
+            self.inner.read(buf)
+        }
+    }
+    reader.grow(1380);
+    let mut batched = CountingRead {
+        inner: &sink,
+        calls: 0,
+    };
+    for _ in 0..expected_frames {
+        assert!(reader.read(&mut batched).unwrap());
+        assert_eq!(reader.payload(), payload);
+        reader.clear();
+    }
+    assert!(batched.inner.is_empty());
+    assert!(batched.calls <= (sink.len() / wire::RX_LIMIT) + 3);
 }
 
 #[test]

@@ -20,54 +20,84 @@ pub fn random(bytes: &mut [u8]) -> io::Result<()> {
     getrandom::fill(bytes).map_err(|_| io::Error::other("OS cryptographic randomness unavailable"))
 }
 
-/// Reads exactly one bounded frame without consuming the next frame from the stream.
+pub const RX_LIMIT: usize = 64 * 1024;
+
+/// Decodes bounded frames; unauthenticated candidates stay single-frame until `grow`.
 pub struct Receive {
     bytes: Vec<u8>,
-    used: usize,
-    len: usize,
+    head: usize,
+    tail: usize,
+    max: usize,
 }
 
 impl Receive {
     pub fn new(max: usize) -> Self {
         Self {
             bytes: vec![0; max + 2],
-            used: 0,
-            len: 0,
+            head: 0,
+            tail: 0,
+            max,
         }
+    }
+
+    pub fn grow(&mut self, max: usize) {
+        self.max = max;
+        self.bytes.resize(RX_LIMIT.max(max + 2), 0);
+    }
+
+    fn frame_len(&self) -> Option<usize> {
+        (self.tail - self.head >= 2).then(|| {
+            u16::from_be_bytes([self.bytes[self.head], self.bytes[self.head + 1]]) as usize
+        })
+    }
+
+    pub fn ready(&self) -> bool {
+        self.frame_len()
+            .is_some_and(|len| len == 0 || len > self.max || self.tail - self.head >= 2 + len)
     }
 
     pub fn read(&mut self, input: &mut impl Read) -> io::Result<bool> {
         loop {
-            let end = if self.used < 2 { 2 } else { self.len + 2 };
-            if self.used == end && self.used >= 2 {
-                return Ok(true);
+            let avail = self.tail - self.head;
+            let need = match self.frame_len() {
+                Some(len) if len == 0 || len > self.max => {
+                    return Err(invalid("invalid framing: zero or oversized length"));
+                }
+                Some(len) if avail >= 2 + len => return Ok(true),
+                Some(len) => 2 + len,
+                None => 2,
+            };
+            if self.head > 0 && self.bytes.len() - self.tail < self.max + 2 {
+                self.bytes.copy_within(self.head..self.tail, 0);
+                self.tail -= self.head;
+                self.head = 0;
             }
-            match input.read(&mut self.bytes[self.used..end]) {
+            let end = if self.bytes.len() > self.max + 2 {
+                self.bytes.len()
+            } else {
+                self.head + need
+            };
+            match input.read(&mut self.bytes[self.tail..end]) {
                 Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "peer EOF")),
-                Ok(n) => self.used += n,
+                Ok(n) => self.tail += n,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(false),
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(e),
             }
-            if self.used == 2 {
-                self.len = u16::from_be_bytes([self.bytes[0], self.bytes[1]]) as usize;
-                if self.len == 0 || self.len > self.bytes.len() - 2 {
-                    return Err(invalid("invalid framing: zero or oversized length"));
-                }
-            }
         }
     }
 
-    pub fn complete(&self) -> bool {
-        self.used >= 2 && self.used == self.len + 2
+    pub fn payload(&self) -> &[u8] {
+        let len = self.frame_len().expect("complete frame");
+        &self.bytes[self.head + 2..self.head + 2 + len]
     }
 
-    pub fn payload(&self) -> &[u8] {
-        &self.bytes[2..2 + self.len]
-    }
     pub fn clear(&mut self) {
-        self.used = 0;
-        self.len = 0;
+        self.head += 2 + self.frame_len().expect("complete frame");
+        if self.head == self.tail {
+            self.head = 0;
+            self.tail = 0;
+        }
     }
 }
 

@@ -124,14 +124,14 @@ This feature authenticates connections but does not add encryption or cryptograp
 
 - Cap pending application-level transmit bytes at 256 KiB per worker, including frame prefixes. This is an internal constant, not a new tuning option.
 - Stop reading the corresponding TUN queue when there is insufficient space for another maximum-size frame. Preserve partial-write state without copying or rebuilding already queued frames unnecessarily.
-- On receive, retain at most one complete frame plus fixed bounded parsing state. If writing its data packet to TUN would block, keep the frame and stop reading that TCP stream until delivery can proceed.
+- Cap pending application-level receive bytes at 64 KiB per established worker (and one authentication frame for unauthenticated candidates). If writing a decoded data packet to TUN would block, retain the buffered bytes and stop reading that TCP stream until delivery can proceed.
 - Keep control-message and authentication buffering bounded too; repeated timer events or blocked writes must not create unbounded queues.
 - While a worker has no authenticated connection, drain and discard packets read from its TUN queue rather than retaining an offline backlog.
 - Discard the old connection's pending data on disconnect or replacement. Do not replay it through a new connection, because delivery at the old peer may be ambiguous.
 - Inner TCP relies on its own recovery after loss; inner UDP may lose packets. Backpressure does not guarantee that finite kernel TUN queues never drop packets.
 - Cap simultaneous unauthenticated candidates per Exit instance at `min(2 * conns, 256)`. Immediately close new candidates exceeding the cap without evicting active tunnels. Every admitted candidate still has a finite authentication deadline.
 - The cap does not promise admission fairness or DDoS resistance against an attacker continuously filling candidate capacity.
-- Application bounds exclude kernel TCP send/receive buffers, listener backlog, and TUN queues. Account for these separately in resource measurements; do not present 256 KiB as total connection memory.
+- Application bounds exclude kernel TCP send/receive buffers, listener backlog, and TUN queues. Account for these separately in resource measurements; do not present application buffer caps as total connection memory.
 
 ### 7. End-to-End Health and Attempt Deadlines
 

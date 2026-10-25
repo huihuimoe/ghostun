@@ -78,7 +78,7 @@ impl Connection {
 
     fn establish(&mut self, mtu: u16) {
         self.auth = None;
-        self.rx = Receive::new(mtu as usize);
+        self.rx.grow(mtu as usize);
         self.since = Instant::now();
         self.last_rx = self.since;
         self.last_ping = self.since;
@@ -101,32 +101,33 @@ impl Connection {
         }
         self.tx.flush(&mut self.socket)?;
         for _ in 0..64 {
-            if self.tun_pending {
-                if !tun_write(tun, self.rx.payload())? {
+            if !self.tun_pending {
+                if !self.rx.read(&mut self.socket)? {
                     break;
                 }
-                self.rx.clear();
-                self.tun_pending = false;
-            }
-            if !self.rx.read(&mut self.socket)? {
-                break;
-            }
-            let p = self.rx.payload();
-            if p.len() == 9 && matches!(p[0], PING | PONG) {
-                if p[0] == PING {
-                    if !self.tx.room(9) {
-                        break;
+                let p = self.rx.payload();
+                if p.len() == 9 && matches!(p[0], PING | PONG) {
+                    if p[0] == PING {
+                        if !self.tx.room(9) {
+                            break;
+                        }
+                        let mut pong: [u8; 9] = p.try_into().unwrap();
+                        pong[0] = PONG;
+                        self.tx.push(&pong);
                     }
-                    let mut pong: [u8; 9] = p.try_into().unwrap();
-                    pong[0] = PONG;
-                    self.tx.push(&pong);
+                    self.rx.clear();
+                    self.last_rx = now;
+                    continue;
                 }
-                self.rx.clear();
-            } else {
                 wire::validate_packet(p, mtu)?;
                 self.tun_pending = true;
+                self.last_rx = now;
             }
-            self.last_rx = now;
+            if !tun_write(tun, self.rx.payload())? {
+                break;
+            }
+            self.rx.clear();
+            self.tun_pending = false;
         }
         for _ in 0..64 {
             if !self.tx.room(mtu) {
@@ -526,7 +527,7 @@ impl Worker {
             if let Some(c) = &connection {
                 fds[1] = pollfd(
                     c.socket.as_raw_fd(),
-                    if c.tun_pending || c.rx.complete() {
+                    if c.tun_pending || c.rx.ready() {
                         0
                     } else {
                         libc::POLLIN
@@ -539,7 +540,15 @@ impl Worker {
                     fds[0].events |= libc::POLLOUT;
                 }
             }
-            if let Err(e) = poll(&mut fds, 20) {
+            let poll_ms = if connection
+                .as_ref()
+                .is_some_and(|c| !c.tun_pending && c.rx.ready() && c.tx.room(9))
+            {
+                0
+            } else {
+                20
+            };
+            if let Err(e) = poll(&mut fds, poll_ms) {
                 log::error!("tcp worker {id}: poll: {e}");
                 return;
             }
