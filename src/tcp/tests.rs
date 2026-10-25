@@ -170,7 +170,7 @@ fn split_prefix_payload_coalescing_and_partial_writes_preserve_packets_and_cap()
 }
 
 #[test]
-fn vectored_writes_preserve_frames_across_partial_prefixes_and_would_block() {
+fn writes_preserve_frames_across_partial_prefixes_and_would_block() {
     struct Writer {
         bytes: Vec<u8>,
         limit: usize,
@@ -178,20 +178,13 @@ fn vectored_writes_preserve_frames_across_partial_prefixes_and_would_block() {
     }
     impl Write for Writer {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            self.write_vectored(&[std::io::IoSlice::new(bytes)])
-        }
-        fn write_vectored(&mut self, slices: &[std::io::IoSlice<'_>]) -> io::Result<usize> {
             self.calls += 1;
             if self.calls == 2 {
                 return Err(io::ErrorKind::WouldBlock.into());
             }
-            let mut n = 0;
-            for slice in slices {
-                let len = slice.len().min(self.limit - n);
-                self.bytes.extend_from_slice(&slice[..len]);
-                n += len;
-            }
-            Ok(n)
+            let len = bytes.len().min(self.limit);
+            self.bytes.extend_from_slice(&bytes[..len]);
+            Ok(len)
         }
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
@@ -215,6 +208,20 @@ fn vectored_writes_preserve_frames_across_partial_prefixes_and_would_block() {
         assert!(tx.push(&p));
         packets.push(p);
     }
+    assert!(tx
+        .push_in_place(1380, |dst| {
+            let p = packet(5);
+            dst[..p.len()].copy_from_slice(&p);
+            Ok(Some(p.len()))
+        })
+        .unwrap());
+    packets.push(packet(5));
+    assert!(tx
+        .push_in_place(1380, |dst| {
+            dst[..4].copy_from_slice(&[0xff; 4]);
+            Err(wire::invalid("bad"))
+        })
+        .is_err());
     tx.flush(&mut writer).unwrap();
     assert_eq!(tx.bytes(), 0);
     let mut input = &writer.bytes[..];
@@ -327,13 +334,8 @@ fn authenticated_admission_and_takeover_preserve_exact_data_and_ignore_incomplet
     entry.tx.flush(&mut entry.socket).unwrap();
     let mut delivered = false;
     for _ in 0..100 {
-        exit.pump(
-            &tun,
-            &mut [0; 1381],
-            Duration::from_secs(1),
-            Duration::from_secs(4),
-        )
-        .unwrap();
+        exit.pump(&tun, 1380, Duration::from_secs(1), Duration::from_secs(4))
+            .unwrap();
         let mut data = [0; 2048];
         if let Ok(n) = consumer.recv(&mut data) {
             assert_eq!(&data[..n], p);
@@ -390,13 +392,8 @@ fn blocked_tun_retains_one_frame_then_delivers_in_order_after_resume() {
     }
     tx.flush(&mut sender).unwrap();
     for _ in 0..100 {
-        c.pump(
-            &tun,
-            &mut [0; 1381],
-            Duration::from_secs(5),
-            Duration::from_secs(15),
-        )
-        .unwrap();
+        c.pump(&tun, 1380, Duration::from_secs(5), Duration::from_secs(15))
+            .unwrap();
         if c.tun_pending {
             break;
         }
@@ -406,13 +403,8 @@ fn blocked_tun_retains_one_frame_then_delivers_in_order_after_resume() {
     assert_eq!(c.rx.payload(), packets[0]);
     let mut buf = [0; 2048];
     while consumer.recv(&mut buf).is_ok() {}
-    c.pump(
-        &tun,
-        &mut [0; 1381],
-        Duration::from_secs(5),
-        Duration::from_secs(15),
-    )
-    .unwrap();
+    c.pump(&tun, 1380, Duration::from_secs(5), Duration::from_secs(15))
+        .unwrap();
     for p in &packets {
         let n = consumer.recv(&mut buf).unwrap();
         assert_eq!(&buf[..n], p);
@@ -430,13 +422,8 @@ fn eof_and_illegal_established_control_close_the_stream() {
     let tun = OwnedFd::from(tun);
     sender.write_all(&[0, 1, 3]).unwrap();
     for _ in 0..100 {
-        if c.pump(
-            &tun,
-            &mut [0; 1381],
-            Duration::from_secs(5),
-            Duration::from_secs(15),
-        )
-        .is_err()
+        if c.pump(&tun, 1380, Duration::from_secs(5), Duration::from_secs(15))
+            .is_err()
         {
             return;
         }
@@ -496,25 +483,15 @@ fn partial_bytes_do_not_refresh_end_to_end_liveness() {
     let prior = c.last_rx;
     peer.write_all(&[0, 9, PING, 0]).unwrap();
     for _ in 0..10 {
-        c.pump(
-            &tun,
-            &mut [0; 1381],
-            Duration::from_secs(1),
-            Duration::from_secs(4),
-        )
-        .unwrap();
+        c.pump(&tun, 1380, Duration::from_secs(1), Duration::from_secs(4))
+            .unwrap();
         assert_eq!(c.last_rx, prior);
         std::thread::sleep(Duration::from_millis(1));
     }
     peer.write_all(&[0; 7]).unwrap();
     for _ in 0..100 {
-        c.pump(
-            &tun,
-            &mut [0; 1381],
-            Duration::from_secs(1),
-            Duration::from_secs(4),
-        )
-        .unwrap();
+        c.pump(&tun, 1380, Duration::from_secs(1), Duration::from_secs(4))
+            .unwrap();
         if c.last_rx > prior {
             return;
         }
@@ -556,13 +533,8 @@ fn slow_tcp_receiver_backpressures_tun_at_the_transmit_bound_then_delivers_exact
                 break;
             }
         }
-        c.pump(
-            &tun,
-            &mut [0; 1381],
-            Duration::from_secs(30),
-            Duration::from_secs(60),
-        )
-        .unwrap();
+        c.pump(&tun, 1380, Duration::from_secs(30), Duration::from_secs(60))
+            .unwrap();
         assert!(c.tx.bytes() <= TX_LIMIT);
         if !c.tx.room(1380) {
             break;
@@ -576,13 +548,8 @@ fn slow_tcp_receiver_backpressures_tun_at_the_transmit_bound_then_delivers_exact
     let mut rx = Receive::new(1380);
     let deadline = Instant::now() + Duration::from_secs(5);
     while received < sent && Instant::now() < deadline {
-        c.pump(
-            &tun,
-            &mut [0; 1381],
-            Duration::from_secs(30),
-            Duration::from_secs(60),
-        )
-        .unwrap();
+        c.pump(&tun, 1380, Duration::from_secs(30), Duration::from_secs(60))
+            .unwrap();
         while rx.read(&mut peer).unwrap() {
             assert_eq!(rx.payload(), p);
             received += 1;

@@ -1,6 +1,5 @@
 //! The TCP v1 codec and mutual authentication. See docs/261025-dual-transport-spec.md.
-use std::collections::VecDeque;
-use std::io::{self, IoSlice, Read, Write};
+use std::io::{self, Read, Write};
 
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
@@ -103,40 +102,81 @@ impl Receive {
 
 #[derive(Default)]
 pub struct SendQueue {
-    pending: VecDeque<u8>,
+    buf: Vec<u8>,
+    head: usize,
+    tail: usize,
 }
 
 impl SendQueue {
     pub fn bytes(&self) -> usize {
-        self.pending.len()
+        self.tail - self.head
     }
 
     pub fn room(&self, payload: usize) -> bool {
         self.bytes() + payload + 2 <= TX_LIMIT
     }
 
+    pub fn grow(&mut self) {
+        self.buf.resize(TX_LIMIT + 1, 0);
+    }
+
+    fn ensure(&mut self, space: usize) {
+        if self.buf.len() - self.tail >= space {
+            return;
+        }
+        if self.head > 0 {
+            self.buf.copy_within(self.head..self.tail, 0);
+            self.tail -= self.head;
+            self.head = 0;
+        }
+        if self.buf.len() - self.tail < space {
+            // Bound retained storage without allocating the full budget for idle candidates.
+            let len = (self.buf.len() * 2)
+                .max(self.tail + space)
+                .min(TX_LIMIT + 1);
+            self.buf.resize(len, 0);
+        }
+    }
+
     pub fn push(&mut self, payload: &[u8]) -> bool {
         if !self.room(payload.len()) {
             return false;
         }
-        let required = self.bytes() + payload.len() + 2;
-        if required > self.pending.capacity() {
-            // Bound retained storage without allocating the full budget for idle candidates.
-            let capacity = (self.pending.capacity() * 2).max(required).min(TX_LIMIT);
-            self.pending.reserve_exact(capacity - self.bytes());
-        }
-        self.pending.extend((payload.len() as u16).to_be_bytes());
-        self.pending.extend(payload);
+        let frame = 2 + payload.len();
+        self.ensure(frame);
+        self.buf[self.tail..self.tail + 2].copy_from_slice(&(payload.len() as u16).to_be_bytes());
+        self.buf[self.tail + 2..self.tail + frame].copy_from_slice(payload);
+        self.tail += frame;
         true
     }
 
+    pub fn push_in_place<F>(&mut self, max: usize, f: F) -> io::Result<bool>
+    where
+        F: FnOnce(&mut [u8]) -> io::Result<Option<usize>>,
+    {
+        if !self.room(max) {
+            return Ok(false);
+        }
+        self.ensure(max + 3);
+        let Some(len) = f(&mut self.buf[self.tail + 2..self.tail + 2 + max + 1])? else {
+            return Ok(false);
+        };
+        assert!((1..=max).contains(&len));
+        self.buf[self.tail..self.tail + 2].copy_from_slice(&(len as u16).to_be_bytes());
+        self.tail += 2 + len;
+        Ok(true)
+    }
+
     pub fn flush(&mut self, output: &mut impl Write) -> io::Result<()> {
-        while !self.pending.is_empty() {
-            let (first, second) = self.pending.as_slices();
-            match output.write_vectored(&[IoSlice::new(first), IoSlice::new(second)]) {
+        while self.head < self.tail {
+            match output.write(&self.buf[self.head..self.tail]) {
                 Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
                 Ok(n) => {
-                    self.pending.drain(..n);
+                    self.head += n;
+                    if self.head == self.tail {
+                        self.head = 0;
+                        self.tail = 0;
+                    }
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,

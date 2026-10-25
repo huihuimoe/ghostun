@@ -79,19 +79,14 @@ impl Connection {
     fn establish(&mut self, mtu: u16) {
         self.auth = None;
         self.rx.grow(mtu as usize);
+        self.tx.grow();
         self.since = Instant::now();
         self.last_rx = self.since;
         self.last_ping = self.since;
     }
 
-    fn pump(
-        &mut self,
-        tun: &OwnedFd,
-        packet: &mut [u8],
-        ping: Duration,
-        dead: Duration,
-    ) -> io::Result<()> {
-        let mtu = packet.len() - 1;
+    fn pump(&mut self, tun: &OwnedFd, mtu: u16, ping: Duration, dead: Duration) -> io::Result<()> {
+        let mtu = mtu as usize;
         let now = Instant::now();
         if now.duration_since(self.last_rx) >= dead {
             return Err(io::Error::new(
@@ -130,14 +125,16 @@ impl Connection {
             self.tun_pending = false;
         }
         for _ in 0..64 {
-            if !self.tx.room(mtu) {
+            let pushed = self.tx.push_in_place(mtu, |buf| {
+                let Some(n) = tun_read(tun, buf)? else {
+                    return Ok(None);
+                };
+                wire::validate_packet(&buf[..n], mtu)?;
+                Ok(Some(n))
+            })?;
+            if !pushed {
                 break;
             }
-            let Some(n) = tun_read(tun, packet)? else {
-                break;
-            };
-            wire::validate_packet(&packet[..n], mtu)?;
-            self.tx.push(&packet[..n]);
         }
         if now.duration_since(self.last_ping) >= ping && self.tx.room(9) {
             let mut msg = [PING; 9];
@@ -488,7 +485,7 @@ impl Worker {
                 } else {
                     c.pump(
                         &self.tun,
-                        &mut packet,
+                        self.mtu,
                         self.cfg.ping_interval,
                         self.cfg.dead_timeout,
                     )
