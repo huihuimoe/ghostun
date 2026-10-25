@@ -27,6 +27,8 @@ cargo build --release --locked
 docker build -t ghostun .
 ```
 
+Pre-built multi-arch Docker images are available at `ghcr.io/huihuimoe/ghostun:latest`.
+
 ## Quick start
 
 1. Generate a shared 32-byte key file (`0600`) and copy it to both hosts:
@@ -127,16 +129,25 @@ Use `exit.toml` and `deploy/ghostun-exit.service` on the Exit host.
 
 ### Docker Compose
 
+Compose files in [`deploy/`](deploy/) use `ghcr.io/huihuimoe/ghostun:latest`:
+
+**Entry:**
+
 ```sh
 cd deploy
 install -m600 config.example.toml entry.toml   # set auth_key and role settings
-docker compose -f docker-compose.entry.yml up -d --build
+docker compose -f docker-compose.entry.yml up -d
 ```
 
-For Exit, enable IP forwarding on the host before starting `docker-compose.exit.yml`:
+**Exit:**
+
+Enable IP forwarding on the host before starting Exit:
 
 ```sh
 sysctl -w net.ipv4.ip_forward=1 net.ipv6.conf.all.forwarding=1
+cd deploy
+install -m600 config.example.toml exit.toml    # set auth_key and role settings
+docker compose -f docker-compose.exit.yml up -d
 ```
 
 ## Performance

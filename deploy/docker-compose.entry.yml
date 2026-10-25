@@ -1,7 +1,6 @@
 services:
   ghostun-entry:
-    build: ..
-    image: ghostun:latest
+    image: ghcr.io/huihuimoe/ghostun:latest
     container_name: ghostun-entry
     restart: unless-stopped
     network_mode: host

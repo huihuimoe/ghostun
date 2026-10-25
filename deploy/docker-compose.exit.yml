@@ -1,7 +1,6 @@
 services:
   ghostun-exit:
-    build: ..
-    image: ghostun:latest
+    image: ghcr.io/huihuimoe/ghostun:latest
     container_name: ghostun-exit
     restart: unless-stopped
     network_mode: host
