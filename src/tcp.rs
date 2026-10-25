@@ -351,7 +351,7 @@ impl Listener {
                         let id = candidate.identity.map(|v| v.0);
                         if let Err(e) = result.and_then(|_| candidate.admit(&self.slots, self.mtu))
                         {
-                            log::warn!("tcp candidate {id:?}: {e}");
+                            log::debug!("tcp candidate {id:?}: {e}");
                         }
                     }
                 }
@@ -371,7 +371,7 @@ impl Listener {
                                     identity: None,
                                     timeout: self.slots[0].lock().unwrap().timeout,
                                 }),
-                                Err(e) => log::warn!("tcp candidate setup: {e}"),
+                                Err(e) => log::debug!("tcp candidate setup: {e}"),
                             }
                         }
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
