@@ -57,3 +57,5 @@ tun_name = "ghostun0"
 
 # Skip nftables/sysctl management (you then provide the rules yourself, see README).
 # no_netfilter = false
+# Exit only: omit nftables masquerade (for routed L3 networks without NAT).
+# no_masq = false

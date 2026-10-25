@@ -314,4 +314,53 @@ for side in entry exit; do
     ! ns $side nft list table inet $TABLE >/dev/null 2>&1 || fail "$side nft table still present"
 done
 pass "SIGTERM: RSTs released firewall slots, ghostun0 and nft tables removed"
+
+# Routed L3 mode (--no-masq): preserve inner source IPs in both directions while keeping
+# FakeTCP bypass and Exit MSS clamping (Exit tun_mtu=1280 < Entry tun_mtu and inet MTU=1420).
+ns inet ip route add 10.200.0.0/30 via 10.3.0.1
+ns inet ip -6 route add fd00:200::/126 via fd00:3::1
+ip netns exec exit "$BIN" --config "$LOG/auth.toml" exit --listen 443 --outer-family "$OUTER_FAMILY" --conns "$N" "${EXIT_CPU_ARGS[@]}" --tun-mtu 1280 --no-masq --ping-interval 1 --dead-timeout $DEAD >"$LOG/exit-nomasq.log" 2>&1 &
+EXIT_PID=$!
+PIDS="$EXIT_PID"
+start_entry
+route_inner
+wait_ping 10 >/dev/null || fail "--no-masq tunnel never came up"
+exit_rules=$(ns exit nft list table inet "$TABLE")
+! [[ $exit_rules =~ postrouting|masquerade ]] || fail "--no-masq installed masquerade rules"
+python3 - <<'PY' || fail "--no-masq source IP preservation or Exit MSS clamping failed"
+import socket, subprocess
+
+def check(server_ns, bind_addr, client_ns, dst_addr, want_peer, max_mss):
+    fam = int(socket.AF_INET6 if ":" in bind_addr else socket.AF_INET)
+    srv = subprocess.Popen(
+        ["ip", "netns", "exec", server_ns, "python3", "-c",
+         f"import socket; s=socket.socket({fam}); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); "
+         f"s.bind(({bind_addr!r}, 9001)); s.listen(1); c,a=s.accept(); "
+         f"print(a[0], c.getsockopt(socket.IPPROTO_TCP, socket.TCP_MAXSEG)); c.sendall(b'ok'); c.close(); s.close()"],
+        stdout=subprocess.PIPE, text=True,
+    )
+    cli_mss = int(subprocess.check_output(
+        ["ip", "netns", "exec", client_ns, "python3", "-c",
+         f"import socket,time\nfor _ in range(30):\n try:\n  c=socket.socket({fam}); c.settimeout(2); c.connect(({dst_addr!r}, 9001)); assert c.recv(2)==b'ok'; "
+         f"print(c.getsockopt(socket.IPPROTO_TCP, socket.TCP_MAXSEG)); c.close(); break\n except OSError: time.sleep(0.05)\nelse: raise SystemExit(1)"],
+        text=True,
+    ).strip())
+    peer, srv_mss = srv.communicate(timeout=5)[0].strip().split()
+    clamped_mss = cli_mss if client_ns == "entry" else int(srv_mss)
+    assert peer == want_peer, f"expected peer {want_peer}, got {peer}"
+    assert clamped_mss <= max_mss, f"expected Exit-clamped MSS <= {max_mss}, got {clamped_mss}"
+
+check("inet", "10.3.0.2", "entry", "10.3.0.2", "10.200.0.1", 1240)
+check("inet", "fd00:3::2", "entry", "fd00:3::2", "fd00:200::1", 1220)
+check("entry", "10.200.0.1", "inet", "10.200.0.1", "10.3.0.2", 1240)
+PY
+kill -TERM "$ENTRY_PID" "$EXIT_PID"
+wait "$ENTRY_PID" || fail "--no-masq entry exit status $?"
+wait "$EXIT_PID" || fail "--no-masq exit exit status $?"
+PIDS=
+for side in entry exit; do
+    ! ns $side ip link show ghostun0 >/dev/null 2>&1 || fail "--no-masq $side ghostun0 survived shutdown"
+    ! ns $side nft list table inet "$TABLE" >/dev/null 2>&1 || fail "--no-masq $side nft table survived shutdown"
+done
+pass "--no-masq: routed IPv4/IPv6 preserved source IPs in both directions with Exit-clamped MSS"
 echo "ALL PASSED"

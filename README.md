@@ -122,6 +122,7 @@ ghostun [options] [entry|exit]
 | `--ping-interval SECS` | `5` | Health probe interval |
 | `--dead-timeout SECS` | `15` | Silence timeout before reconnecting |
 | `--no-netfilter` | off | Skip automatic `nftables` and `sysctl` setup |
+| `--no-masq` | off | Exit only: skip `nftables` masquerade |
 | `-V`, `--version` | — | Print version and exit |
 | `-h`, `--help` | — | Show help and exit |
 
@@ -140,6 +141,20 @@ systemctl enable --now ghostun-entry
 ```
 
 Use `exit.toml` and `deploy/ghostun-exit.service` on the Exit host.
+
+### Podman Quadlet
+
+Quadlet units in [`deploy/`](deploy/) use `ghcr.io/huihuimoe/ghostun:latest`:
+
+```sh
+install -d -m700 /etc/ghostun
+install -m600 deploy/config.example.toml /etc/ghostun/entry.toml  # set auth_key and role settings
+install -m644 deploy/ghostun-entry.container /etc/containers/systemd/
+systemctl daemon-reload
+systemctl start ghostun-entry
+```
+
+On the Exit host, enable IP forwarding (`sysctl -w net.ipv4.ip_forward=1 net.ipv6.conf.all.forwarding=1`), then install `exit.toml` and `deploy/ghostun-exit.container`.
 
 ### Docker Compose
 
@@ -222,7 +237,7 @@ stateful firewall, outer MTU 1420, eight parallel iperf3 streams, two workers pe
 ## Operational notes
 
 - **MTU:** Outer headers take 40 bytes over IPv4 and 60 bytes over IPv6. If your path MTU is lower than the NIC MTU (for example PPPoE `1492` or cloud VPC `1420`) and large transfers stall while ping works, set `--outer-mtu`.
-- **Firewall rules:** `ghostun` manages its own nftables table and removes it on shutdown. Both transports use inner MSS clamping and Exit masquerade. FakeTCP also bypasses conntrack and suppresses kernel RSTs. Use `--no-netfilter` to manage rules yourself.
+- **Firewall rules:** `ghostun` manages its own nftables table and removes it on shutdown. Both transports use inner MSS clamping and Exit masquerade; FakeTCP also bypasses conntrack and suppresses kernel RSTs. Use `--no-masq` on Exit to omit masquerade while keeping the rest, or `--no-netfilter` to skip all `nftables` and `sysctl` changes.
 - **Security:** The shared key authenticates connections. Traffic is not encrypted or protected against modification; use encryption in your proxy. TCP also carries inner UDP, but loss can delay all flows sharing an outer connection.
 - **Reload:** Send `SIGHUP` to reload the key, health timers or CPU affinity. Coordinate key changes on both peers. Transport and topology changes require restart.
 - **Docs:** [Testing](tests/README.md), [architecture](docs/261024-ghostun-spec.md), [FakeTCP authentication](docs/261024-handshake-auth-spec.md), [dual transport](docs/261025-dual-transport-spec.md).

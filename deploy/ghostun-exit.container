@@ -1,0 +1,26 @@
+# /proc/sys is read-only in rootful containers with host networking.
+# Enable forwarding on the host first:
+#   sysctl -w net.ipv4.ip_forward=1 net.ipv6.conf.all.forwarding=1
+[Unit]
+Description=ghostun exit
+After=nftables.service
+
+[Container]
+Image=ghcr.io/huihuimoe/ghostun:latest
+ContainerName=ghostun-exit
+Network=host
+AddCapability=CAP_NET_ADMIN CAP_NET_RAW
+AddDevice=/dev/net/tun
+SecurityLabelDisable=true
+Environment=RUST_LOG=info
+Volume=/etc/ghostun/exit.toml:/etc/ghostun/config.toml:ro
+Exec=--config /etc/ghostun/config.toml
+StopTimeout=10
+
+[Service]
+ExecReload=/usr/bin/podman kill --signal HUP ghostun-exit
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

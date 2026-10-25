@@ -1,0 +1,23 @@
+[Unit]
+Description=ghostun entry
+After=nftables.service
+
+[Container]
+Image=ghcr.io/huihuimoe/ghostun:latest
+ContainerName=ghostun-entry
+Network=host
+AddCapability=CAP_NET_ADMIN CAP_NET_RAW
+AddDevice=/dev/net/tun
+SecurityLabelDisable=true
+Environment=RUST_LOG=info
+Volume=/etc/ghostun/entry.toml:/etc/ghostun/config.toml:ro
+Exec=--config /etc/ghostun/config.toml
+StopTimeout=10
+
+[Service]
+ExecReload=/usr/bin/podman kill --signal HUP ghostun-entry
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

@@ -20,6 +20,8 @@ pub struct NftSpec {
     pub inner_v6: Option<Cidr<Ipv6Addr>>,
     /// Exit: restrict masquerade to this egress interface.
     pub out_iface: Option<String>,
+    /// Exit: masquerade inner subnets on non-TUN egress.
+    pub masq: bool,
 }
 
 pub fn table_name(tun_name: &str) -> String {
@@ -69,33 +71,32 @@ pub fn render(spec: &NftSpec) -> String {
     };
     let clamp = "tcp flags syn tcp option maxseg size set rt mtu";
     let mark = format!("{SOCKET_MARK:#x}");
-    let postrouting = match spec.mode {
-        Mode::Entry => String::new(),
-        Mode::Exit => {
-            let oif = spec
-                .out_iface
-                .as_ref()
-                .map(|i| format!(r#" oifname "{i}""#))
-                .unwrap_or_default();
-            let v4 = spec.inner_v4.network();
-            let v6 = spec
-                .inner_v6
-                .map(|v6| {
-                    format!(
-                        r#"ip6 saddr {} oifname != "{tun}"{oif} masquerade"#,
-                        v6.network()
-                    )
-                })
-                .unwrap_or_default();
-            format!(
-                r#"
+    let postrouting = if spec.mode == Mode::Exit && spec.masq {
+        let oif = spec
+            .out_iface
+            .as_ref()
+            .map(|i| format!(r#" oifname "{i}""#))
+            .unwrap_or_default();
+        let v4 = spec.inner_v4.network();
+        let v6 = spec
+            .inner_v6
+            .map(|v6| {
+                format!(
+                    r#"ip6 saddr {} oifname != "{tun}"{oif} masquerade"#,
+                    v6.network()
+                )
+            })
+            .unwrap_or_default();
+        format!(
+            r#"
     chain postrouting {{
         type nat hook postrouting priority srcnat; policy accept;
         ip saddr {v4} oifname != "{tun}"{oif} masquerade
         {v6}
     }}"#
-            )
-        }
+        )
+    } else {
+        String::new()
     };
     let outer_rules = if spec.transport == Transport::Faketcp {
         format!(
@@ -179,10 +180,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn table_name_and_prerouting_rules_exclude_inner_tun() {
+    fn render_rules_and_optional_masquerade() {
         assert_eq!(table_name("ghostun0"), "ghostun_ghostun0");
         assert_eq!(table_name("wan.1-a"), "ghostun_wan_1_a");
-        let rules = render(&NftSpec {
+        let mut spec = NftSpec {
             mode: Mode::Exit,
             transport: Transport::Faketcp,
             outer_family: OuterFamily::Ipv4,
@@ -191,9 +192,11 @@ mod tests {
             base_port: 30000,
             listen_port: 443,
             inner_v4: "10.200.0.2/30".parse().unwrap(),
-            inner_v6: None,
+            inner_v6: Some("fd00:200::2/126".parse().unwrap()),
             out_iface: Some("eth0".into()),
-        });
+            masq: true,
+        };
+        let rules = render(&spec);
         assert!(
             rules.contains(
                 r#"meta nfproto ipv4 tcp dport 443 iifname != "ghostun0" notrack meta pkttype set other"#
@@ -204,5 +207,31 @@ mod tests {
             rules.contains("meta nfproto ipv4 tcp sport 443 notrack accept"),
             "{rules}"
         );
+        assert!(
+            rules.contains(
+                r#"ip saddr 10.200.0.0/30 oifname != "ghostun0" oifname "eth0" masquerade"#
+            ),
+            "{rules}"
+        );
+
+        spec.masq = false;
+        for transport in [Transport::Faketcp, Transport::Tcp] {
+            spec.transport = transport;
+            let no_masq = render(&spec);
+            assert!(!no_masq.contains("postrouting"), "{no_masq}");
+            assert!(!no_masq.contains("masquerade"), "{no_masq}");
+            assert!(
+                no_masq.contains(
+                    r#"oifname "ghostun0" tcp flags syn tcp option maxseg size set rt mtu"#
+                ),
+                "{no_masq}"
+            );
+            assert!(
+                no_masq.contains(
+                    r#"iifname "ghostun0" tcp flags syn tcp option maxseg size set rt mtu"#
+                ),
+                "{no_masq}"
+            );
+        }
     }
 }

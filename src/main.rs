@@ -126,6 +126,7 @@ fn run(mut cfg: Config) -> Result<(), String> {
             inner_v4: cfg.tun_ipv4,
             inner_v6: cfg.tun_ipv6,
             out_iface: cfg.iface.clone(),
+            masq: cfg.masq,
         };
         Some(netfilter::install(&spec).map_err(|e| format!("netfilter: {e}"))?)
     } else {

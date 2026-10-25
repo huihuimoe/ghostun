@@ -178,6 +178,7 @@ pub struct Config {
     pub ping_interval: Duration,
     pub dead_timeout: Duration,
     pub netfilter: bool,
+    pub masq: bool,
     /// Exit node outer address; `Some` exactly in entry mode.
     pub remote: Option<SocketAddr>,
     /// Outer listen port; `Some` exactly in exit mode.
@@ -292,6 +293,9 @@ struct Cli {
     /// do not touch nftables or sysctl
     #[argh(switch)]
     no_netfilter: bool,
+    /// do not add exit nftables masquerade rules (exit only)
+    #[argh(switch)]
+    no_masq: bool,
 }
 
 #[derive(Deserialize, Default)]
@@ -315,6 +319,8 @@ struct File {
     no_ipv6: bool,
     #[serde(default)]
     no_netfilter: bool,
+    #[serde(default)]
+    no_masq: bool,
     remote: Option<SocketAddr>,
     listen: Option<u16>,
     outer_family: Option<OuterFamily>,
@@ -389,8 +395,10 @@ fn build_config(cli: Cli, running_conns: Option<u16>) -> Result<Config, String> 
     let outer_family = remote
         .map(|r| OuterFamily::of(r.ip()))
         .unwrap_or(outer_family.unwrap_or_default());
+    let no_masq = cli.no_masq || file.no_masq;
     match mode {
         Mode::Entry if listen.is_some() => return Err("`listen` is only valid in exit mode".into()),
+        Mode::Entry if no_masq => return Err("`no_masq` is only valid in exit mode".into()),
         Mode::Exit if remote.is_some() => return Err("`remote` is only valid in entry mode".into()),
         _ => {}
     }
@@ -452,6 +460,7 @@ fn build_config(cli: Cli, running_conns: Option<u16>) -> Result<Config, String> 
         ping_interval: Duration::from_secs(cli.ping_interval.or(file.ping_interval).unwrap_or(5)),
         dead_timeout: Duration::from_secs(cli.dead_timeout.or(file.dead_timeout).unwrap_or(15)),
         netfilter: !(cli.no_netfilter || file.no_netfilter),
+        masq: !no_masq,
         remote,
         listen,
         outer_family,
@@ -474,6 +483,7 @@ fn ensure_reload_compatible(old: &Config, new: &Config) -> Result<(), String> {
         (old.tun_mtu != new.tun_mtu, "tun_mtu"),
         (old.iface != new.iface, "iface"),
         (old.netfilter != new.netfilter, "no_netfilter"),
+        (old.masq != new.masq, "no_masq"),
         (old.remote != new.remote, "remote"),
         (old.listen != new.listen, "listen"),
         (old.base_port != new.base_port, "base_port"),
@@ -716,7 +726,21 @@ mod tests {
         assert_eq!(c.mode, Mode::Exit);
         assert_eq!(c.tun_ipv4.to_string(), "10.200.0.2/30");
         assert_eq!(c.tun_ipv6.unwrap().to_string(), "fd00:200::2/126");
+        assert!(c.netfilter && c.masq);
         assert_eq!((c.listen, c.remote), (Some(443), None));
+        let c = with_file(
+            "exit-no-masq",
+            "mode = 'exit'\nlisten = 443\nno_masq = true\n",
+            &["--no-netfilter", "--iface", "eth0"],
+        )
+        .unwrap();
+        assert!(!c.netfilter && !c.masq);
+        assert_eq!(c.iface.as_deref(), Some("eth0"));
+        assert!(
+            !parse(&["exit", "--listen", "443", "--no-masq"])
+                .unwrap()
+                .masq
+        );
     }
 
     #[test]
@@ -835,6 +859,13 @@ mod tests {
         )
         .unwrap_err()
         .contains("entry mode"));
+        assert!(with_file(
+            "entry-no-masq",
+            "mode = \"entry\"\nremote = \"1.2.3.4:5\"\nno_masq = true\n",
+            &[]
+        )
+        .unwrap_err()
+        .contains("exit mode"));
     }
 
     #[test]
@@ -842,6 +873,7 @@ mod tests {
         assert!(parse(&["entry"]).unwrap_err().contains("remote"));
         assert!(parse(&["exit"]).unwrap_err().contains("listen"));
         assert!(parse(&["exit", "--listen", "0"]).is_err());
+        assert!(entry(&["--no-masq"]).unwrap_err().contains("exit mode"));
         assert!(entry(&["--ping-interval", "5", "--dead-timeout", "5"])
             .unwrap_err()
             .contains("dead_timeout"));
@@ -1026,6 +1058,21 @@ mod tests {
             std::fs::write(&path, &bad_toml).unwrap();
             assert!(reloaded.reload().is_err(), "expected immutable change to fail: {bad_toml}");
         }
+
+        std::fs::write(
+            &path,
+            format!("mode = 'exit'\nlisten = 443\nauth_key = '{key1}'\nconns = 2\n"),
+        )
+        .unwrap();
+        let exit_cfg = parse_from(["ghostun", "--config", path.to_str().unwrap()]).unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                "mode = 'exit'\nlisten = 443\nauth_key = '{key1}'\nconns = 2\nno_masq = true\n"
+            ),
+        )
+        .unwrap();
+        assert!(exit_cfg.reload().unwrap_err().contains("no_masq"));
 
         // When inner IPv6 was disabled at startup, reload remains compatible without false mismatch.
         std::fs::write(
