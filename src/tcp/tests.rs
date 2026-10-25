@@ -561,4 +561,11 @@ fn slow_tcp_receiver_backpressures_tun_at_the_transmit_bound_then_delivers_exact
         received, sent,
         "all accepted packets retain order and payload after backpressure"
     );
+    while c.tx.push(&[PING; 9]) {}
+    let tail = wire::TX_LIMIT - c.tx.bytes();
+    if tail >= 2 {
+        assert!(c.tx.push(&vec![0; tail - 2]));
+    }
+    assert!(!c.tx.room(9));
+    assert!(c.next_deadline(Duration::ZERO, Duration::from_secs(60)) > Instant::now());
 }
