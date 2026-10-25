@@ -10,15 +10,14 @@ workflow:
 test:
   stage: test
   interruptible: true
-  image:
-    name: cgr.dev/chainguard/rust:latest-dev
-    entrypoint: [""]
+  image: rust:1.99.1-slim-trixie
   variables:
     CARGO_BUILD_JOBS: "2"
     CARGO_INCREMENTAL: "0"
     CARGO_PROFILE_DEV_DEBUG: "0"
     CARGO_PROFILE_TEST_DEBUG: "0"
   script:
+    - rustup component add rustfmt clippy
     - bash -n tests/e2e/netns.sh tests/e2e/ipv6-disabled.sh
     - cargo fmt --check
     - cargo clippy --locked --all-targets -- -D warnings
@@ -42,5 +41,5 @@ build-image:
       --local context=.
       --local dockerfile=.
       --opt image-resolve-mode=pull
-      --opt platform=linux/amd64
+      --opt platform=linux/amd64,linux/arm64
       --output "type=image,name=$CI_REGISTRY_IMAGE:$CI_COMMIT_TAG,push=true"
