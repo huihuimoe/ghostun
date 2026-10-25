@@ -64,7 +64,7 @@ impl Connection {
         self.tx.flush(&mut self.socket)?;
         let auth = self.auth.as_mut().expect("handshake initialized");
         if auth.done() {
-            return Ok(self.tx.bytes == 0);
+            return Ok(self.tx.bytes() == 0);
         }
         if self.rx.read(&mut self.socket)? {
             if let Some(reply) = auth.receive(self.rx.payload())? {
@@ -73,7 +73,7 @@ impl Connection {
             self.rx.clear();
         }
         self.tx.flush(&mut self.socket)?;
-        Ok(auth.done() && self.tx.bytes == 0)
+        Ok(auth.done() && self.tx.bytes() == 0)
     }
 
     fn establish(&mut self, mtu: u16) {
@@ -291,7 +291,7 @@ impl Listener {
                 fds.push(pollfd(
                     c.conn.socket.as_raw_fd(),
                     libc::POLLIN
-                        | if c.conn.tx.bytes > 0 {
+                        | if c.conn.tx.bytes() > 0 {
                             libc::POLLOUT
                         } else {
                             0
@@ -530,7 +530,7 @@ impl Worker {
                         0
                     } else {
                         libc::POLLIN
-                    } | if c.tx.bytes > 0 { libc::POLLOUT } else { 0 },
+                    } | if c.tx.bytes() > 0 { libc::POLLOUT } else { 0 },
                 );
                 if established && !c.tx.room(self.mtu as usize) {
                     fds[0].events = 0;

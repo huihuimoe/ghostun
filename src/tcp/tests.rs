@@ -121,7 +121,7 @@ fn split_prefix_payload_coalescing_and_partial_writes_preserve_packets_and_cap()
         bytes: Default::default(),
         block: false,
     };
-    while tx.bytes > 0 {
+    while tx.bytes() > 0 {
         tx.flush(&mut stream).unwrap();
     }
     let mut reader = Receive::new(1380);
@@ -133,11 +133,11 @@ fn split_prefix_payload_coalescing_and_partial_writes_preserve_packets_and_cap()
     assert!(stream.bytes.is_empty());
     let payload = packet(30);
     while tx.push(&payload) {}
-    assert!(tx.bytes <= TX_LIMIT);
+    assert!(tx.bytes() <= TX_LIMIT);
     assert!(!tx.room(1380));
     let mut sink = Vec::new();
     tx.flush(&mut sink).unwrap();
-    assert_eq!(tx.bytes, 0);
+    assert_eq!(tx.bytes(), 0);
     let mut input = &sink[..];
     while !input.is_empty() {
         assert!(reader.read(&mut input).unwrap());
@@ -174,12 +174,12 @@ fn vectored_writes_preserve_frames_across_partial_prefixes_and_would_block() {
             Ok(())
         }
     }
-    let packets = [packet(1), packet(2), vec![PING; 9]];
+    let mut packets = vec![packet(1), packet(2), vec![PING; 9]];
     let mut tx = SendQueue::default();
     for p in &packets {
         assert!(tx.push(p));
     }
-    let total = tx.bytes;
+    let total = tx.bytes();
     let mut writer = Writer {
         bytes: Vec::new(),
         limit: 67,
@@ -187,9 +187,13 @@ fn vectored_writes_preserve_frames_across_partial_prefixes_and_would_block() {
     };
     tx.flush(&mut writer).unwrap();
     assert_eq!(writer.bytes.len(), 67, "one frame and half the next prefix");
-    assert_eq!(tx.bytes, total - 67);
+    assert_eq!(tx.bytes(), total - 67);
+    for p in [packet(3), packet(4)] {
+        assert!(tx.push(&p));
+        packets.push(p);
+    }
     tx.flush(&mut writer).unwrap();
-    assert_eq!(tx.bytes, 0);
+    assert_eq!(tx.bytes(), 0);
     let mut input = &writer.bytes[..];
     let mut rx = Receive::new(1380);
     for p in &packets {
@@ -536,7 +540,7 @@ fn slow_tcp_receiver_backpressures_tun_at_the_transmit_bound_then_delivers_exact
             Duration::from_secs(60),
         )
         .unwrap();
-        assert!(c.tx.bytes <= TX_LIMIT);
+        assert!(c.tx.bytes() <= TX_LIMIT);
         if !c.tx.room(1380) {
             break;
         }

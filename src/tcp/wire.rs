@@ -73,49 +73,40 @@ impl Receive {
 
 #[derive(Default)]
 pub struct SendQueue {
-    frames: VecDeque<Vec<u8>>,
-    offset: usize,
-    pub bytes: usize,
+    pending: VecDeque<u8>,
 }
 
 impl SendQueue {
+    pub fn bytes(&self) -> usize {
+        self.pending.len()
+    }
+
     pub fn room(&self, payload: usize) -> bool {
-        self.bytes + payload + 2 <= TX_LIMIT
+        self.bytes() + payload + 2 <= TX_LIMIT
     }
 
     pub fn push(&mut self, payload: &[u8]) -> bool {
         if !self.room(payload.len()) {
             return false;
         }
-        let mut frame = Vec::with_capacity(payload.len() + 2);
-        frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-        frame.extend_from_slice(payload);
-        self.bytes += frame.len();
-        self.frames.push_back(frame);
+        let required = self.bytes() + payload.len() + 2;
+        if required > self.pending.capacity() {
+            // Bound retained storage without allocating the full budget for idle candidates.
+            let capacity = (self.pending.capacity() * 2).max(required).min(TX_LIMIT);
+            self.pending.reserve_exact(capacity - self.bytes());
+        }
+        self.pending.extend((payload.len() as u16).to_be_bytes());
+        self.pending.extend(payload);
         true
     }
 
     pub fn flush(&mut self, output: &mut impl Write) -> io::Result<()> {
-        while !self.frames.is_empty() {
-            let mut slices = [IoSlice::new(&[]); 64];
-            let count = self.frames.len().min(slices.len());
-            for (i, frame) in self.frames.iter().take(count).enumerate() {
-                slices[i] = IoSlice::new(&frame[if i == 0 { self.offset } else { 0 }..]);
-            }
-            match output.write_vectored(&slices[..count]) {
+        while !self.pending.is_empty() {
+            let (first, second) = self.pending.as_slices();
+            match output.write_vectored(&[IoSlice::new(first), IoSlice::new(second)]) {
                 Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-                Ok(mut n) => {
-                    self.bytes -= n;
-                    while n > 0 {
-                        let len = self.frames.front().unwrap().len();
-                        let consumed = n.min(len - self.offset);
-                        self.offset += consumed;
-                        n -= consumed;
-                        if self.offset == len {
-                            self.frames.pop_front();
-                            self.offset = 0;
-                        }
-                    }
+                Ok(n) => {
+                    self.pending.drain(..n);
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
