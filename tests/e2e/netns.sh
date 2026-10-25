@@ -199,8 +199,8 @@ kill -KILL "$ENTRY_PID"
 wait "$ENTRY_PID" 2>/dev/null || [[ $? == 137 ]] || fail "unexpected killed Entry status"
 PIDS="$EXIT_PID"
 if [[ $OUTER_FAMILY == ipv4 ]]; then
-    ns entry ip addr add 10.1.0.2/24 dev e0
     ns entry ip addr del 10.1.0.1/24 dev e0
+    ns entry ip addr add 10.1.0.2/24 dev e0
     ns entry ip route replace default via 10.1.0.254 src 10.1.0.2
 else
     ns entry ip -6 addr add fd00:1::2/64 dev e0 nodad
