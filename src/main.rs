@@ -1,8 +1,6 @@
-mod auth;
 mod config;
 mod faketcp;
 mod netfilter;
-mod pkt;
 mod sys;
 mod tcp;
 mod worker;
@@ -160,9 +158,9 @@ fn run(mut cfg: Config) -> Result<(), String> {
         let id = i as u16;
         let filter = match cfg.mode {
             Mode::Entry => {
-                pkt::entry_filter(cfg.remote.expect("validated"), cfg.base_port, cfg.conns, id)
+                faketcp::entry_filter(cfg.remote.expect("validated"), cfg.base_port, cfg.conns, id)
             }
-            Mode::Exit => pkt::exit_filter(cfg.outer_family, listen_port, cfg.conns, id),
+            Mode::Exit => faketcp::exit_filter(cfg.outer_family, listen_port, cfg.conns, id),
         };
         let bind_dev = (cfg.mode == Mode::Entry)
             .then_some(outer.dev.as_deref())
@@ -200,7 +198,7 @@ fn run(mut cfg: Config) -> Result<(), String> {
                 .name(format!("ghostun-w{i}"))
                 .spawn(move || match start {
                     Start::Fake(session, tun, raw) => {
-                        worker::run(i, family, *session, tun, raw, &STOP, &worker_ctrl)
+                        faketcp::run(i, family, *session, tun, raw, &STOP, &worker_ctrl)
                     }
                     Start::Tcp(tcp) => tcp.run(&STOP, &worker_ctrl),
                 })
@@ -428,14 +426,30 @@ mod tests {
                 std::mem::take(&mut w.0),
             );
             assert!(entries[i].is_established());
-            controls[i].sync(i, &mut cpus[i], &mut gens[i], now, &mut entries[i], &mut w);
+            faketcp::sync_reload(
+                &controls[i],
+                i,
+                &mut cpus[i],
+                &mut gens[i],
+                now,
+                &mut entries[i],
+                &mut w,
+            );
         }
 
         // Start reload to a wrong key (0xb8) while exits still use 0xa7: worker 0 rotates and
         // waits for Established; worker 1 is not touched and keeps forwarding inner packets.
         let mut rolling = start_reload(&controls, &default_cpus, 1, test_cfg(0xb8, Some("1")));
         let mut w0 = Wire::default();
-        controls[0].sync(0, &mut cpus[0], &mut gens[0], now, &mut entries[0], &mut w0);
+        faketcp::sync_reload(
+            &controls[0],
+            0,
+            &mut cpus[0],
+            &mut gens[0],
+            now,
+            &mut entries[0],
+            &mut w0,
+        );
         assert_eq!(cpus[0], Some(1));
         exchange(&mut entries[0], &mut exits[0], now, w0.0);
         assert!(!entries[0].is_established());
@@ -448,11 +462,20 @@ mod tests {
         // and completes without emitting any RST or SYN frames.
         rolling = start_reload(&controls, &default_cpus, 2, test_cfg(0xa7, None));
         let mut w0 = Wire::default();
-        controls[0].sync(0, &mut cpus[0], &mut gens[0], now, &mut entries[0], &mut w0);
+        faketcp::sync_reload(
+            &controls[0],
+            0,
+            &mut cpus[0],
+            &mut gens[0],
+            now,
+            &mut entries[0],
+            &mut w0,
+        );
         assert_eq!(cpus[0], Some(0));
         exchange(&mut entries[0], &mut exits[0], now, w0.0);
         assert!(entries[0].is_established());
-        controls[0].sync(
+        faketcp::sync_reload(
+            &controls[0],
             0,
             &mut cpus[0],
             &mut gens[0],
@@ -464,7 +487,15 @@ mod tests {
         assert_eq!(rolling.as_ref().unwrap().next_worker, 1);
 
         let mut w1 = Wire::default();
-        controls[1].sync(1, &mut cpus[1], &mut gens[1], now, &mut entries[1], &mut w1);
+        faketcp::sync_reload(
+            &controls[1],
+            1,
+            &mut cpus[1],
+            &mut gens[1],
+            now,
+            &mut entries[1],
+            &mut w1,
+        );
         assert!(
             w1.0.is_empty(),
             "unchanged key on worker 1 must not reset its session"
@@ -490,7 +521,8 @@ mod tests {
         let mut gens = [0u64, 0u64];
 
         let mut rolling = start_reload(&controls, &default_cpus, 1, test_cfg(0xc9, None));
-        controls[0].sync(
+        faketcp::sync_reload(
+            &controls[0],
             0,
             &mut cpus[0],
             &mut gens[0],
@@ -500,7 +532,8 @@ mod tests {
         );
         advance_reload(&controls, &default_cpus, &mut rolling);
         assert_eq!(rolling.as_ref().unwrap().next_worker, 1);
-        controls[1].sync(
+        faketcp::sync_reload(
+            &controls[1],
             1,
             &mut cpus[1],
             &mut gens[1],

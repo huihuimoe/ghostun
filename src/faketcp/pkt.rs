@@ -3,10 +3,106 @@
 use crate::config::OuterFamily;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-pub const IPV4_HDR: usize = 20;
-pub const IPV6_HDR: usize = 40;
-pub const TCP_HDR: usize = 20;
+pub mod ipv4 {
+    use std::net::Ipv4Addr;
+
+    pub const HDR_LEN: usize = 20;
+    pub const OFF_VER_IHL: usize = 0;
+    pub const OFF_TOS: usize = 1;
+    pub const OFF_TOTAL_LEN: usize = 2;
+    pub const OFF_ID: usize = 4;
+    pub const OFF_FLAGS_FRAG: usize = 6;
+    pub const OFF_TTL: usize = 8;
+    pub const OFF_PROTO: usize = 9;
+    pub const OFF_CHECKSUM: usize = 10;
+    pub const OFF_SRC: usize = 12;
+    pub const OFF_DST: usize = 16;
+
+    /// Strongly-typed IPv4 base header builder for in-place packet formatting.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Header {
+        pub total_len: u16,
+        pub id: u16,
+        pub src: Ipv4Addr,
+        pub dst: Ipv4Addr,
+    }
+
+    impl Header {
+        #[inline]
+        pub fn write_to(&self, buf: &mut [u8]) {
+            let ip = &mut buf[..HDR_LEN];
+            ip[OFF_VER_IHL] = 0x45;
+            ip[OFF_TOS] = 0;
+            ip[OFF_TOTAL_LEN..OFF_TOTAL_LEN + 2].copy_from_slice(&self.total_len.to_be_bytes());
+            ip[OFF_ID..OFF_ID + 2].copy_from_slice(&self.id.to_be_bytes());
+            ip[OFF_FLAGS_FRAG..OFF_FLAGS_FRAG + 2].copy_from_slice(&0x4000u16.to_be_bytes()); // DF
+            ip[OFF_TTL] = 64;
+            ip[OFF_PROTO] = libc::IPPROTO_TCP as u8;
+            ip[OFF_CHECKSUM..OFF_CHECKSUM + 2].fill(0);
+            ip[OFF_SRC..OFF_SRC + 4].copy_from_slice(&self.src.octets());
+            ip[OFF_DST..OFF_DST + 4].copy_from_slice(&self.dst.octets());
+            let csum = super::fold(super::sum16(ip, 0));
+            ip[OFF_CHECKSUM..OFF_CHECKSUM + 2].copy_from_slice(&csum.to_be_bytes());
+        }
+    }
+}
+
+pub mod ipv6 {
+    use std::net::Ipv6Addr;
+
+    pub const HDR_LEN: usize = 40;
+    pub const OFF_VER_TC_FLOW: usize = 0;
+    pub const OFF_PAYLOAD_LEN: usize = 4;
+    pub const OFF_NEXT_HDR: usize = 6;
+    pub const OFF_HOP_LIMIT: usize = 7;
+    pub const OFF_SRC: usize = 8;
+    pub const OFF_DST: usize = 24;
+
+    /// Strongly-typed IPv6 base header builder for in-place packet formatting.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Header {
+        pub payload_len: u16,
+        pub src: Ipv6Addr,
+        pub dst: Ipv6Addr,
+    }
+
+    impl Header {
+        #[inline]
+        pub fn write_to(&self, buf: &mut [u8]) {
+            let ip = &mut buf[..HDR_LEN];
+            ip[OFF_VER_TC_FLOW..OFF_VER_TC_FLOW + 4].copy_from_slice(&[0x60, 0, 0, 0]);
+            ip[OFF_PAYLOAD_LEN..OFF_PAYLOAD_LEN + 2]
+                .copy_from_slice(&self.payload_len.to_be_bytes());
+            ip[OFF_NEXT_HDR] = libc::IPPROTO_TCP as u8;
+            ip[OFF_HOP_LIMIT] = 64;
+            ip[OFF_SRC..OFF_SRC + 16].copy_from_slice(&self.src.octets());
+            ip[OFF_DST..OFF_DST + 16].copy_from_slice(&self.dst.octets());
+        }
+    }
+}
+
+pub mod tcp {
+    pub const HDR_LEN: usize = 20;
+    pub const OFF_SPORT: usize = 0;
+    pub const OFF_DPORT: usize = 2;
+    pub const OFF_SEQ: usize = 4;
+    pub const OFF_ACK: usize = 8;
+    pub const OFF_DOFF: usize = 12;
+    pub const OFF_FLAGS: usize = 13;
+    pub const OFF_WINDOW: usize = 14;
+    pub const OFF_CHECKSUM: usize = 16;
+    pub const OFF_URGENT: usize = 18;
+}
+
+#[cfg(test)]
+pub const IPV4_HDR: usize = ipv4::HDR_LEN;
+pub const IPV6_HDR: usize = ipv6::HDR_LEN;
+pub const TCP_HDR: usize = tcp::HDR_LEN;
 pub const MAX_OVERHEAD: usize = IPV6_HDR + TCP_HDR;
+
+pub use ipv4::Header as Ipv4Hdr;
+pub use ipv6::Header as Ipv6Hdr;
+
 /// Control frames use a first byte whose high nibble is 0, which no IPv4 (4) or IPv6 (6) packet can have.
 pub const CTRL_PING: u8 = 0x01;
 pub const CTRL_PONG: u8 = 0x02;
@@ -34,77 +130,107 @@ pub struct TcpMeta {
     pub window: u16,
 }
 
+impl TcpMeta {
+    #[inline]
+    pub fn write_to(&self, buf: &mut [u8], opts: &[u8], ihl: usize, tcp_len: usize) {
+        let tcp_slice = &mut buf[ihl..ihl + tcp::HDR_LEN + opts.len()];
+        tcp_slice[tcp::OFF_SPORT..tcp::OFF_SPORT + 2]
+            .copy_from_slice(&self.src.port().to_be_bytes());
+        tcp_slice[tcp::OFF_DPORT..tcp::OFF_DPORT + 2]
+            .copy_from_slice(&self.dst.port().to_be_bytes());
+        tcp_slice[tcp::OFF_SEQ..tcp::OFF_SEQ + 4].copy_from_slice(&self.seq.to_be_bytes());
+        tcp_slice[tcp::OFF_ACK..tcp::OFF_ACK + 4].copy_from_slice(&self.ack.to_be_bytes());
+        tcp_slice[tcp::OFF_DOFF] = (((tcp::HDR_LEN + opts.len()) / 4) as u8) << 4;
+        tcp_slice[tcp::OFF_FLAGS] = self.flags;
+        tcp_slice[tcp::OFF_WINDOW..tcp::OFF_WINDOW + 2].copy_from_slice(&self.window.to_be_bytes());
+        tcp_slice[tcp::OFF_CHECKSUM..tcp::OFF_URGENT + 2].fill(0);
+        tcp_slice[tcp::HDR_LEN..].copy_from_slice(opts);
+        let csum = fold(tcp_pseudo_sum(buf, ihl, tcp_len));
+        buf[ihl + tcp::OFF_CHECKSUM..ihl + tcp::OFF_CHECKSUM + 2]
+            .copy_from_slice(&csum.to_be_bytes());
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct Parsed<'a> {
     pub meta: TcpMeta,
     pub payload: &'a [u8],
 }
 
+#[inline(always)]
 fn be16(b: &[u8], at: usize) -> u16 {
     u16::from_be_bytes([b[at], b[at + 1]])
 }
 
+#[inline(always)]
 fn be32(b: &[u8], at: usize) -> u32 {
     u32::from_be_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
 }
 
+#[inline(always)]
 fn ip_at(b: &[u8], at: usize) -> Ipv4Addr {
     Ipv4Addr::new(b[at], b[at + 1], b[at + 2], b[at + 3])
 }
 
 /// Parses a complete outer frame. IPv6 raw receive reconstructs the base header from pktinfo.
+#[inline]
 pub fn parse(buf: &[u8]) -> Option<Parsed<'_>> {
     let (ihl, total, src, dst) = match buf.first()? >> 4 {
         4 => {
-            if buf.len() < IPV4_HDR || buf[9] != libc::IPPROTO_TCP as u8 {
+            if buf.len() < ipv4::HDR_LEN || buf[ipv4::OFF_PROTO] != libc::IPPROTO_TCP as u8 {
                 return None;
             }
-            let ihl = usize::from(buf[0] & 0x0f) * 4;
-            let total = usize::from(be16(buf, 2));
-            if ihl < IPV4_HDR || be16(buf, 6) & 0x3fff != 0 {
+            let ihl = usize::from(buf[ipv4::OFF_VER_IHL] & 0x0f) * 4;
+            let total = usize::from(be16(buf, ipv4::OFF_TOTAL_LEN));
+            if ihl < ipv4::HDR_LEN || be16(buf, ipv4::OFF_FLAGS_FRAG) & 0x3fff != 0 {
                 return None;
             }
             (
                 ihl,
                 total,
-                IpAddr::V4(ip_at(buf, 12)),
-                IpAddr::V4(ip_at(buf, 16)),
+                IpAddr::V4(ip_at(buf, ipv4::OFF_SRC)),
+                IpAddr::V4(ip_at(buf, ipv4::OFF_DST)),
             )
         }
         6 => {
-            if buf.len() < IPV6_HDR || buf[6] != libc::IPPROTO_TCP as u8 {
+            if buf.len() < ipv6::HDR_LEN || buf[ipv6::OFF_NEXT_HDR] != libc::IPPROTO_TCP as u8 {
                 return None;
             }
             (
-                IPV6_HDR,
-                IPV6_HDR + usize::from(be16(buf, 4)),
-                IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(&buf[8..24]).ok()?)),
-                IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(&buf[24..40]).ok()?)),
+                ipv6::HDR_LEN,
+                ipv6::HDR_LEN + usize::from(be16(buf, ipv6::OFF_PAYLOAD_LEN)),
+                IpAddr::V6(Ipv6Addr::from(
+                    <[u8; 16]>::try_from(&buf[ipv6::OFF_SRC..ipv6::OFF_SRC + 16]).ok()?,
+                )),
+                IpAddr::V6(Ipv6Addr::from(
+                    <[u8; 16]>::try_from(&buf[ipv6::OFF_DST..ipv6::OFF_DST + 16]).ok()?,
+                )),
             )
         }
         _ => return None,
     };
-    if total > buf.len() || total < ihl + TCP_HDR {
+    if total > buf.len() || total < ihl + tcp::HDR_LEN {
         return None;
     }
-    let tcp = &buf[ihl..total];
-    let doff = usize::from(tcp[12] >> 4) * 4;
-    if doff < TCP_HDR || doff > tcp.len() {
+    let tcp_slice = &buf[ihl..total];
+    let doff = usize::from(tcp_slice[tcp::OFF_DOFF] >> 4) * 4;
+    if doff < tcp::HDR_LEN || doff > tcp_slice.len() {
         return None;
     }
     Some(Parsed {
         meta: TcpMeta {
-            src: SocketAddr::new(src, be16(tcp, 0)),
-            dst: SocketAddr::new(dst, be16(tcp, 2)),
-            seq: be32(tcp, 4),
-            ack: be32(tcp, 8),
-            flags: tcp[13],
-            window: be16(tcp, 14),
+            src: SocketAddr::new(src, be16(tcp_slice, tcp::OFF_SPORT)),
+            dst: SocketAddr::new(dst, be16(tcp_slice, tcp::OFF_DPORT)),
+            seq: be32(tcp_slice, tcp::OFF_SEQ),
+            ack: be32(tcp_slice, tcp::OFF_ACK),
+            flags: tcp_slice[tcp::OFF_FLAGS],
+            window: be16(tcp_slice, tcp::OFF_WINDOW),
         },
-        payload: &tcp[doff..],
+        payload: &tcp_slice[doff..],
     })
 }
 
+#[inline]
 fn sum16(data: &[u8], acc: u32) -> u32 {
     let mut acc = u64::from(acc);
     let (chunks, tail) = data.as_chunks::<8>();
@@ -124,17 +250,19 @@ fn sum16(data: &[u8], acc: u32) -> u32 {
     ((s >> 16) + (s & 0xffff)) as u32
 }
 
+#[inline]
 fn fold(mut acc: u32) -> u16 {
     acc = (acc & 0xffff) + (acc >> 16);
     acc = (acc & 0xffff) + (acc >> 16);
     !(acc as u16)
 }
 
+#[inline]
 fn tcp_pseudo_sum(frame: &[u8], ihl: usize, tcp_len: usize) -> u32 {
     let addresses = if frame[0] >> 4 == 4 {
-        &frame[12..20]
+        &frame[ipv4::OFF_SRC..ipv4::OFF_DST + 4]
     } else {
-        &frame[8..40]
+        &frame[ipv6::OFF_SRC..ipv6::OFF_DST + 16]
     };
     let acc = sum16(addresses, 0) + u32::from(libc::IPPROTO_TCP as u16) + tcp_len as u32;
     sum16(&frame[ihl..ihl + tcp_len], acc)
@@ -151,24 +279,29 @@ pub fn tcp_checksum_ok(frame: &[u8]) -> bool {
     let (ihl, total) = if frame[0] >> 4 == 4 {
         (
             usize::from(frame[0] & 0x0f) * 4,
-            usize::from(be16(frame, 2)),
+            usize::from(be16(frame, ipv4::OFF_TOTAL_LEN)),
         )
     } else {
-        (IPV6_HDR, IPV6_HDR + usize::from(be16(frame, 4)))
+        (
+            ipv6::HDR_LEN,
+            ipv6::HDR_LEN + usize::from(be16(frame, ipv6::OFF_PAYLOAD_LEN)),
+        )
     };
     fold(tcp_pseudo_sum(frame, ihl, total - ihl)) == 0
 }
 
 /// Writes only the IPv6 base header, also used to normalize headerless raw receives in place.
+#[inline]
 pub fn write_ipv6_header(buf: &mut [u8], src: Ipv6Addr, dst: Ipv6Addr, tcp_len: usize) {
-    buf[..4].copy_from_slice(&[0x60, 0, 0, 0]);
-    buf[4..6].copy_from_slice(&(tcp_len as u16).to_be_bytes());
-    buf[6] = libc::IPPROTO_TCP as u8;
-    buf[7] = 64;
-    buf[8..24].copy_from_slice(&src.octets());
-    buf[24..40].copy_from_slice(&dst.octets());
+    Ipv6Hdr {
+        payload_len: tcp_len as u16,
+        src,
+        dst,
+    }
+    .write_to(buf);
 }
 
+#[inline]
 fn write_frame(
     buf: &mut [u8],
     meta: &TcpMeta,
@@ -176,50 +309,41 @@ fn write_frame(
     payload_len: usize,
     ip_id: u16,
 ) -> usize {
-    let tcp_len = TCP_HDR + opts.len() + payload_len;
-    let ihl = OuterFamily::of(meta.src.ip()).overhead() - TCP_HDR;
+    let tcp_len = tcp::HDR_LEN + opts.len() + payload_len;
+    let ihl = OuterFamily::of(meta.src.ip()).overhead() - tcp::HDR_LEN;
     let total = ihl + tcp_len;
     match (meta.src.ip(), meta.dst.ip()) {
         (IpAddr::V4(src), IpAddr::V4(dst)) => {
-            let ip = &mut buf[..IPV4_HDR];
-            ip[0] = 0x45;
-            ip[1] = 0;
-            ip[2..4].copy_from_slice(&(total as u16).to_be_bytes());
-            ip[4..6].copy_from_slice(&ip_id.to_be_bytes());
-            ip[6..8].copy_from_slice(&0x4000u16.to_be_bytes()); // DF
-            ip[8] = 64;
-            ip[9] = libc::IPPROTO_TCP as u8;
-            ip[10..12].fill(0);
-            ip[12..16].copy_from_slice(&src.octets());
-            ip[16..20].copy_from_slice(&dst.octets());
-            let csum = fold(sum16(ip, 0));
-            ip[10..12].copy_from_slice(&csum.to_be_bytes());
+            Ipv4Hdr {
+                total_len: total as u16,
+                id: ip_id,
+                src,
+                dst,
+            }
+            .write_to(buf);
         }
-        (IpAddr::V6(src), IpAddr::V6(dst)) => write_ipv6_header(buf, src, dst, tcp_len),
+        (IpAddr::V6(src), IpAddr::V6(dst)) => {
+            Ipv6Hdr {
+                payload_len: tcp_len as u16,
+                src,
+                dst,
+            }
+            .write_to(buf);
+        }
         _ => unreachable!("session endpoints have the same address family"),
     }
-
-    let tcp = &mut buf[ihl..ihl + TCP_HDR + opts.len()];
-    tcp[0..2].copy_from_slice(&meta.src.port().to_be_bytes());
-    tcp[2..4].copy_from_slice(&meta.dst.port().to_be_bytes());
-    tcp[4..8].copy_from_slice(&meta.seq.to_be_bytes());
-    tcp[8..12].copy_from_slice(&meta.ack.to_be_bytes());
-    tcp[12] = (((TCP_HDR + opts.len()) / 4) as u8) << 4;
-    tcp[13] = meta.flags;
-    tcp[14..16].copy_from_slice(&meta.window.to_be_bytes());
-    tcp[16..20].fill(0);
-    tcp[20..].copy_from_slice(opts);
-    let csum = fold(tcp_pseudo_sum(buf, ihl, tcp_len));
-    buf[ihl + 16..ihl + 18].copy_from_slice(&csum.to_be_bytes());
+    meta.write_to(buf, opts, ihl, tcp_len);
     total
 }
 
 /// Prepends headers in place; payload starts at the source address family's encapsulation offset.
+#[inline]
 pub fn write_headers(buf: &mut [u8], meta: &TcpMeta, payload_len: usize, ip_id: u16) -> usize {
     write_frame(buf, meta, &[], payload_len, ip_id)
 }
 
 /// SYN or SYN|ACK (per `meta.flags`) carrying MSS, SACK_PERM and Window Scale 14.
+#[inline]
 pub fn write_syn(buf: &mut [u8], meta: &TcpMeta, mss: u16, ip_id: u16) -> usize {
     let mut opts = SYN_OPTS;
     opts[2..4].copy_from_slice(&mss.to_be_bytes());
@@ -272,21 +396,25 @@ pub fn entry_filter(exit: SocketAddr, base_port: u16, n: u16, i: u16) -> Vec<lib
         IpAddr::V6(_) => p.stmt(libc::BPF_LDX | libc::BPF_IMM, 0),
     };
     // Check worker port residue before source address words so N-1 sockets reject early.
-    p.stmt(LD_H_IND, 0)
+    p.stmt(LD_H_IND, tcp::OFF_SPORT as u32)
         .stmt(JEQ, u32::from(exit.port()))
-        .stmt(LD_H_IND, 2)
+        .stmt(LD_H_IND, tcp::OFF_DPORT as u32)
         .stmt(JGE, u32::from(base_port))
         .stmt(MOD, u32::from(n))
         .stmt(JEQ, u32::from(i));
     match exit.ip() {
         IpAddr::V4(ip) => {
-            p.stmt(LD_W_ABS, 12).stmt(JEQ, u32::from(ip));
+            p.stmt(LD_W_ABS, ipv4::OFF_SRC as u32)
+                .stmt(JEQ, u32::from(ip));
         }
         IpAddr::V6(ip) => {
             // IPv6 raw socket filters see TCP at offset zero; source IP is network-header relative.
             for (idx, word) in ip.octets().as_chunks::<4>().0.iter().enumerate() {
-                p.stmt(LD_W_ABS, (libc::SKF_NET_OFF + 8 + idx as i32 * 4) as u32)
-                    .stmt(JEQ, u32::from_be_bytes(*word));
+                p.stmt(
+                    LD_W_ABS,
+                    (libc::SKF_NET_OFF + ipv6::OFF_SRC as i32 + idx as i32 * 4) as u32,
+                )
+                .stmt(JEQ, u32::from_be_bytes(*word));
             }
         }
     }
@@ -309,9 +437,9 @@ pub fn exit_filter(
             p.stmt(libc::BPF_LDX | libc::BPF_IMM, 0);
         }
     }
-    p.stmt(LD_H_IND, 2)
+    p.stmt(LD_H_IND, tcp::OFF_DPORT as u32)
         .stmt(JEQ, u32::from(listen_port))
-        .stmt(LD_H_IND, 0)
+        .stmt(LD_H_IND, tcp::OFF_SPORT as u32)
         .stmt(MOD, u32::from(n))
         .stmt(JEQ, u32::from(i))
         .finish()

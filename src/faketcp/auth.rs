@@ -9,8 +9,8 @@ use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
 
+use super::pkt::TcpMeta;
 use crate::config::{AuthKey, Mode};
-use crate::pkt::TcpMeta;
 
 pub const CONTROL: u8 = 3;
 const VERSION: u8 = 1;

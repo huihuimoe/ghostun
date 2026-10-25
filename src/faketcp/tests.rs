@@ -1,5 +1,5 @@
+use super::pkt::Parsed;
 use super::*;
-use crate::pkt::Parsed;
 use std::net::Ipv4Addr;
 
 const ENTRY_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));

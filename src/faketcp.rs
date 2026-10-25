@@ -5,9 +5,20 @@ use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
-use crate::auth::{self, Auth, EntryStep, ExitStep, HELLO_LEN, PROOF_LEN};
+pub mod auth;
+pub mod pkt;
+#[cfg(test)]
+mod tests;
+pub mod worker;
+
 use crate::config::{AuthKey, Mode, OuterFamily};
-use crate::pkt::{self, flags, TcpMeta, CTRL_LEN, CTRL_PING, CTRL_PONG, MAX_OVERHEAD};
+pub use auth::{Auth, EntryStep, ExitStep, HELLO_LEN, PROOF_LEN};
+pub use pkt::{
+    entry_filter, exit_filter, flags, TcpMeta, CTRL_LEN, CTRL_PING, CTRL_PONG, MAX_OVERHEAD,
+};
+pub use worker::run;
+#[cfg(test)]
+pub use worker::sync_reload;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -624,6 +635,3 @@ fn port_pool(cfg: &SessionConfig) -> (u16, u16) {
     let count = (65535 - first) / n + 1;
     (first as u16, count as u16)
 }
-
-#[cfg(test)]
-mod tests;

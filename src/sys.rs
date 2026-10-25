@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::config::OuterFamily;
-use crate::pkt::{self, IPV6_HDR};
+use crate::faketcp::pkt::{self, IPV6_HDR};
 
 /// fwmark on every frame ghostun sends, so the netfilter RST-suppression rule spares our own RSTs.
 pub const SOCKET_MARK: u32 = 0x6768_7374;
