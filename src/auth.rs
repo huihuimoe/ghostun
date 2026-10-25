@@ -89,6 +89,11 @@ impl Auth {
         })
     }
 
+    pub fn reload(&mut self, key: &AuthKey, timeout: Duration) {
+        self.key = HmacSha256::new_from_slice(&key.0).expect("HMAC accepts a 32-byte key");
+        self.timeout = timeout;
+    }
+
     /// SYN cookies bind the observed tuple and Entry ISN, without storing a candidate.
     pub fn syn_cookie(&self, now: Instant, meta: &TcpMeta) -> u32 {
         self.syn_cookie_at(meta, self.bucket(now))

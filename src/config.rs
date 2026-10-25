@@ -173,6 +173,7 @@ pub struct Config {
     /// Outer listen port; `Some` exactly in exit mode.
     pub listen: Option<u16>,
     pub outer_family: OuterFamily,
+    cli: Cli,
 }
 
 impl Config {
@@ -195,9 +196,26 @@ impl Config {
         }
         Ok(mtu)
     }
+
+    /// Records that the kernel has no inner IPv6 support so subsequent reloads stay consistent.
+    pub fn disable_inner_ipv6(&mut self) {
+        self.tun_ipv6 = None;
+        self.cli.no_ipv6 = true;
+    }
+
+    /// Re-reads the `--config` TOML file, re-applies startup CLI overrides, and rejects
+    /// changes to any topology- or socket-bound field.
+    pub fn reload(&self) -> Result<Config, String> {
+        if self.cli.config.is_none() {
+            return Err("reload requires `--config`".into());
+        }
+        let next = build_config(self.cli.clone(), Some(self.conns))?;
+        ensure_reload_compatible(self, &next)?;
+        Ok(next)
+    }
 }
 
-#[derive(FromArgs, Debug)]
+#[derive(Clone, Debug, Default, PartialEq, FromArgs)]
 #[argh(
     name = "ghostun",
     description = "L3-over-FakeTCP tunnel with per-core BPF steering.",
@@ -322,6 +340,10 @@ where
         println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
         std::process::exit(0);
     }
+    build_config(cli, None)
+}
+
+fn build_config(cli: Cli, running_conns: Option<u16>) -> Result<Config, String> {
     let file = match &cli.config {
         Some(path) => {
             let text = std::fs::read_to_string(path)
@@ -364,8 +386,8 @@ where
     };
     let tun_ipv4 = cli
         .tun_ipv4
-        .or(file.tun_ipv4)
         .as_deref()
+        .or(file.tun_ipv4.as_deref())
         .unwrap_or(v4_default)
         .parse()?;
     let tun_ipv6 = if cli.no_ipv6 || file.no_ipv6 {
@@ -373,22 +395,24 @@ where
     } else {
         Some(
             cli.tun_ipv6
-                .or(file.tun_ipv6)
                 .as_deref()
+                .or(file.tun_ipv6.as_deref())
                 .unwrap_or(v6_default)
                 .parse()?,
         )
     };
     let cpus = cli
         .cpus
-        .or(file.cpus)
         .as_deref()
+        .or(file.cpus.as_deref())
         .map(parse_cpus)
         .transpose()?;
-    let default_conns = cpus.as_ref().map_or_else(
-        || std::thread::available_parallelism().map_or(1, |n| n.get().min(256) as u16),
-        |c| c.len().min(256) as u16,
-    );
+    let default_conns = running_conns.unwrap_or_else(|| {
+        cpus.as_ref().map_or_else(
+            || std::thread::available_parallelism().map_or(1, |n| n.get().min(256) as u16),
+            |c| c.len().min(256) as u16,
+        )
+    });
     let cfg = Config {
         mode,
         auth_key: file
@@ -398,6 +422,7 @@ where
             .parse()?,
         tun_name: cli
             .tun_name
+            .clone()
             .or(file.tun_name)
             .unwrap_or_else(|| "ghostun0".into()),
         tun_ipv4,
@@ -406,7 +431,7 @@ where
         cpus,
         outer_mtu: cli.outer_mtu.or(file.outer_mtu),
         tun_mtu: cli.tun_mtu.or(file.tun_mtu),
-        iface: cli.iface.or(file.iface),
+        iface: cli.iface.clone().or(file.iface),
         base_port: cli.base_port.or(file.base_port).unwrap_or(32768),
         ping_interval: Duration::from_secs(cli.ping_interval.or(file.ping_interval).unwrap_or(5)),
         dead_timeout: Duration::from_secs(cli.dead_timeout.or(file.dead_timeout).unwrap_or(15)),
@@ -414,9 +439,33 @@ where
         remote,
         listen,
         outer_family,
+        cli,
     };
     validate(&cfg)?;
     Ok(cfg)
+}
+
+fn ensure_reload_compatible(old: &Config, new: &Config) -> Result<(), String> {
+    for (changed, field) in [
+        (old.mode != new.mode, "mode"),
+        (old.outer_family != new.outer_family, "outer_family"),
+        (old.tun_name != new.tun_name, "tun_name"),
+        (old.tun_ipv4 != new.tun_ipv4, "tun_ipv4"),
+        (old.tun_ipv6 != new.tun_ipv6, "tun_ipv6"),
+        (old.conns != new.conns, "conns"),
+        (old.outer_mtu != new.outer_mtu, "outer_mtu"),
+        (old.tun_mtu != new.tun_mtu, "tun_mtu"),
+        (old.iface != new.iface, "iface"),
+        (old.netfilter != new.netfilter, "no_netfilter"),
+        (old.remote != new.remote, "remote"),
+        (old.listen != new.listen, "listen"),
+        (old.base_port != new.base_port, "base_port"),
+    ] {
+        if changed {
+            return Err(format!("cannot reload `{field}` without restarting"));
+        }
+    }
+    Ok(())
 }
 
 fn parse_cpus(spec: &str) -> Result<Vec<usize>, String> {
@@ -848,5 +897,93 @@ mod tests {
         .unwrap();
         assert_eq!(c.resolve_tun_mtu(1280).unwrap(), 1220);
         assert!(c.resolve_tun_mtu(1279).is_err());
+    }
+
+    #[test]
+    fn reload_updates_mutable_fields_and_rejects_immutable_or_invalid_changes() {
+        let path = std::env::temp_dir().join(format!("ghostun-reload-{}.toml", std::process::id()));
+        let key1 = "a7".repeat(32);
+        let key2 = "b8".repeat(32);
+        std::fs::write(
+            &path,
+            format!(
+                "mode = 'entry'\nremote = '203.0.113.9:443'\nauth_key = '{key1}'\nconns = 2\nping_interval = 5\ndead_timeout = 15\n"
+            ),
+        )
+        .unwrap();
+        let cfg = parse_from([
+            "ghostun",
+            "--config",
+            path.to_str().unwrap(),
+            "--base-port",
+            "40000",
+        ])
+        .unwrap();
+
+        // Updating all four mutable fields (auth_key, ping_interval, dead_timeout, cpus) succeeds
+        // while preserving startup CLI overrides (--base-port 40000).
+        std::fs::write(
+            &path,
+            format!(
+                "mode = 'entry'\nremote = '203.0.113.9:443'\nauth_key = '{key2}'\nconns = 2\ncpus = '0,1'\nping_interval = 3\ndead_timeout = 12\n"
+            ),
+        )
+        .unwrap();
+        let reloaded = cfg.reload().unwrap();
+        assert_eq!(reloaded.auth_key, key2.parse().unwrap());
+        assert_eq!(reloaded.ping_interval, Duration::from_secs(3));
+        assert_eq!(reloaded.dead_timeout, Duration::from_secs(12));
+        assert_eq!(reloaded.cpus, Some(vec![0, 1]));
+        assert_eq!(reloaded.base_port, 40000);
+
+        // Changing cpus when conns was omitted in TOML/CLI keeps the running conns.
+        std::fs::write(
+            &path,
+            format!(
+                "mode = 'entry'\nremote = '203.0.113.9:443'\nauth_key = '{key2}'\ncpus = '0,1,2,3'\nping_interval = 3\ndead_timeout = 12\n"
+            ),
+        )
+        .unwrap();
+        let reloaded_cpus = reloaded.reload().unwrap();
+        assert_eq!(reloaded_cpus.conns, 2);
+        assert_eq!(reloaded_cpus.cpus, Some(vec![0, 1, 2, 3]));
+
+        // Invalid TOML syntax or invalid key is rejected without disclosing secret material.
+        let secret = "c9D0".repeat(16);
+        std::fs::write(&path, format!("auth_key = ['{secret}']\n")).unwrap();
+        let err = reloaded.reload().unwrap_err();
+        assert!(!err.contains(&secret));
+
+        // Changing any immutable field is rejected.
+        for bad_toml in [
+            format!("mode = 'exit'\nlisten = 443\nauth_key = '{key2}'\nconns = 2\n"),
+            format!("mode = 'entry'\nremote = '203.0.113.10:443'\nauth_key = '{key2}'\nconns = 2\n"),
+            format!("mode = 'entry'\nremote = '[2001:db8::1]:443'\nauth_key = '{key2}'\nconns = 2\n"),
+            format!("mode = 'entry'\nremote = '203.0.113.9:443'\nauth_key = '{key2}'\nconns = 4\n"),
+            format!("mode = 'entry'\nremote = '203.0.113.9:443'\nauth_key = '{key2}'\nconns = 2\ntun_name = 'gtun1'\n"),
+            format!("mode = 'entry'\nremote = '203.0.113.9:443'\nauth_key = '{key2}'\nconns = 2\ntun_ipv4 = '10.200.1.1/30'\n"),
+            format!("mode = 'entry'\nremote = '203.0.113.9:443'\nauth_key = '{key2}'\nconns = 2\ntun_ipv6 = 'fd00:201::1/126'\n"),
+            format!("mode = 'entry'\nremote = '203.0.113.9:443'\nauth_key = '{key2}'\nconns = 2\nouter_mtu = 1420\n"),
+            format!("mode = 'entry'\nremote = '203.0.113.9:443'\nauth_key = '{key2}'\nconns = 2\ntun_mtu = 1360\n"),
+            format!("mode = 'entry'\nremote = '203.0.113.9:443'\nauth_key = '{key2}'\nconns = 2\niface = 'eth9'\n"),
+            format!("mode = 'entry'\nremote = '203.0.113.9:443'\nauth_key = '{key2}'\nconns = 2\nno_netfilter = true\n"),
+        ] {
+            std::fs::write(&path, &bad_toml).unwrap();
+            assert!(reloaded.reload().is_err(), "expected immutable change to fail: {bad_toml}");
+        }
+
+        // When inner IPv6 was disabled at startup, reload remains compatible without false mismatch.
+        std::fs::write(
+            &path,
+            format!("mode = 'entry'\nremote = '203.0.113.9:443'\nauth_key = '{key1}'\nconns = 2\n"),
+        )
+        .unwrap();
+        let mut no_v6_cfg = reloaded.clone();
+        no_v6_cfg.disable_inner_ipv6();
+        let after_no_v6 = no_v6_cfg.reload().unwrap();
+        assert_eq!(after_no_v6.tun_ipv6, None);
+        assert_eq!(after_no_v6.auth_key, key1.parse().unwrap());
+
+        std::fs::remove_file(&path).unwrap();
     }
 }

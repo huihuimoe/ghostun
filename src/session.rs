@@ -135,6 +135,42 @@ impl Session {
         self.cfg.mss
     }
 
+    pub fn is_established(&self) -> bool {
+        self.state == State::Established
+    }
+
+    /// Updates session timers and key; returns `true` when this update reset a previously
+    /// `Established` session and the reload coordinator must wait for re-establishment.
+    pub fn reload(
+        &mut self,
+        now: Instant,
+        auth_key: AuthKey,
+        ping_interval: Duration,
+        dead_timeout: Duration,
+        out: &mut impl Sink,
+    ) -> bool {
+        let was_established = self.state == State::Established;
+        self.cfg.ping_interval = ping_interval;
+        self.cfg.dead_timeout = dead_timeout;
+        self.auth.reload(&auth_key, dead_timeout);
+        if self.cfg.auth_key == auth_key {
+            if was_established {
+                self.next_ping = now + ping_interval;
+            }
+            return false;
+        }
+        self.cfg.auth_key = auth_key;
+        match self.cfg.mode {
+            Mode::Entry => {
+                if self.state != State::Closed {
+                    self.reconnect(now, true, out);
+                }
+            }
+            Mode::Exit => self.shutdown(out),
+        }
+        was_established
+    }
+
     pub fn start(&mut self, now: Instant, out: &mut impl Sink) {
         if self.cfg.mode == Mode::Entry {
             self.connect(now, out);
@@ -166,6 +202,14 @@ impl Session {
         match self.cfg.mode {
             Mode::Entry => {
                 if Some(m.src) != self.peer || m.dst != self.local {
+                    if Some(m.src) == self.peer
+                        && m.dst.ip() == self.local.ip()
+                        && m.flags & (flags::RST | flags::SYN) == 0
+                        && m.flags & flags::ACK != 0
+                        && !p.payload.is_empty()
+                    {
+                        self.send_rst_to(m.dst, m.src, m.ack, out);
+                    }
                     return None;
                 }
                 if matches!(self.state, State::SynSent | State::Authenticating)
@@ -1596,5 +1640,108 @@ mod tests {
         assert_eq!(p.entry.state(), State::Closed);
         p.entry.shutdown(&mut w);
         assert!(w.0.is_empty());
+    }
+
+    #[test]
+    fn reload_updates_timers_in_place_and_rotates_session_on_key_change() {
+        let mut p = Pair::new(0, 2, 41);
+        let first_tuple = p.connect();
+        let key1 = AuthKey([0xa7; 32]);
+        let key2 = AuthKey([0xb8; 32]);
+
+        // 1. In-place timer update with unchanged key emits no frames and keeps the session live.
+        let mut w = Wire::default();
+        assert!(!p.entry.reload(
+            p.t,
+            key1.clone(),
+            Duration::from_secs(2),
+            Duration::from_secs(9),
+            &mut w,
+        ));
+        assert!(w.0.is_empty());
+        assert!(p.entry.is_established());
+        assert_eq!(p.entry.next_deadline(), p.t + Duration::from_secs(2));
+
+        let inner = [0x45; 20];
+        let data = encap(&mut p.entry, &inner, 40).unwrap();
+        assert_eq!(p.exit.on_outer(p.t, &data, &mut w), Some(&inner[..]));
+
+        // 2. Entry key rotation emits RSTs on the old tuple + SYN on the next port in its pool.
+        p.t += Duration::from_secs(1);
+        assert!(p.entry.reload(
+            p.t,
+            key2.clone(),
+            Duration::from_secs(2),
+            Duration::from_secs(9),
+            &mut w,
+        ));
+        assert!(!p.entry.is_established());
+        let frames = w.take();
+        assert!(frames.iter().any(|f| {
+            let m = parsed(f).meta;
+            m.src == first_tuple.src && m.flags & flags::RST != 0
+        }));
+        let syn = frames
+            .iter()
+            .find(|f| parsed(f).meta.flags == flags::SYN)
+            .expect("entry reload must initiate a new SYN");
+        assert_eq!(parsed(syn).meta.src.port(), first_tuple.src.port() + 2);
+
+        // Before Exit reloads its key, handshake cannot complete.
+        p.pump(frames);
+        assert!(!p.entry.is_established());
+        assert!(!p.exit.is_established());
+
+        // Once Exit reloads to key2 (while Closed, so no RST emitted), the next retry establishes.
+        assert!(!p.exit.reload(
+            p.t,
+            key2.clone(),
+            Duration::from_secs(2),
+            Duration::from_secs(9),
+            &mut w,
+        ));
+        assert!(w.0.is_empty());
+        p.t += SYN_RETRY;
+        p.entry.on_tick(p.t, &mut w);
+        let retry = w.take();
+        p.pump(retry);
+        assert!(p.entry.is_established());
+        assert!(p.exit.is_established());
+
+        // 3. Exit-first key rotation on an Established session emits RST, prompting Entry to
+        // immediately reconnect; once Entry also reloads key1, session re-establishes immediately.
+        p.t += Duration::from_secs(1);
+        assert!(p.exit.reload(
+            p.t,
+            key1.clone(),
+            Duration::from_secs(2),
+            Duration::from_secs(9),
+            &mut w,
+        ));
+        assert!(!p.exit.is_established());
+        let exit_rst = w.take();
+        assert!(exit_rst
+            .iter()
+            .all(|f| parsed(f).meta.flags & flags::RST != 0));
+        for f in &exit_rst {
+            p.entry.on_outer(p.t, f, &mut w);
+        }
+        p.pump(w.take());
+        assert!(!p.entry.is_established());
+
+        assert!(!p.entry.reload(
+            p.t,
+            key1,
+            Duration::from_secs(2),
+            Duration::from_secs(9),
+            &mut w,
+        ));
+        let entry_reconn = w.take();
+        p.pump(entry_reconn);
+        assert!(p.entry.is_established());
+        assert!(p.exit.is_established());
+
+        let data = encap(&mut p.entry, &inner, 40).unwrap();
+        assert_eq!(p.exit.on_outer(p.t, &data, &mut w), Some(&inner[..]));
     }
 }

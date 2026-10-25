@@ -345,30 +345,26 @@ unsafe fn pktinfo_dst(msg: &libc::msghdr) -> Option<Ipv6Addr> {
     None
 }
 
-/// Pins the calling thread to `explicit` CPU if set, else the `worker`-th allowed CPU (wrapping).
-pub fn pin_to_cpu(worker: usize, explicit: Option<usize>) -> io::Result<()> {
-    // SAFETY: cpu_set_t is plain data; the libc CPU_* helpers stay within its bounds.
+/// Returns the calling thread's allowed CPU IDs in ascending order.
+pub fn usable_cpus() -> Vec<usize> {
+    // SAFETY: cpu_set_t is plain data; CPU_ISSET stays within CPU_SETSIZE.
     unsafe {
-        let target = match explicit {
-            Some(cpu) => cpu,
-            None => {
-                let mut allowed: libc::cpu_set_t = std::mem::zeroed();
-                cvt(libc::sched_getaffinity(
-                    0,
-                    size_of::<libc::cpu_set_t>(),
-                    &mut allowed,
-                ))?;
-                let usable: Vec<usize> = (0..libc::CPU_SETSIZE as usize)
-                    .filter(|&c| libc::CPU_ISSET(c, &allowed))
-                    .collect();
-                let Some(&target) = usable.get(worker % usable.len().max(1)) else {
-                    return Ok(());
-                };
-                target
-            }
-        };
+        let mut allowed: libc::cpu_set_t = std::mem::zeroed();
+        if libc::sched_getaffinity(0, size_of::<libc::cpu_set_t>(), &mut allowed) != 0 {
+            return Vec::new();
+        }
+        (0..libc::CPU_SETSIZE as usize)
+            .filter(|&c| libc::CPU_ISSET(c, &allowed))
+            .collect()
+    }
+}
+
+/// Pins the calling thread to `cpu`.
+pub fn pin_to_cpu(cpu: usize) -> io::Result<()> {
+    // SAFETY: cpu_set_t is plain data; CPU_SET stays within its bounds.
+    unsafe {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
-        libc::CPU_SET(target, &mut set);
+        libc::CPU_SET(cpu, &mut set);
         cvt(libc::sched_setaffinity(
             0,
             size_of::<libc::cpu_set_t>(),

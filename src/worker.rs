@@ -2,10 +2,11 @@
 
 use std::net::IpAddr;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use crate::config::OuterFamily;
+use crate::config::{AuthKey, OuterFamily};
 use crate::session::{Session, Sink};
 use crate::sys::{self, RAW_BATCH};
 
@@ -15,6 +16,91 @@ const OPT_HEADROOM: usize = 80;
 const MIN_STRIDE: usize = 2048;
 const MAX_POLL: Duration = Duration::from_millis(200);
 
+pub struct Reload {
+    pub auth_key: AuthKey,
+    pub ping_interval: Duration,
+    pub dead_timeout: Duration,
+    pub cpu: Option<usize>,
+}
+
+pub struct Control {
+    initial_cpu: Option<usize>,
+    target_gen: AtomicU64,
+    applied_gen: AtomicU64,
+    wait_for_established: AtomicBool,
+    established: AtomicBool,
+    pending: Mutex<Option<(u64, Reload)>>,
+}
+
+impl Control {
+    pub fn new(initial_cpu: Option<usize>) -> Self {
+        Self {
+            initial_cpu,
+            target_gen: AtomicU64::new(0),
+            applied_gen: AtomicU64::new(0),
+            wait_for_established: AtomicBool::new(false),
+            established: AtomicBool::new(false),
+            pending: Mutex::new(None),
+        }
+    }
+
+    pub fn publish(&self, generation: u64, reload: Reload) {
+        *self.pending.lock().expect("reload lock") = Some((generation, reload));
+        self.target_gen.store(generation, Ordering::Release);
+    }
+
+    pub fn is_step_complete(&self, generation: u64) -> bool {
+        self.applied_gen.load(Ordering::Acquire) == generation
+            && (!self.wait_for_established.load(Ordering::Acquire)
+                || self.established.load(Ordering::Acquire))
+    }
+
+    pub fn sync(
+        &self,
+        id: usize,
+        cpu: &mut Option<usize>,
+        applied_gen: &mut u64,
+        now: Instant,
+        session: &mut Session,
+        out: &mut impl Sink,
+    ) {
+        let mut new_gen = None;
+        if self.target_gen.load(Ordering::Acquire) != *applied_gen {
+            if let Some((gen, reload)) = self.pending.lock().expect("reload lock").take() {
+                if reload.cpu != *cpu {
+                    *cpu = reload.cpu;
+                    pin(id, *cpu);
+                }
+                let prior_wait =
+                    self.wait_for_established.load(Ordering::Relaxed) && !session.is_established();
+                let wait = session.reload(
+                    now,
+                    reload.auth_key,
+                    reload.ping_interval,
+                    reload.dead_timeout,
+                    out,
+                );
+                *applied_gen = gen;
+                self.wait_for_established
+                    .store(wait || prior_wait, Ordering::Release);
+                new_gen = Some(gen);
+            }
+        }
+        self.established
+            .store(session.is_established(), Ordering::Release);
+        if let Some(gen) = new_gen {
+            self.applied_gen.store(gen, Ordering::Release);
+        }
+    }
+}
+
+fn pin(id: usize, cpu: Option<usize>) {
+    if let Some(target) = cpu {
+        if let Err(e) = sys::pin_to_cpu(target) {
+            log::warn!("worker {id}: cannot pin to CPU: {e}");
+        }
+    }
+}
 struct RawSink<'a>(BorrowedFd<'a>);
 
 impl Sink for RawSink<'_> {
@@ -34,16 +120,15 @@ fn read(fd: BorrowedFd<'_>, buf: &mut [u8]) -> Option<usize> {
 /// Runs until `stop` is set, then resets the outer connection so firewalls free its slot.
 pub fn run(
     id: usize,
-    cpu: Option<usize>,
     family: OuterFamily,
     mut session: Session,
     tun: OwnedFd,
     raw: OwnedFd,
     stop: &AtomicBool,
+    ctrl: &Control,
 ) {
-    if let Err(e) = sys::pin_to_cpu(id, cpu) {
-        log::warn!("worker {id}: cannot pin to CPU: {e}");
-    }
+    let mut cpu = ctrl.initial_cpu;
+    pin(id, cpu);
     let overhead = family.overhead();
     let stride = (overhead + usize::from(session.mss()) + OPT_HEADROOM).max(MIN_STRIDE);
     let mut out = RawSink(raw.as_fd());
@@ -66,6 +151,7 @@ pub fn run(
     ];
     let mut now = Instant::now();
     let mut busy = false;
+    let mut applied_gen = 0;
     while !stop.load(Ordering::Relaxed) {
         let timeout = if busy {
             0
@@ -84,6 +170,10 @@ pub fn run(
                 log::error!("worker {id}: poll: {e}");
                 break;
             }
+            continue;
+        }
+        if stop.load(Ordering::Relaxed) {
+            break;
         }
         now = Instant::now();
         let mut tun_ready = fds[0].revents & libc::POLLIN != 0;
@@ -160,6 +250,7 @@ pub fn run(
         if now >= session.next_deadline() {
             session.on_tick(now, &mut out);
         }
+        ctrl.sync(id, &mut cpu, &mut applied_gen, now, &mut session, &mut out);
     }
     session.shutdown(&mut out);
 }

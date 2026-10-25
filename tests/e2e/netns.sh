@@ -252,6 +252,55 @@ c=$(established)
 [[ $c == "$N" ]] || fail "after black hole: $c ESTABLISHED (leaked slots), want $N"
 pass "recovered ${t}s after one-way black hole; stale entries closed by RST, $N ESTABLISHED"
 
+# Live SIGHUP reload: reject immutable/invalid config changes without disturbing sessions,
+# exercise rollback without resetting untouched sibling workers, then complete a staged
+# rolling auth_key rotation across Entry and Exit.
+pre_reload=$(outer_tuples)
+printf "auth_key = '%064d'\ntun_name = 'other0'\n" 1 >"$LOG/auth.toml"
+kill -HUP "$ENTRY_PID" "$EXIT_PID"
+sleep 0.3
+[[ $(outer_tuples) == "$pre_reload" ]] || fail "rejected reload altered active outer tuples"
+ns entry ping -c2 -i0.2 -W1 10.3.0.2 >/dev/null || fail "rejected reload disrupted forwarding"
+
+printf "auth_key = '%064d'\n" 2 >"$LOG/auth.toml"
+kill -HUP "$ENTRY_PID"
+sleep 0.4
+if ((N > 1)); then
+    ns entry ping -c2 -i0.2 -W1 10.3.0.2 >/dev/null || fail "mid-rotation disrupted forwarding on sibling workers"
+fi
+printf "auth_key = '%064d'\n" 1 >"$LOG/auth.toml"
+kill -HUP "$ENTRY_PID"
+for _ in $(seq 40); do
+    [[ $(established) == "$N" ]] && grep -q "configuration reload complete (generation 2)" "$LOG/entry.log" && break
+    sleep 0.1
+done
+after_rollback=$(outer_tuples)
+preserved=$(comm -12 <(printf '%s\n' "$pre_reload") <(printf '%s\n' "$after_rollback") | grep -c . || true)
+[[ $preserved == $((N - 1)) ]] || fail "rollback preserved $preserved tuples, want $((N - 1)) (pre: $pre_reload | after: $after_rollback)"
+
+printf "auth_key = '%064d'\n" 3 >"$LOG/auth.toml"
+kill -HUP "$ENTRY_PID"
+sleep 0.4
+if ((N > 1)); then
+    ns entry ping -c2 -i0.2 -W1 10.3.0.2 >/dev/null || fail "rolling reload disrupted forwarding before Exit reloaded"
+fi
+kill -HUP "$EXIT_PID"
+for _ in $(seq 50); do
+    grep -q "configuration reload complete (generation 3)" "$LOG/entry.log" &&
+        grep -q "configuration reload complete (generation 1)" "$LOG/exit.log" &&
+        [[ $(established) == "$N" ]] && break
+    sleep 0.1
+done
+after_rotate=$(outer_tuples)
+overlap=$(comm -12 <(printf '%s\n' "$after_rollback") <(printf '%s\n' "$after_rotate") | grep -c . || true)
+[[ $overlap == 0 ]] || fail "SIGHUP key rotation left $overlap unrotated outer tuples"
+ns entry ping -c2 -i0.2 -W1 10.3.0.2 >/dev/null || fail "inner IPv4 ping after SIGHUP reload"
+ns entry ping -6 -c2 -i0.2 -W1 fd00:3::2 >/dev/null || fail "inner IPv6 ping after SIGHUP reload"
+ns inet iperf3 -s -D -1 -p 5203 && sleep 0.3
+ns entry iperf3 -c 10.3.0.2 -p 5203 -t 1 -P 8 >/dev/null || fail "multi-stream TCP after SIGHUP reload"
+sleep 0.2
+pass "SIGHUP reload: rejected invalid config, rolled back cleanly, and rotated all $N sessions"
+
 kill -TERM "$ENTRY_PID" "$EXIT_PID"
 wait "$ENTRY_PID" || fail "entry exit status $?"
 wait "$EXIT_PID" || fail "exit exit status $?"

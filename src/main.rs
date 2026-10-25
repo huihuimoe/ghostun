@@ -9,19 +9,25 @@ mod worker;
 use std::net::IpAddr;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 use config::{Config, Mode};
 use session::{Session, SessionConfig};
 
 static STOP: AtomicBool = AtomicBool::new(false);
+static RELOAD: AtomicBool = AtomicBool::new(false);
 
-extern "C" fn on_signal(_: libc::c_int) {
-    STOP.store(true, Ordering::Relaxed);
+extern "C" fn on_signal(sig: libc::c_int) {
+    if sig == libc::SIGHUP {
+        RELOAD.store(true, Ordering::Relaxed);
+    } else {
+        STOP.store(true, Ordering::Relaxed);
+    }
 }
 
 fn install_signal_handlers() -> std::io::Result<()> {
-    for sig in [libc::SIGINT, libc::SIGTERM] {
-        // SAFETY: the handler only stores to an atomic, which is async-signal-safe.
+    for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
         unsafe {
             let mut sa: libc::sigaction = std::mem::zeroed();
             sa.sa_sigaction = on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
@@ -99,7 +105,7 @@ fn run(mut cfg: Config) -> Result<(), String> {
     )
     .map_err(|e| format!("configuring {}: {e}", cfg.tun_name))?;
     if !ipv6 {
-        cfg.tun_ipv6 = None;
+        cfg.disable_inner_ipv6();
     }
 
     // Rules go in before sockets exist so the kernel never RSTs our first handshake.
@@ -155,18 +161,46 @@ fn run(mut cfg: Config) -> Result<(), String> {
         slots.push((session, tun, raw));
     }
     let family = cfg.outer_family;
-    let cpus = cfg.cpus.as_deref();
-    let workers: Vec<_> = slots
-        .into_iter()
-        .enumerate()
-        .map(|(i, (session, tun, raw))| {
-            let cpu = cpus.map(|list| list[i % list.len()]);
+    let default_cpus = sys::usable_cpus();
+    let mut controls = Vec::with_capacity(n);
+    let mut workers = Vec::with_capacity(n);
+    for (i, (session, tun, raw)) in slots.into_iter().enumerate() {
+        let cpu = cpu_for(&cfg, &default_cpus, i);
+        let ctrl = Arc::new(worker::Control::new(cpu));
+        let worker_ctrl = Arc::clone(&ctrl);
+        controls.push(ctrl);
+        workers.push(
             std::thread::Builder::new()
                 .name(format!("ghostun-w{i}"))
-                .spawn(move || worker::run(i, cpu, family, session, tun, raw, &STOP))
-                .expect("spawning worker thread")
-        })
-        .collect();
+                .spawn(move || worker::run(i, family, session, tun, raw, &STOP, &worker_ctrl))
+                .expect("spawning worker thread"),
+        );
+    }
+
+    let mut generation = 0u64;
+    let mut rolling = None;
+    while !STOP.load(Ordering::Relaxed) {
+        if RELOAD.swap(false, Ordering::Relaxed) {
+            match cfg.reload() {
+                Ok(next) if next == cfg && rolling.is_none() => {
+                    log::info!("configuration reload: no changes");
+                }
+                Ok(next) => {
+                    generation += 1;
+                    log::info!("reloading configuration (generation {generation})");
+                    cfg = next;
+                    rolling = start_reload(&controls, &default_cpus, generation, cfg.clone());
+                }
+                Err(e) => log::error!("reload rejected: {e}"),
+            }
+        }
+        advance_reload(&controls, &default_cpus, &mut rolling);
+        if workers.iter().any(|w| w.is_finished()) {
+            STOP.store(true, Ordering::Relaxed);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 
     for w in workers {
         if w.join().is_err() {
@@ -182,6 +216,66 @@ fn run(mut cfg: Config) -> Result<(), String> {
     Ok(())
 }
 
+struct RollingReload {
+    generation: u64,
+    next_worker: usize,
+    target: Config,
+}
+
+fn cpu_for(cfg: &Config, default_cpus: &[usize], id: usize) -> Option<usize> {
+    let list = cfg.cpus.as_deref().unwrap_or(default_cpus);
+    (!list.is_empty()).then(|| list[id % list.len()])
+}
+
+fn reload_for(cfg: &Config, default_cpus: &[usize], id: usize) -> worker::Reload {
+    worker::Reload {
+        auth_key: cfg.auth_key.clone(),
+        ping_interval: cfg.ping_interval,
+        dead_timeout: cfg.dead_timeout,
+        cpu: cpu_for(cfg, default_cpus, id),
+    }
+}
+
+fn start_reload(
+    controls: &[Arc<worker::Control>],
+    default_cpus: &[usize],
+    generation: u64,
+    target: Config,
+) -> Option<RollingReload> {
+    let first = controls.first()?;
+    first.publish(generation, reload_for(&target, default_cpus, 0));
+    Some(RollingReload {
+        generation,
+        next_worker: 0,
+        target,
+    })
+}
+
+fn advance_reload(
+    controls: &[Arc<worker::Control>],
+    default_cpus: &[usize],
+    rolling: &mut Option<RollingReload>,
+) {
+    while let Some(state) = rolling.as_mut() {
+        if !controls[state.next_worker].is_step_complete(state.generation) {
+            break;
+        }
+        state.next_worker += 1;
+        if state.next_worker < controls.len() {
+            controls[state.next_worker].publish(
+                state.generation,
+                reload_for(&state.target, default_cpus, state.next_worker),
+            );
+        } else {
+            log::info!(
+                "configuration reload complete (generation {})",
+                state.generation
+            );
+            *rolling = None;
+        }
+    }
+}
+
 fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     match config::load().and_then(run) {
@@ -190,5 +284,197 @@ fn main() -> ExitCode {
             log::error!("{e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::AuthKey;
+    use crate::session::Sink;
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::time::Instant;
+
+    #[derive(Default)]
+    struct Wire(Vec<Vec<u8>>);
+
+    impl Sink for Wire {
+        fn send(&mut self, frame: &[u8], _dst: IpAddr) {
+            self.0.push(frame.to_vec());
+        }
+    }
+
+    fn test_cfg(key_byte: u8, cpus: Option<&str>) -> Config {
+        let path = std::env::temp_dir().join(format!(
+            "ghostun-main-test-{}-{key_byte}.toml",
+            std::process::id()
+        ));
+        let hex = format!("{key_byte:02x}").repeat(32);
+        let cpus_line = cpus.map_or_else(String::new, |c| format!("cpus = '{c}'\n"));
+        std::fs::write(
+            &path,
+            format!(
+                "mode = 'entry'\nremote = '203.0.113.9:443'\nauth_key = '{hex}'\nconns = 2\n{cpus_line}"
+            ),
+        )
+        .unwrap();
+        let cfg = config::parse_from(["ghostun", "--config", path.to_str().unwrap()]).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        cfg
+    }
+
+    fn make_session(mode: Mode, worker: u16, key_byte: u8, now: Instant) -> Session {
+        let entry_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
+        let exit = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20)), 443);
+        Session::new(
+            SessionConfig {
+                mode,
+                auth_key: AuthKey([key_byte; 32]),
+                local_ip: if mode == Mode::Entry {
+                    entry_ip
+                } else {
+                    exit.ip()
+                },
+                remote: (mode == Mode::Entry).then_some(exit),
+                listen_port: exit.port(),
+                worker,
+                conns: 2,
+                base_port: 32768,
+                mss: 1460,
+                ping_interval: Duration::from_secs(5),
+                dead_timeout: Duration::from_secs(15),
+            },
+            now,
+            u64::from(worker) + 1,
+        )
+        .unwrap()
+    }
+
+    fn exchange(entry: &mut Session, exit: &mut Session, now: Instant, mut to_exit: Vec<Vec<u8>>) {
+        while !to_exit.is_empty() {
+            let mut back = Wire::default();
+            for f in &to_exit {
+                exit.on_outer(now, f, &mut back);
+            }
+            let mut fwd = Wire::default();
+            for f in std::mem::take(&mut back.0) {
+                entry.on_outer(now, &f, &mut fwd);
+            }
+            to_exit = fwd.0;
+        }
+    }
+
+    #[test]
+    fn rolling_reload_rotates_established_workers_sequentially_and_rolls_back_without_resetting_sibling(
+    ) {
+        let now = Instant::now();
+        let default_cpus = vec![0, 1];
+        let controls = vec![
+            Arc::new(worker::Control::new(Some(0))),
+            Arc::new(worker::Control::new(Some(1))),
+        ];
+        let mut entries = [
+            make_session(Mode::Entry, 0, 0xa7, now),
+            make_session(Mode::Entry, 1, 0xa7, now),
+        ];
+        let mut exits = [
+            make_session(Mode::Exit, 0, 0xa7, now),
+            make_session(Mode::Exit, 1, 0xa7, now),
+        ];
+        let mut cpus = [Some(0), Some(1)];
+        let mut gens = [0u64, 0u64];
+
+        for i in 0..2 {
+            let mut w = Wire::default();
+            entries[i].start(now, &mut w);
+            exchange(
+                &mut entries[i],
+                &mut exits[i],
+                now,
+                std::mem::take(&mut w.0),
+            );
+            assert!(entries[i].is_established());
+            controls[i].sync(i, &mut cpus[i], &mut gens[i], now, &mut entries[i], &mut w);
+        }
+
+        // Start reload to a wrong key (0xb8) while exits still use 0xa7: worker 0 rotates and
+        // waits for Established; worker 1 is not touched and keeps forwarding inner packets.
+        let mut rolling = start_reload(&controls, &default_cpus, 1, test_cfg(0xb8, Some("1")));
+        let mut w0 = Wire::default();
+        controls[0].sync(0, &mut cpus[0], &mut gens[0], now, &mut entries[0], &mut w0);
+        assert_eq!(cpus[0], Some(1));
+        exchange(&mut entries[0], &mut exits[0], now, w0.0);
+        assert!(!entries[0].is_established());
+        advance_reload(&controls, &default_cpus, &mut rolling);
+        assert_eq!(rolling.as_ref().unwrap().next_worker, 0);
+        assert!(entries[1].is_established());
+
+        // Rollback SIGHUP (generation 2) restores key 0xa7 and removes explicit cpus override:
+        // worker 0 restores default CPU 0 and re-establishes; worker 1 sees unchanged key 0xa7
+        // and completes without emitting any RST or SYN frames.
+        rolling = start_reload(&controls, &default_cpus, 2, test_cfg(0xa7, None));
+        let mut w0 = Wire::default();
+        controls[0].sync(0, &mut cpus[0], &mut gens[0], now, &mut entries[0], &mut w0);
+        assert_eq!(cpus[0], Some(0));
+        exchange(&mut entries[0], &mut exits[0], now, w0.0);
+        assert!(entries[0].is_established());
+        controls[0].sync(
+            0,
+            &mut cpus[0],
+            &mut gens[0],
+            now,
+            &mut entries[0],
+            &mut Wire::default(),
+        );
+        advance_reload(&controls, &default_cpus, &mut rolling);
+        assert_eq!(rolling.as_ref().unwrap().next_worker, 1);
+
+        let mut w1 = Wire::default();
+        controls[1].sync(1, &mut cpus[1], &mut gens[1], now, &mut entries[1], &mut w1);
+        assert!(
+            w1.0.is_empty(),
+            "unchanged key on worker 1 must not reset its session"
+        );
+        assert!(entries[1].is_established());
+        advance_reload(&controls, &default_cpus, &mut rolling);
+        assert!(rolling.is_none());
+    }
+
+    #[test]
+    fn rolling_reload_fast_forwards_unestablished_workers() {
+        let now = Instant::now();
+        let default_cpus = vec![0, 1];
+        let controls = vec![
+            Arc::new(worker::Control::new(Some(0))),
+            Arc::new(worker::Control::new(Some(1))),
+        ];
+        let mut exits = [
+            make_session(Mode::Exit, 0, 0xa7, now),
+            make_session(Mode::Exit, 1, 0xa7, now),
+        ];
+        let mut cpus = [Some(0), Some(1)];
+        let mut gens = [0u64, 0u64];
+
+        let mut rolling = start_reload(&controls, &default_cpus, 1, test_cfg(0xc9, None));
+        controls[0].sync(
+            0,
+            &mut cpus[0],
+            &mut gens[0],
+            now,
+            &mut exits[0],
+            &mut Wire::default(),
+        );
+        advance_reload(&controls, &default_cpus, &mut rolling);
+        assert_eq!(rolling.as_ref().unwrap().next_worker, 1);
+        controls[1].sync(
+            1,
+            &mut cpus[1],
+            &mut gens[1],
+            now,
+            &mut exits[1],
+            &mut Wire::default(),
+        );
+        advance_reload(&controls, &default_cpus, &mut rolling);
+        assert!(rolling.is_none());
     }
 }
