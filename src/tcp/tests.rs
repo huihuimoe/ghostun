@@ -147,6 +147,60 @@ fn split_prefix_payload_coalescing_and_partial_writes_preserve_packets_and_cap()
 }
 
 #[test]
+fn vectored_writes_preserve_frames_across_partial_prefixes_and_would_block() {
+    struct Writer {
+        bytes: Vec<u8>,
+        limit: usize,
+        calls: usize,
+    }
+    impl Write for Writer {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.write_vectored(&[std::io::IoSlice::new(bytes)])
+        }
+        fn write_vectored(&mut self, slices: &[std::io::IoSlice<'_>]) -> io::Result<usize> {
+            self.calls += 1;
+            if self.calls == 2 {
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            let mut n = 0;
+            for slice in slices {
+                let len = slice.len().min(self.limit - n);
+                self.bytes.extend_from_slice(&slice[..len]);
+                n += len;
+            }
+            Ok(n)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let packets = [packet(1), packet(2), vec![PING; 9]];
+    let mut tx = SendQueue::default();
+    for p in &packets {
+        assert!(tx.push(p));
+    }
+    let total = tx.bytes;
+    let mut writer = Writer {
+        bytes: Vec::new(),
+        limit: 67,
+        calls: 0,
+    };
+    tx.flush(&mut writer).unwrap();
+    assert_eq!(writer.bytes.len(), 67, "one frame and half the next prefix");
+    assert_eq!(tx.bytes, total - 67);
+    tx.flush(&mut writer).unwrap();
+    assert_eq!(tx.bytes, 0);
+    let mut input = &writer.bytes[..];
+    let mut rx = Receive::new(1380);
+    for p in &packets {
+        assert!(rx.read(&mut input).unwrap());
+        assert_eq!(rx.payload(), p);
+        rx.clear();
+    }
+    assert!(input.is_empty());
+}
+
+#[test]
 fn malformed_lengths_and_packets_fail_without_resynchronizing() {
     for bytes in [&[0, 0][..], &[255, 255][..], &[0, 3, 1][..]] {
         let mut input = bytes;

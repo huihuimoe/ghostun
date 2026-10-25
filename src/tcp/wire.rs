@@ -1,6 +1,6 @@
 //! The TCP v1 codec and mutual authentication. See docs/261025-dual-transport-spec.md.
 use std::collections::VecDeque;
-use std::io::{self, Read, Write};
+use std::io::{self, IoSlice, Read, Write};
 
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
@@ -96,15 +96,25 @@ impl SendQueue {
     }
 
     pub fn flush(&mut self, output: &mut impl Write) -> io::Result<()> {
-        while let Some(frame) = self.frames.front() {
-            match output.write(&frame[self.offset..]) {
+        while !self.frames.is_empty() {
+            let mut slices = [IoSlice::new(&[]); 64];
+            let count = self.frames.len().min(slices.len());
+            for (i, frame) in self.frames.iter().take(count).enumerate() {
+                slices[i] = IoSlice::new(&frame[if i == 0 { self.offset } else { 0 }..]);
+            }
+            match output.write_vectored(&slices[..count]) {
                 Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-                Ok(n) => {
-                    self.offset += n;
+                Ok(mut n) => {
                     self.bytes -= n;
-                    if self.offset == frame.len() {
-                        self.frames.pop_front();
-                        self.offset = 0;
+                    while n > 0 {
+                        let len = self.frames.front().unwrap().len();
+                        let consumed = n.min(len - self.offset);
+                        self.offset += consumed;
+                        n -= consumed;
+                        if self.offset == len {
+                            self.frames.pop_front();
+                            self.offset = 0;
+                        }
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
