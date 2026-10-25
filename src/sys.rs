@@ -65,7 +65,11 @@ pub fn create_tun(name: &str, queues: usize) -> io::Result<Vec<OwnedFd>> {
             let fd = unsafe { OwnedFd::from_raw_fd(fd) };
             // SAFETY: TUNSETIFF reads/writes an ifreq-sized struct that outlives the call.
             cvt(unsafe {
-                libc::ioctl(fd.as_raw_fd(), libc::TUNSETIFF, &mut req as *mut IfReqFlags)
+                libc::ioctl(
+                    fd.as_raw_fd(),
+                    libc::TUNSETIFF as _,
+                    &mut req as *mut IfReqFlags,
+                )
             })?;
             Ok(fd)
         })
@@ -319,7 +323,7 @@ pub fn send_raw_batch(
                 fd.as_raw_fd(),
                 hdrs[sent..].as_mut_ptr().cast(),
                 (count - sent) as libc::c_uint,
-                libc::MSG_DONTWAIT,
+                libc::MSG_DONTWAIT as _,
             )
         };
         if n > 0 {
@@ -359,7 +363,7 @@ pub fn recv_raw_batch(
         base.msg_hdr.msg_iovlen = 1;
         let offset = if family == OuterFamily::Ipv6 {
             base.msg_hdr.msg_namelen = size_of::<libc::sockaddr_in6>() as libc::socklen_t;
-            base.msg_hdr.msg_controllen = size_of::<CmsgBuf>();
+            base.msg_hdr.msg_controllen = size_of::<CmsgBuf>() as _;
             IPV6_HDR
         } else {
             0
@@ -381,7 +385,7 @@ pub fn recv_raw_batch(
             fd.as_raw_fd(),
             hdrs.as_mut_ptr().cast(),
             RAW_BATCH as libc::c_uint,
-            libc::MSG_DONTWAIT,
+            libc::MSG_DONTWAIT as _,
             std::ptr::null_mut(),
         );
         if m < 0 {
@@ -417,7 +421,7 @@ unsafe fn pktinfo_dst(msg: &libc::msghdr) -> Option<Ipv6Addr> {
     while !cmsg.is_null() {
         if (*cmsg).cmsg_level == libc::IPPROTO_IPV6
             && (*cmsg).cmsg_type == libc::IPV6_PKTINFO
-            && (*cmsg).cmsg_len >= libc::CMSG_LEN(size_of::<libc::in6_pktinfo>() as u32) as usize
+            && (*cmsg).cmsg_len >= libc::CMSG_LEN(size_of::<libc::in6_pktinfo>() as u32) as _
         {
             let info = std::ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast::<libc::in6_pktinfo>());
             return Some(Ipv6Addr::from(info.ipi6_addr.s6_addr));
