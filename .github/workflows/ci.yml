@@ -23,6 +23,8 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -33,32 +35,61 @@ jobs:
           cargo fmt --check
           cargo clippy --locked --all-targets -- -D warnings
           cargo test --locked
+      - name: Detect whether network E2E is needed
+        id: filter
+        if: "!startsWith(github.ref, 'refs/tags/')"
+        env:
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if [[ -z "$BASE_SHA" || "$BASE_SHA" =~ ^0+$ ]] || ! git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
+            echo "e2e=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if git diff --name-only "$BASE_SHA" HEAD -- \
+            src Cargo.toml Cargo.lock tests .github/workflows/ci.yml | grep -q .; then
+            echo "e2e=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Skipping network E2E: no runtime, dependency, test, or CI changes"
+            echo "e2e=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Build network test binary and image
+        if: steps.filter.outputs.e2e == 'true'
         run: |
           cargo build --release --locked
           sudo docker build -f tests/Dockerfile -t ghostun-e2e .
       - name: Run isolated network tests
+        if: steps.filter.outputs.e2e == 'true'
         run: |
-          sudo docker run -d --name ghostun-e2e --privileged --network none \
-            -v "$PWD":/src -w /src -e BIN=/src/target/release/ghostun \
-            ghostun-e2e -c 'sleep infinity'
-          sudo docker exec ghostun-e2e bash -c '
-            set -e
-            for family in ipv4 ipv6; do
-              LOG=/src/target/e2e-faketcp-$family OUTER_FAMILY=$family bash tests/e2e/netns.sh
-              for relay in 0 1; do
-                LOG=/src/target/e2e-tcp-$family-$relay OUTER_FAMILY=$family RELAY=$relay bash tests/e2e/tcp.sh
-              done
-            done
-            for transport in faketcp tcp; do
-              LOG=/src/target/e2e-noipv6-$transport TRANSPORT=$transport bash tests/e2e/ipv6-disabled.sh
-            done'
-      - name: Remove network test container
-        if: always()
+          run_suite() {
+            local name=$1 cmd=$2 start=$SECONDS
+            local out="target/e2e-$name.out"
+            mkdir -p target
+            if sudo docker run --rm --name "ghostun-e2e-$name" --label ghostun-e2e=1 \
+              --privileged --network none \
+              -v "$PWD":/src -w /src -e BIN=/src/target/release/ghostun \
+              ghostun-e2e -c "$cmd" >"$out" 2>&1; then
+              echo "=== PASS: $name ($((SECONDS - start))s) ==="
+            else
+              echo "=== FAIL: $name ($((SECONDS - start))s) ==="
+              cat "$out"
+              return 1
+            fi
+          }
+          export -f run_suite
+          printf '%s\0' \
+            'tcp-ipv4-relay'    'LOG=/tmp/e2e OUTER_FAMILY=ipv4 RELAY=1 bash tests/e2e/tcp.sh' \
+            'tcp-ipv6-relay'    'LOG=/tmp/e2e OUTER_FAMILY=ipv6 RELAY=1 bash tests/e2e/tcp.sh' \
+            'faketcp-ipv4'      'LOG=/tmp/e2e OUTER_FAMILY=ipv4 bash tests/e2e/netns.sh' \
+            'faketcp-ipv6'      'LOG=/tmp/e2e OUTER_FAMILY=ipv6 bash tests/e2e/netns.sh' \
+            'tcp-ipv4-direct'   'LOG=/tmp/e2e OUTER_FAMILY=ipv4 RELAY=0 bash tests/e2e/tcp.sh' \
+            'tcp-ipv6-direct'   'LOG=/tmp/e2e OUTER_FAMILY=ipv6 RELAY=0 bash tests/e2e/tcp.sh' \
+            'noipv6-faketcp'    'LOG=/tmp/e2e TRANSPORT=faketcp bash tests/e2e/ipv6-disabled.sh' \
+            'noipv6-tcp'        'LOG=/tmp/e2e TRANSPORT=tcp bash tests/e2e/ipv6-disabled.sh' |
+            xargs -0 -n 2 -P 4 bash -ceu 'run_suite "$1" "$2"' _
+      - name: Remove network test containers
+        if: always() && steps.filter.outputs.e2e == 'true'
         run: |
-          if sudo docker container inspect ghostun-e2e >/dev/null 2>&1; then
-            sudo docker rm -f ghostun-e2e
-          fi
+          sudo docker ps -aq --filter label=ghostun-e2e=1 | xargs -r sudo docker rm -f
 
   release:
     needs: test
