@@ -141,16 +141,18 @@ sysctl -w net.ipv4.ip_forward=1 net.ipv6.conf.all.forwarding=1
 
 ## Performance
 
-Measured inside a single 4-vCPU VM (AMD EPYC-Genoa, Linux 7.2) running Entry, a stateful `nftables` firewall, Exit, and `iperf3 -P 8` across isolated network namespaces in Docker (outer MTU `1420`):
+Measured inside a single 4-vCPU VM (AMD EPYC-Genoa, Linux 7.2) running Entry (`--conns 2 --cpus 0-1`), a stateful `nftables` firewall, Exit (`--conns 2 --cpus 2-3`), and 8 parallel `iperf3` streams across isolated network namespaces in Docker (outer MTU `1420`):
 
-| `--conns` (CPU pinning) | Outer family | Inner IPv4 upload | Inner IPv6 download | Entry RSS | Exit RSS |
-|---|---|---|---|---|---|
-| `2` (`0-1` / `2-3`) | IPv4 (TUN MTU 1380) | 2.22 Gbit/s | 2.62 Gbit/s | ~3.1 MB | ~3.1 MB |
-| `2` (`0-1` / `2-3`) | IPv6 (TUN MTU 1360) | 2.17 Gbit/s | 2.38 Gbit/s | ~3.1 MB | ~3.1 MB |
-| `4` (shared 4 vCPUs) | IPv4 (TUN MTU 1380) | 2.37 Gbit/s | 3.17 Gbit/s | ~3.4 MB | ~3.5 MB |
-| `4` (shared 4 vCPUs) | IPv6 (TUN MTU 1360) | 2.42 Gbit/s | 3.11 Gbit/s | ~3.3 MB | ~3.5 MB |
+| Scenario | Outer family | Inner IPv4 upload / download | Inner IPv6 upload / download | Tunnel packet rate |
+|---|---|---|---|---|
+| Large packets (full MTU) | IPv4 (TUN MTU 1380) | 2.57 / 2.92 Gbit/s | 2.30 / 2.64 Gbit/s | 287–350 kPPS |
+| Large packets (full MTU) | IPv6 (TUN MTU 1360) | 2.54 / 2.72 Gbit/s | 2.16 / 2.55 Gbit/s | 274–333 kPPS |
+| Mixed packets (IMIX: 4×MTU + 2×512B + 2×128B) | IPv4 (TUN MTU 1380) | 1.40 / 1.68 Gbit/s | 1.09 / 1.50 Gbit/s | 285–321 kPPS |
+| Mixed packets (IMIX: 4×MTU + 2×512B + 2×128B) | IPv6 (TUN MTU 1360) | 1.61 / 1.79 Gbit/s | 1.19 / 1.27 Gbit/s | 291–327 kPPS |
+| Small packets (128 B MSS/payload) | IPv4 (TUN MTU 1380) | 211 / 216 Mbit/s | 194 / 221 Mbit/s | 314–357 kPPS |
+| Small packets (128 B MSS/payload) | IPv6 (TUN MTU 1360) | 181 / 213 Mbit/s | 194 / 204 Mbit/s | 293–345 kPPS |
 
-Stripped release binary size is ~800 KB.
+Entry and Exit RSS stay at ~3.1 MB each; stripped release binary size is ~800 KB.
 
 ## Operational notes
 
