@@ -3,13 +3,13 @@ FROM --platform=$BUILDPLATFORM rust:1.99.1-slim-trixie AS build
 ARG TARGETARCH
 WORKDIR /build
 RUN case "$TARGETARCH" in \
-      amd64) compiler=gcc-x86-64-linux-gnu; rust_target=x86_64-unknown-linux-gnu ;; \
-      arm64) compiler=gcc-aarch64-linux-gnu; rust_target=aarch64-unknown-linux-gnu ;; \
+      amd64) compiler=gcc-x86-64-linux-gnu; libc_dev=libc6-dev-amd64-cross; rust_target=x86_64-unknown-linux-gnu ;; \
+      arm64) compiler=gcc-aarch64-linux-gnu; libc_dev=libc6-dev-arm64-cross; rust_target=aarch64-unknown-linux-gnu ;; \
       *) exit 1 ;; \
     esac \
     && if [ "$(dpkg --print-architecture)" != "$TARGETARCH" ]; then \
          apt-get update \
-         && apt-get install -y --no-install-recommends "$compiler" \
+         && apt-get install -y --no-install-recommends "$compiler" "$libc_dev" \
          && rustup target add "$rust_target" \
          && rm -rf /var/lib/apt/lists/*; \
        fi
