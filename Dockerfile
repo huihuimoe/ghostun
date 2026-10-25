@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1.28
 FROM --platform=$BUILDPLATFORM rust:1.99.1-slim-trixie AS build
 ARG TARGETARCH
 WORKDIR /build
