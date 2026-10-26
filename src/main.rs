@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use config::{Config, Mode, Transport};
 use faketcp::{Session, SessionConfig};
+use worker::RollingReload;
 
 static STOP: AtomicBool = AtomicBool::new(false);
 static RELOAD: AtomicBool = AtomicBool::new(false);
@@ -23,20 +24,6 @@ extern "C" fn on_signal(sig: libc::c_int) {
     } else {
         STOP.store(true, Ordering::Relaxed);
     }
-}
-
-fn install_signal_handlers() -> std::io::Result<()> {
-    for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
-        unsafe {
-            let mut sa: libc::sigaction = std::mem::zeroed();
-            sa.sa_sigaction = on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
-            libc::sigemptyset(&mut sa.sa_mask);
-            if libc::sigaction(sig, &sa, std::ptr::null_mut()) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Outer addressing derived from config plus the routing table.
@@ -76,7 +63,7 @@ fn resolve_outer(cfg: &Config) -> Result<Outer, String> {
 }
 
 fn run(mut cfg: Config) -> Result<(), String> {
-    install_signal_handlers().map_err(|e| format!("signal handlers: {e}"))?;
+    sys::install_signal_handlers(on_signal).map_err(|e| format!("signal handlers: {e}"))?;
     let outer = resolve_outer(&cfg)?;
     let tun_mtu = cfg.resolve_tun_mtu(outer.mtu)?;
     let mss = (outer.mtu - cfg.outer_family.overhead() as u32) as u16;
@@ -113,19 +100,7 @@ fn run(mut cfg: Config) -> Result<(), String> {
 
     // Rules go in before sockets exist so the kernel never RSTs our first handshake.
     let guard = if cfg.netfilter {
-        let spec = netfilter::NftSpec {
-            mode: cfg.mode,
-            transport: cfg.transport,
-            outer_family: cfg.outer_family,
-            tun_name: cfg.tun_name.clone(),
-            remote: cfg.remote,
-            base_port: cfg.base_port,
-            listen_port,
-            inner_v4: cfg.tun_ipv4,
-            inner_v6: cfg.tun_ipv6,
-            out_iface: cfg.iface.clone(),
-            masq: cfg.masq,
-        };
+        let spec = netfilter::NftSpec::from_config(&cfg, listen_port);
         Some(netfilter::install(&spec).map_err(|e| format!("netfilter: {e}"))?)
     } else {
         None
@@ -167,19 +142,7 @@ fn run(mut cfg: Config) -> Result<(), String> {
             .flatten();
         let raw = sys::raw_socket(cfg.outer_family, bind_dev, &filter)
             .map_err(|e| format!("raw socket: {e}"))?;
-        let scfg = SessionConfig {
-            mode: cfg.mode,
-            auth_key: cfg.auth_key.clone(),
-            local_ip: outer.local_ip,
-            remote: cfg.remote,
-            listen_port,
-            worker: id,
-            conns: cfg.conns,
-            base_port: cfg.base_port,
-            mss,
-            ping_interval: cfg.ping_interval,
-            dead_timeout: cfg.dead_timeout,
-        };
+        let scfg = SessionConfig::from_config(&cfg, outer.local_ip, listen_port, id, mss);
         let session = Session::new(scfg, std::time::Instant::now(), seed ^ ((id as u64) << 48))
             .map_err(|e| format!("initializing worker {id} authentication: {e}"))?;
         slots.push(Start::Fake(Box::new(session), tun, raw));
@@ -189,7 +152,7 @@ fn run(mut cfg: Config) -> Result<(), String> {
     let mut controls = Vec::with_capacity(n);
     let mut workers = Vec::with_capacity(n);
     for (i, start) in slots.into_iter().enumerate() {
-        let cpu = cpu_for(&cfg, &default_cpus, i);
+        let cpu = worker::cpu_for(&cfg, &default_cpus, i);
         let ctrl = Arc::new(worker::Control::new(cpu));
         let worker_ctrl = Arc::clone(&ctrl);
         controls.push(ctrl);
@@ -221,12 +184,13 @@ fn run(mut cfg: Config) -> Result<(), String> {
                     generation += 1;
                     log::info!("reloading configuration (generation {generation})");
                     cfg = next;
-                    rolling = start_reload(&controls, &default_cpus, generation, cfg.clone());
+                    rolling =
+                        RollingReload::start(&controls, &default_cpus, generation, cfg.clone());
                 }
                 Err(e) => log::error!("reload rejected: {e}"),
             }
         }
-        advance_reload(&controls, &default_cpus, &mut rolling);
+        RollingReload::advance(&controls, &default_cpus, &mut rolling);
         if workers.iter().any(|w| w.is_finished()) {
             STOP.store(true, Ordering::Relaxed);
             break;
@@ -246,66 +210,6 @@ fn run(mut cfg: Config) -> Result<(), String> {
             .map_err(|e| format!("removing netfilter table: {e}"))?;
     }
     Ok(())
-}
-
-struct RollingReload {
-    generation: u64,
-    next_worker: usize,
-    target: Config,
-}
-
-fn cpu_for(cfg: &Config, default_cpus: &[usize], id: usize) -> Option<usize> {
-    let list = cfg.cpus.as_deref().unwrap_or(default_cpus);
-    (!list.is_empty()).then(|| list[id % list.len()])
-}
-
-fn reload_for(cfg: &Config, default_cpus: &[usize], id: usize) -> worker::Reload {
-    worker::Reload {
-        auth_key: cfg.auth_key.clone(),
-        ping_interval: cfg.ping_interval,
-        dead_timeout: cfg.dead_timeout,
-        cpu: cpu_for(cfg, default_cpus, id),
-    }
-}
-
-fn start_reload(
-    controls: &[Arc<worker::Control>],
-    default_cpus: &[usize],
-    generation: u64,
-    target: Config,
-) -> Option<RollingReload> {
-    let first = controls.first()?;
-    first.publish(generation, reload_for(&target, default_cpus, 0));
-    Some(RollingReload {
-        generation,
-        next_worker: 0,
-        target,
-    })
-}
-
-fn advance_reload(
-    controls: &[Arc<worker::Control>],
-    default_cpus: &[usize],
-    rolling: &mut Option<RollingReload>,
-) {
-    while let Some(state) = rolling.as_mut() {
-        if !controls[state.next_worker].is_step_complete(state.generation) {
-            break;
-        }
-        state.next_worker += 1;
-        if state.next_worker < controls.len() {
-            controls[state.next_worker].publish(
-                state.generation,
-                reload_for(&state.target, default_cpus, state.next_worker),
-            );
-        } else {
-            log::info!(
-                "configuration reload complete (generation {})",
-                state.generation
-            );
-            *rolling = None;
-        }
-    }
 }
 
 fn main() -> ExitCode {
@@ -439,7 +343,8 @@ mod tests {
 
         // Start reload to a wrong key (0xb8) while exits still use 0xa7: worker 0 rotates and
         // waits for Established; worker 1 is not touched and keeps forwarding inner packets.
-        let mut rolling = start_reload(&controls, &default_cpus, 1, test_cfg(0xb8, Some("1")));
+        let mut rolling =
+            RollingReload::start(&controls, &default_cpus, 1, test_cfg(0xb8, Some("1")));
         let mut w0 = Wire::default();
         faketcp::sync_reload(
             &controls[0],
@@ -453,14 +358,14 @@ mod tests {
         assert_eq!(cpus[0], Some(1));
         exchange(&mut entries[0], &mut exits[0], now, w0.0);
         assert!(!entries[0].is_established());
-        advance_reload(&controls, &default_cpus, &mut rolling);
+        RollingReload::advance(&controls, &default_cpus, &mut rolling);
         assert_eq!(rolling.as_ref().unwrap().next_worker, 0);
         assert!(entries[1].is_established());
 
         // Rollback SIGHUP (generation 2) restores key 0xa7 and removes explicit cpus override:
         // worker 0 restores default CPU 0 and re-establishes; worker 1 sees unchanged key 0xa7
         // and completes without emitting any RST or SYN frames.
-        rolling = start_reload(&controls, &default_cpus, 2, test_cfg(0xa7, None));
+        rolling = RollingReload::start(&controls, &default_cpus, 2, test_cfg(0xa7, None));
         let mut w0 = Wire::default();
         faketcp::sync_reload(
             &controls[0],
@@ -483,7 +388,7 @@ mod tests {
             &mut entries[0],
             &mut Wire::default(),
         );
-        advance_reload(&controls, &default_cpus, &mut rolling);
+        RollingReload::advance(&controls, &default_cpus, &mut rolling);
         assert_eq!(rolling.as_ref().unwrap().next_worker, 1);
 
         let mut w1 = Wire::default();
@@ -501,7 +406,7 @@ mod tests {
             "unchanged key on worker 1 must not reset its session"
         );
         assert!(entries[1].is_established());
-        advance_reload(&controls, &default_cpus, &mut rolling);
+        RollingReload::advance(&controls, &default_cpus, &mut rolling);
         assert!(rolling.is_none());
     }
 
@@ -520,7 +425,7 @@ mod tests {
         let mut cpus = [Some(0), Some(1)];
         let mut gens = [0u64, 0u64];
 
-        let mut rolling = start_reload(&controls, &default_cpus, 1, test_cfg(0xc9, None));
+        let mut rolling = RollingReload::start(&controls, &default_cpus, 1, test_cfg(0xc9, None));
         faketcp::sync_reload(
             &controls[0],
             0,
@@ -530,7 +435,7 @@ mod tests {
             &mut exits[0],
             &mut Wire::default(),
         );
-        advance_reload(&controls, &default_cpus, &mut rolling);
+        RollingReload::advance(&controls, &default_cpus, &mut rolling);
         assert_eq!(rolling.as_ref().unwrap().next_worker, 1);
         faketcp::sync_reload(
             &controls[1],
@@ -541,7 +446,7 @@ mod tests {
             &mut exits[1],
             &mut Wire::default(),
         );
-        advance_reload(&controls, &default_cpus, &mut rolling);
+        RollingReload::advance(&controls, &default_cpus, &mut rolling);
         assert!(rolling.is_none());
     }
 }

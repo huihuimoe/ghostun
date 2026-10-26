@@ -11,10 +11,11 @@ pub mod pkt;
 mod tests;
 pub mod worker;
 
-use crate::config::{AuthKey, Mode, OuterFamily};
+use crate::config::{AuthKey, Config, Mode, OuterFamily};
 pub use auth::{Auth, EntryStep, ExitStep, HELLO_LEN, PROOF_LEN};
 pub use pkt::{
-    entry_filter, exit_filter, flags, TcpMeta, CTRL_LEN, CTRL_PING, CTRL_PONG, MAX_OVERHEAD,
+    entry_filter, exit_filter, flags, Keepalive, TcpMeta, CTRL_LEN, CTRL_PING, CTRL_PONG,
+    MAX_OVERHEAD,
 };
 pub use worker::run;
 #[cfg(test)]
@@ -46,6 +47,30 @@ pub struct SessionConfig {
     pub dead_timeout: Duration,
 }
 
+impl SessionConfig {
+    pub fn from_config(
+        cfg: &Config,
+        local_ip: IpAddr,
+        listen_port: u16,
+        worker: u16,
+        mss: u16,
+    ) -> Self {
+        Self {
+            mode: cfg.mode,
+            auth_key: cfg.auth_key.clone(),
+            local_ip,
+            remote: cfg.remote,
+            listen_port,
+            worker,
+            conns: cfg.conns,
+            base_port: cfg.base_port,
+            mss,
+            ping_interval: cfg.ping_interval,
+            dead_timeout: cfg.dead_timeout,
+        }
+    }
+}
+
 pub trait Sink {
     fn send(&mut self, frame: &[u8], dst: IpAddr);
 }
@@ -57,6 +82,7 @@ pub const SYN_RETRY: Duration = Duration::from_secs(1);
 const WINDOW: u16 = 65535;
 const IDLE: Duration = Duration::from_secs(3600);
 
+#[inline]
 fn emit(scratch: &mut [u8], meta: &TcpMeta, payload: &[u8], id: u16, out: &mut impl Sink) {
     let overhead = OuterFamily::of(meta.src.ip()).overhead();
     scratch[overhead..overhead + payload.len()].copy_from_slice(payload);
@@ -85,6 +111,7 @@ pub struct Session {
 }
 
 /// `a` is later than `b` in 32-bit sequence space.
+#[inline(always)]
 fn seq_after(a: u32, b: u32) -> bool {
     (a.wrapping_sub(b) as i32) > 0
 }
@@ -126,10 +153,12 @@ impl Session {
         self.state
     }
 
+    #[inline(always)]
     pub fn mss(&self) -> u16 {
         self.cfg.mss
     }
 
+    #[inline(always)]
     pub fn is_established(&self) -> bool {
         self.state == State::Established
     }
@@ -172,6 +201,7 @@ impl Session {
         }
     }
 
+    #[inline]
     pub fn encap(&mut self, buf: &mut [u8], len: usize) -> Option<(usize, IpAddr)> {
         if self.state != State::Established {
             return None;
@@ -186,6 +216,7 @@ impl Session {
         ))
     }
 
+    #[inline]
     pub fn on_outer<'a>(
         &mut self,
         now: Instant,
@@ -199,6 +230,7 @@ impl Session {
         }
     }
 
+    #[inline]
     fn on_entry_outer<'a>(
         &mut self,
         now: Instant,
@@ -271,6 +303,7 @@ impl Session {
         None
     }
 
+    #[inline]
     fn on_exit_outer<'a>(
         &mut self,
         now: Instant,
@@ -340,15 +373,14 @@ impl Session {
             (_, State::Established) if now >= self.next_ping => {
                 self.next_ping = now + self.cfg.ping_interval;
                 self.nonce = self.nonce.wrapping_add(1);
-                let mut frame = [0u8; CTRL_LEN];
-                frame[0] = CTRL_PING;
-                frame[1..].copy_from_slice(&self.nonce.to_be_bytes());
+                let frame = Keepalive::new(CTRL_PING, self.nonce.to_be_bytes()).encode();
                 self.send_ctrl(flags::PSH | flags::ACK, &frame, out);
             }
             _ => {}
         }
     }
 
+    #[inline]
     pub fn next_deadline(&self) -> Instant {
         let dead = self.last_rx + self.cfg.dead_timeout;
         match self.state {
@@ -387,6 +419,7 @@ impl Session {
         );
     }
 
+    #[inline]
     fn on_segment<'a>(
         &mut self,
         now: Instant,
@@ -404,17 +437,17 @@ impl Session {
         }
         self.unacked = self.unacked.saturating_add(payload.len() as u32);
         match payload[0] >> 4 {
-            4 | 6 => {
+            pkt::ipv4::VERSION | pkt::ipv6::VERSION => {
                 if self.unacked >= ACK_THRESHOLD {
                     self.send_ctrl(flags::ACK, &[], out);
                 }
                 Some(payload)
             }
             0 if payload[0] == CTRL_PING && payload.len() >= CTRL_LEN => {
-                let mut pong = [0u8; CTRL_LEN];
-                pong[0] = CTRL_PONG;
-                pong[1..].copy_from_slice(&payload[1..CTRL_LEN]);
-                self.send_ctrl(flags::PSH | flags::ACK, &pong, out);
+                if let Some(ping) = Keepalive::decode(&payload[..CTRL_LEN]) {
+                    let pong = Keepalive::new(CTRL_PONG, ping.nonce).encode();
+                    self.send_ctrl(flags::PSH | flags::ACK, &pong, out);
+                }
                 None
             }
             _ => None,
@@ -578,6 +611,7 @@ impl Session {
         out.send(&self.scratch[..len], peer.ip());
     }
 
+    #[inline]
     fn send_ctrl(&mut self, tcp_flags: u8, payload: &[u8], out: &mut impl Sink) {
         let Some(peer) = self.peer else { return };
         let meta = self.meta(peer, tcp_flags);
@@ -601,6 +635,7 @@ impl Session {
         out.send(&self.scratch[..len], to.ip());
     }
 
+    #[inline(always)]
     fn meta(&self, peer: SocketAddr, tcp_flags: u8) -> TcpMeta {
         TcpMeta {
             src: self.local,
@@ -612,6 +647,7 @@ impl Session {
         }
     }
 
+    #[inline(always)]
     fn next_ip_id(&mut self) -> u16 {
         self.ip_id = self.ip_id.wrapping_add(1);
         self.ip_id

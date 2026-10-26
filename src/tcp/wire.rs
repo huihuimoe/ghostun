@@ -5,21 +5,54 @@ use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
 use crate::config::AuthKey;
+use crate::faketcp::pkt::{be16, is_valid_inner_ip, put_be16};
+use crate::sys;
 
+pub const FRAME_PREFIX_LEN: usize = 2;
 pub const TX_LIMIT: usize = 256 * 1024;
-pub const AUTH_MAX: usize = 65;
+pub const RX_LIMIT: usize = 64 * 1024;
 pub const PING: u8 = 0x10;
 pub const PONG: u8 = 0x11;
 
+const MSG_HELLO: u8 = 1;
+const MSG_CHALLENGE: u8 = 2;
+const MSG_PROOF: u8 = 3;
+const MSG_FINISHED: u8 = 4;
+const MSG_READY: u8 = 5;
+
+const HELLO_MAGIC: &[u8; 4] = b"GTCP";
+const PROTOCOL_VERSION: u8 = 1;
+const NONCE_LEN: usize = 32;
+const TAG_LEN: usize = 32;
+
+const OFF_HELLO_KIND: usize = 0;
+const OFF_HELLO_MAGIC: usize = 1;
+const OFF_HELLO_VERSION: usize = OFF_HELLO_MAGIC + HELLO_MAGIC.len();
+const OFF_HELLO_WORKER: usize = OFF_HELLO_VERSION + 1;
+const OFF_HELLO_CONNS: usize = OFF_HELLO_WORKER + 2;
+const OFF_HELLO_MTU: usize = OFF_HELLO_CONNS + 2;
+const OFF_HELLO_NONCE: usize = OFF_HELLO_MTU + 2;
+pub const HELLO_LEN: usize = OFF_HELLO_NONCE + NONCE_LEN;
+
+const CHALLENGE_PREFIX_LEN: usize = 1 + NONCE_LEN;
+pub const CHALLENGE_LEN: usize = CHALLENGE_PREFIX_LEN + TAG_LEN;
+pub const TAG_MSG_LEN: usize = 1 + TAG_LEN;
+pub const AUTH_MAX: usize = CHALLENGE_LEN;
+
+const TRANSCRIPT_PREFIX: &[u8; 14] = b"ghostun-tcp\x01\x01\x02";
+const OFF_TRANSCRIPT_HELLO: usize = TRANSCRIPT_PREFIX.len();
+const OFF_TRANSCRIPT_CHALLENGE: usize = OFF_TRANSCRIPT_HELLO + HELLO_LEN;
+const TRANSCRIPT_LEN: usize = OFF_TRANSCRIPT_CHALLENGE + CHALLENGE_PREFIX_LEN;
+
+const DOMAIN_EXIT: &[u8] = b"ghostun-tcp-v1/exit";
+const DOMAIN_ENTRY: &[u8] = b"ghostun-tcp-v1/entry";
+const DOMAIN_FINISHED: &[u8] = b"ghostun-tcp-v1/finished";
+const DOMAIN_READY: &[u8] = b"ghostun-tcp-v1/ready";
+
+#[inline]
 pub fn invalid(reason: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, reason)
 }
-
-pub fn random(bytes: &mut [u8]) -> io::Result<()> {
-    getrandom::fill(bytes).map_err(|_| io::Error::other("OS cryptographic randomness unavailable"))
-}
-
-pub const RX_LIMIT: usize = 64 * 1024;
 
 /// Decodes bounded frames; unauthenticated candidates stay single-frame until `grow`.
 pub struct Receive {
@@ -32,7 +65,7 @@ pub struct Receive {
 impl Receive {
     pub fn new(max: usize) -> Self {
         Self {
-            bytes: vec![0; max + 2],
+            bytes: vec![0; max + FRAME_PREFIX_LEN],
             head: 0,
             tail: 0,
             max,
@@ -41,20 +74,23 @@ impl Receive {
 
     pub fn grow(&mut self, max: usize) {
         self.max = max;
-        self.bytes.resize(RX_LIMIT.max(max + 2), 0);
+        self.bytes.resize(RX_LIMIT.max(max + FRAME_PREFIX_LEN), 0);
     }
 
+    #[inline(always)]
     fn frame_len(&self) -> Option<usize> {
-        (self.tail - self.head >= 2).then(|| {
-            u16::from_be_bytes([self.bytes[self.head], self.bytes[self.head + 1]]) as usize
+        (self.tail - self.head >= FRAME_PREFIX_LEN)
+            .then(|| usize::from(be16(&self.bytes, self.head)))
+    }
+
+    #[inline(always)]
+    pub fn ready(&self) -> bool {
+        self.frame_len().is_some_and(|len| {
+            len == 0 || len > self.max || self.tail - self.head >= FRAME_PREFIX_LEN + len
         })
     }
 
-    pub fn ready(&self) -> bool {
-        self.frame_len()
-            .is_some_and(|len| len == 0 || len > self.max || self.tail - self.head >= 2 + len)
-    }
-
+    #[inline]
     pub fn read(&mut self, input: &mut impl Read) -> io::Result<bool> {
         loop {
             let avail = self.tail - self.head;
@@ -62,16 +98,16 @@ impl Receive {
                 Some(len) if len == 0 || len > self.max => {
                     return Err(invalid("invalid framing: zero or oversized length"));
                 }
-                Some(len) if avail >= 2 + len => return Ok(true),
-                Some(len) => 2 + len,
-                None => 2,
+                Some(len) if avail >= FRAME_PREFIX_LEN + len => return Ok(true),
+                Some(len) => FRAME_PREFIX_LEN + len,
+                None => FRAME_PREFIX_LEN,
             };
-            if self.head > 0 && self.bytes.len() - self.tail < self.max + 2 {
+            if self.head > 0 && self.bytes.len() - self.tail < self.max + FRAME_PREFIX_LEN {
                 self.bytes.copy_within(self.head..self.tail, 0);
                 self.tail -= self.head;
                 self.head = 0;
             }
-            let end = if self.bytes.len() > self.max + 2 {
+            let end = if self.bytes.len() > self.max + FRAME_PREFIX_LEN {
                 self.bytes.len()
             } else {
                 self.head + need
@@ -86,13 +122,16 @@ impl Receive {
         }
     }
 
+    #[inline(always)]
     pub fn payload(&self) -> &[u8] {
         let len = self.frame_len().expect("complete frame");
-        &self.bytes[self.head + 2..self.head + 2 + len]
+        let start = self.head + FRAME_PREFIX_LEN;
+        &self.bytes[start..start + len]
     }
 
+    #[inline]
     pub fn clear(&mut self) {
-        self.head += 2 + self.frame_len().expect("complete frame");
+        self.head += FRAME_PREFIX_LEN + self.frame_len().expect("complete frame");
         if self.head == self.tail {
             self.head = 0;
             self.tail = 0;
@@ -108,18 +147,21 @@ pub struct SendQueue {
 }
 
 impl SendQueue {
+    #[inline(always)]
     pub fn bytes(&self) -> usize {
         self.tail - self.head
     }
 
+    #[inline(always)]
     pub fn room(&self, payload: usize) -> bool {
-        self.bytes() + payload + 2 <= TX_LIMIT
+        self.bytes() + payload + FRAME_PREFIX_LEN <= TX_LIMIT
     }
 
     pub fn grow(&mut self) {
         self.buf.resize(TX_LIMIT + 1, 0);
     }
 
+    #[inline]
     fn ensure(&mut self, space: usize) {
         if self.buf.len() - self.tail >= space {
             return;
@@ -138,18 +180,20 @@ impl SendQueue {
         }
     }
 
+    #[inline]
     pub fn push(&mut self, payload: &[u8]) -> bool {
         if !self.room(payload.len()) {
             return false;
         }
-        let frame = 2 + payload.len();
+        let frame = FRAME_PREFIX_LEN + payload.len();
         self.ensure(frame);
-        self.buf[self.tail..self.tail + 2].copy_from_slice(&(payload.len() as u16).to_be_bytes());
-        self.buf[self.tail + 2..self.tail + frame].copy_from_slice(payload);
+        put_be16(&mut self.buf, self.tail, payload.len() as u16);
+        self.buf[self.tail + FRAME_PREFIX_LEN..self.tail + frame].copy_from_slice(payload);
         self.tail += frame;
         true
     }
 
+    #[inline]
     pub fn push_in_place<F>(&mut self, max: usize, f: F) -> io::Result<bool>
     where
         F: FnOnce(&mut [u8]) -> io::Result<Option<usize>>,
@@ -157,16 +201,18 @@ impl SendQueue {
         if !self.room(max) {
             return Ok(false);
         }
-        self.ensure(max + 3);
-        let Some(len) = f(&mut self.buf[self.tail + 2..self.tail + 2 + max + 1])? else {
+        self.ensure(max + FRAME_PREFIX_LEN + 1);
+        let payload_start = self.tail + FRAME_PREFIX_LEN;
+        let Some(len) = f(&mut self.buf[payload_start..payload_start + max + 1])? else {
             return Ok(false);
         };
         assert!((1..=max).contains(&len));
-        self.buf[self.tail..self.tail + 2].copy_from_slice(&(len as u16).to_be_bytes());
-        self.tail += 2 + len;
+        put_be16(&mut self.buf, self.tail, len as u16);
+        self.tail += FRAME_PREFIX_LEN + len;
         Ok(true)
     }
 
+    #[inline]
     pub fn flush(&mut self, output: &mut impl Write) -> io::Result<()> {
         while self.head < self.tail {
             match output.write(&self.buf[self.head..self.tail]) {
@@ -194,52 +240,73 @@ pub struct Params {
     pub mtu: u16,
 }
 
+impl Params {
+    fn encode_hello(self) -> io::Result<[u8; HELLO_LEN]> {
+        let mut hello = [0; HELLO_LEN];
+        hello[OFF_HELLO_KIND] = MSG_HELLO;
+        hello[OFF_HELLO_MAGIC..OFF_HELLO_VERSION].copy_from_slice(HELLO_MAGIC);
+        hello[OFF_HELLO_VERSION] = PROTOCOL_VERSION;
+        put_be16(&mut hello, OFF_HELLO_WORKER, self.worker);
+        put_be16(&mut hello, OFF_HELLO_CONNS, self.conns);
+        put_be16(&mut hello, OFF_HELLO_MTU, self.mtu);
+        sys::random(&mut hello[OFF_HELLO_NONCE..])?;
+        Ok(hello)
+    }
+}
+
 pub fn hello_params(hello: &[u8]) -> io::Result<Params> {
-    if hello.len() != 44 || hello[0] != 1 || &hello[1..5] != b"GTCP" {
+    if hello.len() != HELLO_LEN
+        || hello[OFF_HELLO_KIND] != MSG_HELLO
+        || &hello[OFF_HELLO_MAGIC..OFF_HELLO_VERSION] != HELLO_MAGIC
+    {
         return Err(invalid("malformed authentication Hello"));
     }
-    if hello[5] != 1 {
+    if hello[OFF_HELLO_VERSION] != PROTOCOL_VERSION {
         return Err(invalid("unsupported TCP protocol version"));
     }
     Ok(Params {
-        worker: u16::from_be_bytes([hello[6], hello[7]]),
-        conns: u16::from_be_bytes([hello[8], hello[9]]),
-        mtu: u16::from_be_bytes([hello[10], hello[11]]),
+        worker: be16(hello, OFF_HELLO_WORKER),
+        conns: be16(hello, OFF_HELLO_CONNS),
+        mtu: be16(hello, OFF_HELLO_MTU),
     })
 }
 
-fn transcript(hello: &[u8]) -> [u8; 91] {
-    let mut buf = [0; 91];
-    buf[..14].copy_from_slice(b"ghostun-tcp\x01\x01\x02");
-    buf[14..58].copy_from_slice(hello);
+fn init_transcript(hello: &[u8]) -> [u8; TRANSCRIPT_LEN] {
+    let mut buf = [0; TRANSCRIPT_LEN];
+    buf[..OFF_TRANSCRIPT_HELLO].copy_from_slice(TRANSCRIPT_PREFIX);
+    buf[OFF_TRANSCRIPT_HELLO..OFF_TRANSCRIPT_CHALLENGE].copy_from_slice(hello);
     buf
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    WaitChallenge,
+    WaitEntryProof,
+    WaitFinished,
+    WaitReady,
+    Done,
 }
 
 pub struct Handshake {
     key: Hmac<Sha256>,
-    transcript: [u8; 91],
-    expected: u8,
+    transcript: [u8; TRANSCRIPT_LEN],
+    phase: Phase,
 }
 
 impl Handshake {
-    pub fn entry(key: &AuthKey, p: Params) -> io::Result<(Self, [u8; 44])> {
-        let mut hello = [0; 44];
-        hello[..6].copy_from_slice(b"\x01GTCP\x01");
-        hello[6..8].copy_from_slice(&p.worker.to_be_bytes());
-        hello[8..10].copy_from_slice(&p.conns.to_be_bytes());
-        hello[10..12].copy_from_slice(&p.mtu.to_be_bytes());
-        random(&mut hello[12..])?;
+    pub fn entry(key: &AuthKey, p: Params) -> io::Result<(Self, [u8; HELLO_LEN])> {
+        let hello = p.encode_hello()?;
         Ok((
             Self {
-                key: Hmac::new_from_slice(&key.0).unwrap(),
-                transcript: transcript(&hello),
-                expected: 2,
+                key: Hmac::new_from_slice(&key.0).expect("HMAC accepts a 32-byte key"),
+                transcript: init_transcript(&hello),
+                phase: Phase::WaitChallenge,
             },
             hello,
         ))
     }
 
-    pub fn exit(key: &AuthKey, p: Params, hello: &[u8]) -> io::Result<(Self, [u8; 65])> {
+    pub fn exit(key: &AuthKey, p: Params, hello: &[u8]) -> io::Result<(Self, [u8; CHALLENGE_LEN])> {
         let peer = hello_params(hello)?;
         if peer.worker != p.worker || peer.worker >= p.conns {
             return Err(invalid("invalid worker ID"));
@@ -247,17 +314,17 @@ impl Handshake {
         if peer.conns != p.conns || peer.mtu != p.mtu {
             return Err(invalid("incompatible peer conns or effective TUN MTU"));
         }
-        let mut challenge = [0; 65];
-        challenge[0] = 2;
-        random(&mut challenge[1..33])?;
-        let mut transcript = transcript(hello);
-        transcript[58..].copy_from_slice(&challenge[..33]);
+        let mut challenge = [0; CHALLENGE_LEN];
+        challenge[0] = MSG_CHALLENGE;
+        sys::random(&mut challenge[1..CHALLENGE_PREFIX_LEN])?;
+        let mut transcript = init_transcript(hello);
+        transcript[OFF_TRANSCRIPT_CHALLENGE..].copy_from_slice(&challenge[..CHALLENGE_PREFIX_LEN]);
         let auth = Self {
-            key: Hmac::new_from_slice(&key.0).unwrap(),
+            key: Hmac::new_from_slice(&key.0).expect("HMAC accepts a 32-byte key"),
             transcript,
-            expected: 3,
+            phase: Phase::WaitEntryProof,
         };
-        challenge[33..].copy_from_slice(&auth.tag(b"ghostun-tcp-v1/exit"));
+        challenge[CHALLENGE_PREFIX_LEN..].copy_from_slice(&auth.tag(DOMAIN_EXIT));
         Ok((auth, challenge))
     }
 
@@ -267,54 +334,68 @@ impl Handshake {
         mac.update(&self.transcript);
         mac
     }
-    fn tag(&self, domain: &[u8]) -> [u8; 32] {
+
+    fn tag(&self, domain: &[u8]) -> [u8; TAG_LEN] {
         self.mac(domain).finalize().into_bytes().into()
     }
-    pub fn done(&self) -> bool {
-        self.expected == 0
+
+    fn encode_tag_msg(&self, kind: u8, domain: &[u8]) -> [u8; TAG_MSG_LEN] {
+        let mut msg = [0; TAG_MSG_LEN];
+        msg[0] = kind;
+        msg[1..].copy_from_slice(&self.tag(domain));
+        msg
     }
 
-    pub fn receive(&mut self, payload: &[u8]) -> io::Result<Option<[u8; 33]>> {
-        let expected_len = if self.expected == 2 { 65 } else { 33 };
-        if payload.len() != expected_len || payload[0] != self.expected || self.done() {
+    #[inline(always)]
+    pub fn done(&self) -> bool {
+        self.phase == Phase::Done
+    }
+
+    pub fn receive(&mut self, payload: &[u8]) -> io::Result<Option<[u8; TAG_MSG_LEN]>> {
+        let (expected_kind, expected_len) = match self.phase {
+            Phase::WaitChallenge => (MSG_CHALLENGE, CHALLENGE_LEN),
+            Phase::WaitEntryProof => (MSG_PROOF, TAG_MSG_LEN),
+            Phase::WaitFinished => (MSG_FINISHED, TAG_MSG_LEN),
+            Phase::WaitReady => (MSG_READY, TAG_MSG_LEN),
+            Phase::Done => return Err(invalid("illegal authentication message or phase")),
+        };
+        if payload.len() != expected_len || payload[0] != expected_kind {
             return Err(invalid("illegal authentication message or phase"));
         }
-        let (domain, next, reply, reply_domain): (&[u8], u8, u8, &[u8]) = match self.expected {
-            2 => {
-                self.transcript[58..].copy_from_slice(&payload[..33]);
-                (b"ghostun-tcp-v1/exit", 4, 3, b"ghostun-tcp-v1/entry")
+        let (domain, next, reply) = match self.phase {
+            Phase::WaitChallenge => {
+                self.transcript[OFF_TRANSCRIPT_CHALLENGE..]
+                    .copy_from_slice(&payload[..CHALLENGE_PREFIX_LEN]);
+                (
+                    DOMAIN_EXIT,
+                    Phase::WaitFinished,
+                    Some((MSG_PROOF, DOMAIN_ENTRY)),
+                )
             }
-            3 => (b"ghostun-tcp-v1/entry", 5, 4, b"ghostun-tcp-v1/finished"),
-            4 => (b"ghostun-tcp-v1/finished", 0, 5, b"ghostun-tcp-v1/ready"),
-            5 => (b"ghostun-tcp-v1/ready", 0, 0, b""),
-            _ => return Err(invalid("illegal authentication phase")),
+            Phase::WaitEntryProof => (
+                DOMAIN_ENTRY,
+                Phase::WaitReady,
+                Some((MSG_FINISHED, DOMAIN_FINISHED)),
+            ),
+            Phase::WaitFinished => (
+                DOMAIN_FINISHED,
+                Phase::Done,
+                Some((MSG_READY, DOMAIN_READY)),
+            ),
+            Phase::WaitReady => (DOMAIN_READY, Phase::Done, None),
+            Phase::Done => unreachable!(),
         };
         self.mac(domain)
-            .verify_slice(&payload[payload.len() - 32..])
+            .verify_slice(&payload[payload.len() - TAG_LEN..])
             .map_err(|_| invalid("authentication proof verification failed"))?;
-        self.expected = next;
-        Ok((reply != 0).then(|| {
-            let mut msg = [0; 33];
-            msg[0] = reply;
-            msg[1..].copy_from_slice(&self.tag(reply_domain));
-            msg
-        }))
+        self.phase = next;
+        Ok(reply.map(|(kind, reply_domain)| self.encode_tag_msg(kind, reply_domain)))
     }
 }
 
+#[inline]
 pub fn validate_packet(p: &[u8], mtu: usize) -> io::Result<()> {
-    let valid = p.len() <= mtu
-        && match p.first().map(|v| v >> 4) {
-            Some(4) if p.len() >= 20 => {
-                let header = (p[0] & 15) as usize * 4;
-                header >= 20
-                    && header <= p.len()
-                    && u16::from_be_bytes([p[2], p[3]]) as usize == p.len()
-            }
-            Some(6) if p.len() >= 40 => u16::from_be_bytes([p[4], p[5]]) as usize + 40 == p.len(),
-            _ => false,
-        };
-    if valid {
+    if is_valid_inner_ip(p, mtu) {
         Ok(())
     } else {
         Err(invalid(

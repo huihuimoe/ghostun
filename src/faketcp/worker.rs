@@ -28,13 +28,6 @@ impl Sink for RawSink<'_> {
 }
 
 #[inline]
-fn read(fd: BorrowedFd<'_>, buf: &mut [u8]) -> Option<usize> {
-    // SAFETY: read(2) into a buffer of the stated length.
-    let n = unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
-    (n > 0).then_some(n as usize)
-}
-
-#[inline]
 fn apply_reload(
     ctrl: &Control,
     id: usize,
@@ -99,16 +92,8 @@ pub fn run(
     let mut bufs = vec![0u8; RAW_BATCH * stride];
     let mut lens = [0usize; RAW_BATCH];
     let mut fds = [
-        libc::pollfd {
-            fd: tun.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        },
-        libc::pollfd {
-            fd: raw.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        },
+        sys::pollfd(tun.as_raw_fd(), libc::POLLIN),
+        sys::pollfd(raw.as_raw_fd(), libc::POLLIN),
     ];
     let mut now = Instant::now();
     let mut busy = false;
@@ -121,17 +106,15 @@ pub fn run(
                 .next_deadline()
                 .saturating_duration_since(now)
                 .min(MAX_POLL);
-            // Round up so we never wake just before a deadline and spin.
-            wait.as_micros().div_ceil(1000) as libc::c_int
+            sys::poll_ms(wait)
         };
-        // SAFETY: fds is a valid array of two pollfd.
-        if unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout) } < 0 {
-            let e = std::io::Error::last_os_error();
-            if e.kind() != std::io::ErrorKind::Interrupted {
+        match sys::poll(&mut fds, timeout) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(e) => {
                 log::error!("worker {id}: poll: {e}");
                 break;
             }
-            continue;
         }
         if stop.load(Ordering::Relaxed) {
             break;
@@ -150,21 +133,10 @@ pub fn run(
                                 }
                                 let frame = &bufs[k * stride..k * stride + n];
                                 if let Some(inner) = session.on_outer(now, frame, &mut out) {
-                                    // SAFETY: write(2) of a slice of the stated length.
-                                    if unsafe {
-                                        libc::write(
-                                            tun.as_raw_fd(),
-                                            inner.as_ptr().cast(),
-                                            inner.len(),
-                                        )
-                                    } < 0
-                                    {
-                                        log::debug!(
-                                            "worker {id}: tun write: {}",
-                                            std::io::Error::last_os_error()
-                                        );
-                                    } else {
-                                        tun_ready = true;
+                                    match sys::tun_write(tun.as_fd(), inner) {
+                                        Ok(true) => tun_ready = true,
+                                        Ok(false) => {}
+                                        Err(e) => log::debug!("worker {id}: tun write: {e}"),
                                     }
                                 }
                             }
@@ -184,7 +156,7 @@ pub fn run(
                 let mut batch_dst = None;
                 while reads < RAW_BATCH {
                     let slot = &mut bufs[count * stride..(count + 1) * stride];
-                    let Some(n) = read(tun.as_fd(), &mut slot[overhead..]) else {
+                    let Ok(Some(n)) = sys::tun_read(tun.as_fd(), &mut slot[overhead..]) else {
                         break;
                     };
                     reads += 1;

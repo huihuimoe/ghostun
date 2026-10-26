@@ -1,4 +1,4 @@
-//! Outer IP + FakeTCP frame codec and classic BPF steering filters.
+//! Outer IP + FakeTCP frame codec, inner IP validation, and classic BPF steering filters.
 
 use crate::config::OuterFamily;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -6,7 +6,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 pub mod ipv4 {
     use std::net::Ipv4Addr;
 
+    pub const VERSION: u8 = 4;
     pub const HDR_LEN: usize = 20;
+    pub const MIN_MTU: u32 = 576;
     pub const OFF_VER_IHL: usize = 0;
     pub const OFF_TOS: usize = 1;
     pub const OFF_TOTAL_LEN: usize = 2;
@@ -31,18 +33,18 @@ pub mod ipv4 {
         #[inline]
         pub fn write_to(&self, buf: &mut [u8]) {
             let ip = &mut buf[..HDR_LEN];
-            ip[OFF_VER_IHL] = 0x45;
+            ip[OFF_VER_IHL] = (VERSION << 4) | ((HDR_LEN / 4) as u8);
             ip[OFF_TOS] = 0;
-            ip[OFF_TOTAL_LEN..OFF_TOTAL_LEN + 2].copy_from_slice(&self.total_len.to_be_bytes());
-            ip[OFF_ID..OFF_ID + 2].copy_from_slice(&self.id.to_be_bytes());
-            ip[OFF_FLAGS_FRAG..OFF_FLAGS_FRAG + 2].copy_from_slice(&0x4000u16.to_be_bytes()); // DF
+            super::put_be16(ip, OFF_TOTAL_LEN, self.total_len);
+            super::put_be16(ip, OFF_ID, self.id);
+            super::put_be16(ip, OFF_FLAGS_FRAG, 0x4000); // DF
             ip[OFF_TTL] = 64;
             ip[OFF_PROTO] = libc::IPPROTO_TCP as u8;
-            ip[OFF_CHECKSUM..OFF_CHECKSUM + 2].fill(0);
+            super::put_be16(ip, OFF_CHECKSUM, 0);
             ip[OFF_SRC..OFF_SRC + 4].copy_from_slice(&self.src.octets());
             ip[OFF_DST..OFF_DST + 4].copy_from_slice(&self.dst.octets());
             let csum = super::fold(super::sum16(ip, 0));
-            ip[OFF_CHECKSUM..OFF_CHECKSUM + 2].copy_from_slice(&csum.to_be_bytes());
+            super::put_be16(ip, OFF_CHECKSUM, csum);
         }
     }
 }
@@ -50,7 +52,9 @@ pub mod ipv4 {
 pub mod ipv6 {
     use std::net::Ipv6Addr;
 
+    pub const VERSION: u8 = 6;
     pub const HDR_LEN: usize = 40;
+    pub const MIN_MTU: u32 = 1280;
     pub const OFF_VER_TC_FLOW: usize = 0;
     pub const OFF_PAYLOAD_LEN: usize = 4;
     pub const OFF_NEXT_HDR: usize = 6;
@@ -70,9 +74,8 @@ pub mod ipv6 {
         #[inline]
         pub fn write_to(&self, buf: &mut [u8]) {
             let ip = &mut buf[..HDR_LEN];
-            ip[OFF_VER_TC_FLOW..OFF_VER_TC_FLOW + 4].copy_from_slice(&[0x60, 0, 0, 0]);
-            ip[OFF_PAYLOAD_LEN..OFF_PAYLOAD_LEN + 2]
-                .copy_from_slice(&self.payload_len.to_be_bytes());
+            ip[OFF_VER_TC_FLOW..OFF_VER_TC_FLOW + 4].copy_from_slice(&[VERSION << 4, 0, 0, 0]);
+            super::put_be16(ip, OFF_PAYLOAD_LEN, self.payload_len);
             ip[OFF_NEXT_HDR] = libc::IPPROTO_TCP as u8;
             ip[OFF_HOP_LIMIT] = 64;
             ip[OFF_SRC..OFF_SRC + 16].copy_from_slice(&self.src.octets());
@@ -109,9 +112,39 @@ pub const CTRL_PONG: u8 = 0x02;
 /// Type byte + 8-byte big-endian nonce.
 pub const CTRL_LEN: usize = 9;
 
-const SYN_OPTS: [u8; 12] = [2, 4, 0, 0, 1, 1, 4, 2, 1, 3, 3, 14];
+/// Zero-overhead keepalive frame (`[kind, nonce_be64]`) shared across transports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Keepalive {
+    pub kind: u8,
+    pub nonce: [u8; 8],
+}
+
+impl Keepalive {
+    #[inline(always)]
+    pub const fn new(kind: u8, nonce: [u8; 8]) -> Self {
+        Self { kind, nonce }
+    }
+
+    #[inline(always)]
+    pub fn decode(payload: &[u8]) -> Option<Self> {
+        let (&[kind], rest) = payload.split_first_chunk::<1>()?;
+        let nonce: [u8; 8] = rest.try_into().ok()?;
+        Some(Self { kind, nonce })
+    }
+
+    #[inline(always)]
+    pub fn encode(self) -> [u8; CTRL_LEN] {
+        let mut out = [0u8; CTRL_LEN];
+        out[0] = self.kind;
+        out[1..].copy_from_slice(&self.nonce);
+        out
+    }
+}
+
+const SYN_OPTS_TEMPLATE: [u8; 12] = [2, 4, 0, 0, 1, 1, 4, 2, 1, 3, 3, 14];
+const SYN_OPT_MSS_OFF: usize = 2;
 #[cfg(test)]
-pub const SYN_FRAME_LEN: usize = IPV4_HDR + TCP_HDR + SYN_OPTS.len();
+pub const SYN_FRAME_LEN: usize = IPV4_HDR + TCP_HDR + SYN_OPTS_TEMPLATE.len();
 
 pub mod flags {
     pub const SYN: u8 = 0x02;
@@ -134,20 +167,17 @@ impl TcpMeta {
     #[inline]
     pub fn write_to(&self, buf: &mut [u8], opts: &[u8], ihl: usize, tcp_len: usize) {
         let tcp_slice = &mut buf[ihl..ihl + tcp::HDR_LEN + opts.len()];
-        tcp_slice[tcp::OFF_SPORT..tcp::OFF_SPORT + 2]
-            .copy_from_slice(&self.src.port().to_be_bytes());
-        tcp_slice[tcp::OFF_DPORT..tcp::OFF_DPORT + 2]
-            .copy_from_slice(&self.dst.port().to_be_bytes());
-        tcp_slice[tcp::OFF_SEQ..tcp::OFF_SEQ + 4].copy_from_slice(&self.seq.to_be_bytes());
-        tcp_slice[tcp::OFF_ACK..tcp::OFF_ACK + 4].copy_from_slice(&self.ack.to_be_bytes());
+        put_be16(tcp_slice, tcp::OFF_SPORT, self.src.port());
+        put_be16(tcp_slice, tcp::OFF_DPORT, self.dst.port());
+        put_be32(tcp_slice, tcp::OFF_SEQ, self.seq);
+        put_be32(tcp_slice, tcp::OFF_ACK, self.ack);
         tcp_slice[tcp::OFF_DOFF] = (((tcp::HDR_LEN + opts.len()) / 4) as u8) << 4;
         tcp_slice[tcp::OFF_FLAGS] = self.flags;
-        tcp_slice[tcp::OFF_WINDOW..tcp::OFF_WINDOW + 2].copy_from_slice(&self.window.to_be_bytes());
+        put_be16(tcp_slice, tcp::OFF_WINDOW, self.window);
         tcp_slice[tcp::OFF_CHECKSUM..tcp::OFF_URGENT + 2].fill(0);
         tcp_slice[tcp::HDR_LEN..].copy_from_slice(opts);
         let csum = fold(tcp_pseudo_sum(buf, ihl, tcp_len));
-        buf[ihl + tcp::OFF_CHECKSUM..ihl + tcp::OFF_CHECKSUM + 2]
-            .copy_from_slice(&csum.to_be_bytes());
+        put_be16(&mut buf[ihl..], tcp::OFF_CHECKSUM, csum);
     }
 }
 
@@ -158,13 +188,33 @@ pub struct Parsed<'a> {
 }
 
 #[inline(always)]
-fn be16(b: &[u8], at: usize) -> u16 {
+pub fn be16(b: &[u8], at: usize) -> u16 {
     u16::from_be_bytes([b[at], b[at + 1]])
 }
 
 #[inline(always)]
-fn be32(b: &[u8], at: usize) -> u32 {
+pub fn be32(b: &[u8], at: usize) -> u32 {
     u32::from_be_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
+}
+
+#[inline(always)]
+pub fn put_be16(b: &mut [u8], at: usize, val: u16) {
+    b[at..at + 2].copy_from_slice(&val.to_be_bytes());
+}
+
+#[inline(always)]
+pub fn put_be32(b: &mut [u8], at: usize, val: u32) {
+    b[at..at + 4].copy_from_slice(&val.to_be_bytes());
+}
+
+#[inline(always)]
+pub fn be64(b: &[u8], at: usize) -> u64 {
+    u64::from_be_bytes(b[at..at + 8].try_into().unwrap())
+}
+
+#[inline(always)]
+pub fn put_be64(b: &mut [u8], at: usize, val: u64) {
+    b[at..at + 8].copy_from_slice(&val.to_be_bytes());
 }
 
 #[inline(always)]
@@ -172,11 +222,29 @@ fn ip_at(b: &[u8], at: usize) -> Ipv4Addr {
     Ipv4Addr::new(b[at], b[at + 1], b[at + 2], b[at + 3])
 }
 
+/// Validates that `p` is a well-formed IPv4 or IPv6 packet within `mtu`.
+#[inline]
+pub fn is_valid_inner_ip(p: &[u8], mtu: usize) -> bool {
+    p.len() <= mtu
+        && match p.first().map(|v| v >> 4) {
+            Some(ipv4::VERSION) if p.len() >= ipv4::HDR_LEN => {
+                let header = usize::from(p[ipv4::OFF_VER_IHL] & 0x0f) * 4;
+                header >= ipv4::HDR_LEN
+                    && header <= p.len()
+                    && usize::from(be16(p, ipv4::OFF_TOTAL_LEN)) == p.len()
+            }
+            Some(ipv6::VERSION) if p.len() >= ipv6::HDR_LEN => {
+                usize::from(be16(p, ipv6::OFF_PAYLOAD_LEN)) + ipv6::HDR_LEN == p.len()
+            }
+            _ => false,
+        }
+}
+
 /// Parses a complete outer frame. IPv6 raw receive reconstructs the base header from pktinfo.
 #[inline]
 pub fn parse(buf: &[u8]) -> Option<Parsed<'_>> {
     let (ihl, total, src, dst) = match buf.first()? >> 4 {
-        4 => {
+        ipv4::VERSION => {
             if buf.len() < ipv4::HDR_LEN || buf[ipv4::OFF_PROTO] != libc::IPPROTO_TCP as u8 {
                 return None;
             }
@@ -192,7 +260,7 @@ pub fn parse(buf: &[u8]) -> Option<Parsed<'_>> {
                 IpAddr::V4(ip_at(buf, ipv4::OFF_DST)),
             )
         }
-        6 => {
+        ipv6::VERSION => {
             if buf.len() < ipv6::HDR_LEN || buf[ipv6::OFF_NEXT_HDR] != libc::IPPROTO_TCP as u8 {
                 return None;
             }
@@ -259,7 +327,7 @@ fn fold(mut acc: u32) -> u16 {
 
 #[inline]
 fn tcp_pseudo_sum(frame: &[u8], ihl: usize, tcp_len: usize) -> u32 {
-    let addresses = if frame[0] >> 4 == 4 {
+    let addresses = if frame[0] >> 4 == ipv4::VERSION {
         &frame[ipv4::OFF_SRC..ipv4::OFF_DST + 4]
     } else {
         &frame[ipv6::OFF_SRC..ipv6::OFF_DST + 16]
@@ -276,7 +344,7 @@ pub fn ipv4_header_checksum_ok(frame: &[u8]) -> bool {
 
 #[cfg(test)]
 pub fn tcp_checksum_ok(frame: &[u8]) -> bool {
-    let (ihl, total) = if frame[0] >> 4 == 4 {
+    let (ihl, total) = if frame[0] >> 4 == ipv4::VERSION {
         (
             usize::from(frame[0] & 0x0f) * 4,
             usize::from(be16(frame, ipv4::OFF_TOTAL_LEN)),
@@ -345,8 +413,8 @@ pub fn write_headers(buf: &mut [u8], meta: &TcpMeta, payload_len: usize, ip_id: 
 /// SYN or SYN|ACK (per `meta.flags`) carrying MSS, SACK_PERM and Window Scale 14.
 #[inline]
 pub fn write_syn(buf: &mut [u8], meta: &TcpMeta, mss: u16, ip_id: u16) -> usize {
-    let mut opts = SYN_OPTS;
-    opts[2..4].copy_from_slice(&mss.to_be_bytes());
+    let mut opts = SYN_OPTS_TEMPLATE;
+    put_be16(&mut opts, SYN_OPT_MSS_OFF, mss);
     write_frame(buf, meta, &opts, 0, ip_id)
 }
 

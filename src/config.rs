@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
+use crate::faketcp::pkt::{ipv4, ipv6, tcp};
 use argh::{FromArgValue, FromArgs};
 use serde::Deserialize;
 
@@ -34,7 +35,8 @@ pub enum OuterFamily {
 }
 
 impl OuterFamily {
-    pub fn of(ip: IpAddr) -> Self {
+    #[inline(always)]
+    pub const fn of(ip: IpAddr) -> Self {
         if ip.is_ipv4() {
             Self::Ipv4
         } else {
@@ -42,10 +44,19 @@ impl OuterFamily {
         }
     }
 
-    pub fn overhead(self) -> usize {
+    #[inline(always)]
+    pub const fn overhead(self) -> usize {
         match self {
-            Self::Ipv4 => 40,
-            Self::Ipv6 => 60,
+            Self::Ipv4 => ipv4::HDR_LEN + tcp::HDR_LEN,
+            Self::Ipv6 => ipv6::HDR_LEN + tcp::HDR_LEN,
+        }
+    }
+
+    #[inline(always)]
+    pub const fn min_mtu(self) -> u32 {
+        match self {
+            Self::Ipv4 => ipv4::MIN_MTU,
+            Self::Ipv6 => ipv6::MIN_MTU,
         }
     }
 
@@ -189,19 +200,24 @@ pub struct Config {
 
 impl Config {
     /// Validates explicit and detected MTUs before any network resources are changed.
+    #[inline(always)]
+    const fn inner_min_mtu(&self) -> u32 {
+        if self.tun_ipv6.is_some() {
+            ipv6::MIN_MTU
+        } else {
+            ipv4::MIN_MTU
+        }
+    }
+
     pub fn resolve_tun_mtu(&self, outer_mtu: u32) -> Result<u32, String> {
         let overhead = self.outer_family.overhead() as u32;
-        let min_outer = if self.outer_family == OuterFamily::Ipv6 {
-            1280
-        } else {
-            576
-        };
+        let min_outer = self.outer_family.min_mtu();
         if !(min_outer..=65535).contains(&outer_mtu) {
             return Err(format!("outer MTU must be within {min_outer}..=65535"));
         }
         let available = outer_mtu - overhead;
         let mtu = self.tun_mtu.unwrap_or(available);
-        let minimum = if self.tun_ipv6.is_some() { 1280 } else { 576 };
+        let minimum = self.inner_min_mtu();
         if mtu < minimum || mtu > available {
             return Err(format!("TUN MTU {mtu} must be within {minimum}..={available} for outer MTU {outer_mtu} and {overhead}-byte encapsulation"));
         }
@@ -545,7 +561,7 @@ fn validate(c: &Config) -> Result<(), String> {
     if let Some(m) = c.outer_mtu {
         c.resolve_tun_mtu(m)?;
     } else if let Some(m) = c.tun_mtu {
-        let min = if c.tun_ipv6.is_some() { 1280 } else { 576 };
+        let min = c.inner_min_mtu();
         let max = 65535 - c.outer_family.overhead() as u32;
         if m < min || m > max {
             return Err(format!("`tun_mtu` must be within {min}..={max}"));

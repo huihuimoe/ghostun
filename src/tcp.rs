@@ -11,14 +11,19 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::config::{AuthKey, Config, Mode};
+use crate::faketcp::pkt::{Keepalive, CTRL_LEN};
+use crate::sys::{poll, poll_ms, pollfd, READ_READY, WRITE_READY};
 use crate::{sys, worker};
 use wire::{invalid, Handshake, Params, Receive, SendQueue, AUTH_MAX, PING, PONG};
 
 const ROUNDS: usize = 4;
 const BATCH: usize = 64;
+
+#[inline(always)]
+const fn can_io(pfd: libc::pollfd, event: i16, ready: i16) -> bool {
+    pfd.events & event == 0 || pfd.revents & ready != 0
+}
 const MAX_POLL: Duration = Duration::from_millis(50);
-const READ_READY: i16 = libc::POLLIN | libc::POLLERR | libc::POLLHUP;
-const WRITE_READY: i16 = libc::POLLOUT | libc::POLLERR | libc::POLLHUP;
 
 struct Connection {
     socket: TcpStream,
@@ -78,17 +83,19 @@ impl Connection {
         self.last_ping = self.since;
     }
 
+    #[inline]
     fn next_deadline(&self, ping: Duration, dead: Duration) -> Instant {
         if self.auth.is_some() {
             return self.since + dead;
         }
         let mut next = self.last_rx + dead;
-        if self.tx.room(9) {
+        if self.tx.room(CTRL_LEN) {
             next = next.min(self.last_ping + ping);
         }
         next
     }
 
+    #[inline]
     fn flush_tx(&mut self, sock_w: &mut bool) -> io::Result<()> {
         if self.tx.bytes() > 0 && *sock_w {
             self.tx.flush(&mut self.socket)?;
@@ -110,6 +117,7 @@ impl Connection {
         .map(drop)
     }
 
+    #[inline]
     fn pump_io(
         &mut self,
         tun: &OwnedFd,
@@ -144,13 +152,13 @@ impl Connection {
                         break;
                     }
                     let p = self.rx.payload();
-                    if p.len() == 9 && matches!(p[0], PING | PONG) {
-                        if p[0] == PING {
-                            if !self.tx.room(9) {
+                    if let Some(ka) = Keepalive::decode(p).filter(|k| matches!(k.kind, PING | PONG))
+                    {
+                        if ka.kind == PING {
+                            if !self.tx.room(CTRL_LEN) {
                                 break;
                             }
-                            let mut pong: [u8; 9] = p.try_into().unwrap();
-                            pong[0] = PONG;
+                            let pong = Keepalive::new(PONG, ka.nonce).encode();
                             self.tx.push(&pong);
                         }
                         self.rx.clear();
@@ -165,7 +173,7 @@ impl Connection {
                 if !tun_w {
                     break;
                 }
-                if !tun_write(tun, self.rx.payload())? {
+                if !sys::tun_write(tun.as_fd(), self.rx.payload())? {
                     tun_w = false;
                     break;
                 }
@@ -176,7 +184,7 @@ impl Connection {
             if tun_r {
                 for _ in 0..BATCH {
                     let pushed = self.tx.push_in_place(mtu, |buf| {
-                        let Some(n) = tun_read(tun, buf)? else {
+                        let Some(n) = sys::tun_read(tun.as_fd(), buf)? else {
                             return Ok(None);
                         };
                         wire::validate_packet(&buf[..n], mtu)?;
@@ -191,7 +199,7 @@ impl Connection {
                 }
             }
             self.flush_tx(&mut sock_w)?;
-            let rx_blocked_on_pong = self.rx.ready() && !self.tx.room(9);
+            let rx_blocked_on_pong = self.rx.ready() && !self.tx.room(CTRL_LEN);
             let more_rx = !self.tun_pending && !rx_blocked_on_pong && (sock_r || self.rx.ready());
             let more_tx = tun_r && self.tx.room(mtu);
             busy = more_rx || more_tx;
@@ -199,57 +207,15 @@ impl Connection {
                 break;
             }
         }
-        if now.duration_since(self.last_ping) >= ping && self.tx.room(9) {
-            let mut msg = [PING; 9];
-            wire::random(&mut msg[1..])?;
+        if now.duration_since(self.last_ping) >= ping && self.tx.room(CTRL_LEN) {
+            let mut nonce = [0u8; 8];
+            sys::random(&mut nonce)?;
+            let msg = Keepalive::new(PING, nonce).encode();
             self.tx.push(&msg);
             self.last_ping = now;
             self.flush_tx(&mut sock_w)?;
         }
         Ok(busy)
-    }
-}
-
-fn tun_read(tun: &OwnedFd, buf: &mut [u8]) -> io::Result<Option<usize>> {
-    // SAFETY: valid nonblocking descriptor and writable buffer of the supplied length.
-    let n = unsafe { libc::read(tun.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
-    if n < 0 {
-        let e = io::Error::last_os_error();
-        if matches!(
-            e.kind(),
-            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-        ) {
-            Ok(None)
-        } else {
-            Err(e)
-        }
-    } else if n == 0 {
-        Err(io::ErrorKind::UnexpectedEof.into())
-    } else {
-        Ok(Some(n as usize))
-    }
-}
-
-fn tun_write(tun: &OwnedFd, packet: &[u8]) -> io::Result<bool> {
-    // SAFETY: valid descriptor and readable packet slice. TUN writes preserve packet boundaries.
-    let n = unsafe { libc::write(tun.as_raw_fd(), packet.as_ptr().cast(), packet.len()) };
-    if n == packet.len() as isize {
-        return Ok(true);
-    }
-    if n >= 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::WriteZero,
-            "short TUN packet write",
-        ));
-    }
-    let e = io::Error::last_os_error();
-    if matches!(
-        e.kind(),
-        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-    ) {
-        Ok(false)
-    } else {
-        Err(e)
     }
 }
 
@@ -612,7 +578,7 @@ impl Worker {
             if !established && can_io(fds[0], libc::POLLIN, READ_READY) {
                 let mut drained = 0;
                 while drained < ROUNDS * BATCH {
-                    match tun_read(&self.tun, &mut packet) {
+                    match sys::tun_read(self.tun.as_fd(), &mut packet) {
                         Ok(Some(_)) => drained += 1,
                         Ok(None) => break,
                         Err(e) => {
@@ -661,7 +627,7 @@ impl Worker {
     fn retry(&self, backoff: &mut Backoff, stable: bool) -> Instant {
         let mut bytes = [0; 4];
         // Failure to obtain retry jitter must not produce a rapid reconnect loop.
-        let delay = match wire::random(&mut bytes) {
+        let delay = match sys::random(&mut bytes) {
             Ok(()) => backoff.delay(u32::from_ne_bytes(bytes), stable),
             Err(e) => {
                 log::error!("tcp worker {}: retry randomness: {e}", self.id);
@@ -675,28 +641,4 @@ impl Worker {
         );
         Instant::now() + delay
     }
-}
-
-fn pollfd(fd: i32, events: i16) -> libc::pollfd {
-    libc::pollfd {
-        fd,
-        events,
-        revents: 0,
-    }
-}
-fn can_io(pfd: libc::pollfd, event: i16, ready: i16) -> bool {
-    pfd.events & event == 0 || pfd.revents & ready != 0
-}
-fn poll_ms(wait: Duration) -> libc::c_int {
-    wait.as_micros().div_ceil(1000) as libc::c_int
-}
-fn poll(fds: &mut [libc::pollfd], timeout: i32) -> io::Result<()> {
-    // SAFETY: valid pollfd array for the supplied count.
-    if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) } < 0 {
-        let e = io::Error::last_os_error();
-        if e.kind() != io::ErrorKind::Interrupted {
-            return Err(e);
-        }
-    }
-    Ok(())
 }

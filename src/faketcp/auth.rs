@@ -9,8 +9,9 @@ use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
 
-use super::pkt::TcpMeta;
+use super::pkt::{be64, put_be64, TcpMeta};
 use crate::config::{AuthKey, Mode};
+use crate::sys;
 
 pub const CONTROL: u8 = 3;
 const VERSION: u8 = 1;
@@ -18,10 +19,27 @@ pub(crate) const HELLO: u8 = 1;
 pub(crate) const CHALLENGE: u8 = 2;
 pub(crate) const PROOF: u8 = 3;
 pub(crate) const FINISHED: u8 = 4;
-pub const HELLO_LEN: usize = 35;
-const CHALLENGE_LEN: usize = 147;
-pub const PROOF_LEN: usize = 179;
-const FINISHED_LEN: usize = 43;
+
+const HDR_LEN: usize = 3;
+const TICKET_LEN: usize = 8;
+const NONCE_LEN: usize = 32;
+const TAG_LEN: usize = 32;
+
+const OFF_KIND: usize = 2;
+const OFF_TICKET: usize = HDR_LEN;
+const OFF_ISSUED: usize = OFF_TICKET + TICKET_LEN;
+const OFF_ENTRY_NONCE: usize = OFF_ISSUED + 8;
+const OFF_EXIT_NONCE: usize = OFF_ENTRY_NONCE + NONCE_LEN;
+const OFF_COOKIE: usize = OFF_EXIT_NONCE + NONCE_LEN;
+const OFF_EXIT_TAG: usize = OFF_COOKIE + TAG_LEN;
+const OFF_ENTRY_TAG: usize = OFF_EXIT_TAG + TAG_LEN;
+const OFF_FINISHED_TAG: usize = OFF_TICKET + TICKET_LEN;
+
+pub const HELLO_LEN: usize = HDR_LEN + NONCE_LEN;
+const CHALLENGE_LEN: usize = OFF_EXIT_TAG + TAG_LEN;
+pub const PROOF_LEN: usize = OFF_ENTRY_TAG + TAG_LEN;
+const FINISHED_LEN: usize = OFF_FINISHED_TAG + TAG_LEN;
+
 const ENTRY_BYTES: u32 = (HELLO_LEN + PROOF_LEN) as u32;
 pub(crate) const EXIT_BYTES: u32 = (CHALLENGE_LEN + FINISHED_LEN) as u32;
 const EXIT_DOMAIN: &[u8] = b"ghostun-auth-v1/exit";
@@ -81,19 +99,21 @@ pub struct Auth {
     timeout: Duration,
 }
 
-fn random(bytes: &mut [u8]) -> io::Result<()> {
-    getrandom::fill(bytes).map_err(|_| io::Error::other("OS cryptographic randomness unavailable"))
+#[inline]
+fn header(kind: u8) -> [u8; HDR_LEN] {
+    [CONTROL, VERSION, kind]
 }
 
+#[inline]
 fn is_message(payload: &[u8], kind: u8, len: usize) -> bool {
-    payload.len() == len && payload[..3] == [CONTROL, VERSION, kind]
+    payload.len() == len && payload[..HDR_LEN] == header(kind)
 }
 
 impl Auth {
     pub fn new(key: &AuthKey, mode: Mode, now: Instant, timeout: Duration) -> io::Result<Self> {
         let server = if mode == Mode::Exit {
-            let mut secret = [0; 32];
-            random(&mut secret)?;
+            let mut secret = [0; NONCE_LEN];
+            sys::random(&mut secret)?;
             Some(Server {
                 cookie_key: HmacSha256::new_from_slice(&secret)
                     .expect("HMAC accepts a 32-byte key"),
@@ -125,8 +145,8 @@ impl Auth {
 
     pub fn begin_entry(&mut self, seq: u32) -> io::Result<()> {
         let mut frame = [0; PROOF_LEN];
-        frame[..3].copy_from_slice(&[CONTROL, VERSION, HELLO]);
-        random(&mut frame[3..HELLO_LEN])?;
+        frame[..HDR_LEN].copy_from_slice(&header(HELLO));
+        sys::random(&mut frame[HDR_LEN..HELLO_LEN])?;
         self.entry = Some(EntryState {
             frame,
             len: HELLO_LEN,
@@ -135,6 +155,7 @@ impl Auth {
         Ok(())
     }
 
+    #[inline]
     pub fn pending(&self) -> Option<(u32, &[u8])> {
         self.entry.as_ref().map(|p| (p.seq, &p.frame[..p.len]))
     }
@@ -156,7 +177,7 @@ impl Auth {
             if m.seq != irs.wrapping_add(1) || m.ack != snd_nxt {
                 return None;
             }
-            let proof = self.proof(isns, &pending.frame[3..HELLO_LEN], payload)?;
+            let proof = self.proof(isns, &pending.frame[HDR_LEN..HELLO_LEN], payload)?;
             self.entry = Some(EntryState {
                 frame: proof,
                 len: PROOF_LEN,
@@ -257,34 +278,38 @@ impl Auth {
         };
         server.next_ticket = ticket;
         let mut frame = [0; CHALLENGE_LEN];
-        frame[..3].copy_from_slice(&[CONTROL, VERSION, CHALLENGE]);
-        frame[3..11].copy_from_slice(&ticket.to_be_bytes());
-        frame[11..19].copy_from_slice(
-            &(now.saturating_duration_since(self.origin).as_millis() as u64).to_be_bytes(),
-        );
-        frame[19..51].copy_from_slice(&payload[3..]);
-        random(&mut frame[51..83])?;
-        let cookie = cookie_mac(&server.cookie_key, meta, isns, &frame[3..83])
+        frame[..HDR_LEN].copy_from_slice(&header(CHALLENGE));
+        put_be64(&mut frame, OFF_TICKET, ticket);
+        let issued_ms = now.saturating_duration_since(self.origin).as_millis() as u64;
+        put_be64(&mut frame, OFF_ISSUED, issued_ms);
+        frame[OFF_ENTRY_NONCE..OFF_EXIT_NONCE].copy_from_slice(&payload[HDR_LEN..]);
+        sys::random(&mut frame[OFF_EXIT_NONCE..OFF_COOKIE])?;
+        let cookie = cookie_mac(&server.cookie_key, meta, isns, &frame[HDR_LEN..OFF_COOKIE])
             .finalize()
             .into_bytes();
-        frame[83..115].copy_from_slice(cookie.as_ref());
-        let tag = self.sign(EXIT_DOMAIN, isns, &frame[3..115]);
-        frame[115..].copy_from_slice(tag.as_ref());
+        frame[OFF_COOKIE..OFF_EXIT_TAG].copy_from_slice(cookie.as_ref());
+        let tag = self.sign(EXIT_DOMAIN, isns, &frame[HDR_LEN..OFF_EXIT_TAG]);
+        frame[OFF_EXIT_TAG..].copy_from_slice(tag.as_ref());
         Ok(Some(frame))
     }
 
     fn proof(&self, isns: Isns, nonce: &[u8], challenge: &[u8]) -> Option<[u8; PROOF_LEN]> {
         if !is_message(challenge, CHALLENGE, CHALLENGE_LEN)
-            || challenge[19..51] != *nonce
-            || !self.verify(EXIT_DOMAIN, isns, &challenge[3..115], &challenge[115..])
+            || challenge[OFF_ENTRY_NONCE..OFF_EXIT_NONCE] != *nonce
+            || !self.verify(
+                EXIT_DOMAIN,
+                isns,
+                &challenge[HDR_LEN..OFF_EXIT_TAG],
+                &challenge[OFF_EXIT_TAG..],
+            )
         {
             return None;
         }
         let mut frame = [0; PROOF_LEN];
         frame[..CHALLENGE_LEN].copy_from_slice(challenge);
-        frame[2] = PROOF;
-        let tag = self.sign(ENTRY_DOMAIN, isns, &challenge[3..115]);
-        frame[CHALLENGE_LEN..].copy_from_slice(tag.as_ref());
+        frame[OFF_KIND] = PROOF;
+        let tag = self.sign(ENTRY_DOMAIN, isns, &challenge[HDR_LEN..OFF_EXIT_TAG]);
+        frame[OFF_ENTRY_TAG..].copy_from_slice(tag.as_ref());
         Some(frame)
     }
 
@@ -293,11 +318,11 @@ impl Auth {
         if !is_message(proof, PROOF, PROOF_LEN) {
             return None;
         }
-        let ticket = u64::from_be_bytes(proof[3..11].try_into().unwrap());
+        let ticket = be64(proof, OFF_TICKET);
         if ticket <= self.server.as_ref()?.accepted {
             return None;
         }
-        let issued = u64::from_be_bytes(proof[11..19].try_into().unwrap());
+        let issued = be64(proof, OFF_ISSUED);
         let elapsed = now.saturating_duration_since(self.origin).as_millis();
         if u128::from(issued) > elapsed
             || elapsed - u128::from(issued) > self.timeout.as_millis() * 2
@@ -308,18 +333,30 @@ impl Auth {
             entry: meta.seq.wrapping_sub(1 + HELLO_LEN as u32),
             exit: meta.ack.wrapping_sub(1 + CHALLENGE_LEN as u32),
         };
-        if cookie_mac(&self.server.as_ref()?.cookie_key, meta, isns, &proof[3..83])
-            .verify_slice(&proof[83..115])
-            .is_err()
-            || !self.verify(EXIT_DOMAIN, isns, &proof[3..115], &proof[115..147])
-            || !self.verify(ENTRY_DOMAIN, isns, &proof[3..115], &proof[147..])
+        let transcript = &proof[HDR_LEN..OFF_EXIT_TAG];
+        if cookie_mac(
+            &self.server.as_ref()?.cookie_key,
+            meta,
+            isns,
+            &proof[HDR_LEN..OFF_COOKIE],
+        )
+        .verify_slice(&proof[OFF_COOKIE..OFF_EXIT_TAG])
+        .is_err()
+            || !self.verify(
+                EXIT_DOMAIN,
+                isns,
+                transcript,
+                &proof[OFF_EXIT_TAG..OFF_ENTRY_TAG],
+            )
+            || !self.verify(ENTRY_DOMAIN, isns, transcript, &proof[OFF_ENTRY_TAG..])
         {
             return None;
         }
         let mut finished = [0; FINISHED_LEN];
-        finished[..3].copy_from_slice(&[CONTROL, VERSION, FINISHED]);
-        finished[3..11].copy_from_slice(&ticket.to_be_bytes());
-        finished[11..].copy_from_slice(self.sign(FINISHED_DOMAIN, isns, &proof[3..115]).as_ref());
+        finished[..HDR_LEN].copy_from_slice(&header(FINISHED));
+        put_be64(&mut finished, OFF_TICKET, ticket);
+        finished[OFF_FINISHED_TAG..]
+            .copy_from_slice(self.sign(FINISHED_DOMAIN, isns, transcript).as_ref());
         self.server.as_mut()?.accepted = ticket;
         self.completion = Some(Completion {
             request: *meta,
@@ -337,8 +374,13 @@ impl Auth {
 
     fn finished(&self, isns: Isns, proof: &[u8; PROOF_LEN], payload: &[u8]) -> bool {
         is_message(payload, FINISHED, FINISHED_LEN)
-            && payload[3..11] == proof[3..11]
-            && self.verify(FINISHED_DOMAIN, isns, &proof[3..115], &payload[11..])
+            && payload[OFF_TICKET..OFF_FINISHED_TAG] == proof[OFF_TICKET..OFF_FINISHED_TAG]
+            && self.verify(
+                FINISHED_DOMAIN,
+                isns,
+                &proof[HDR_LEN..OFF_EXIT_TAG],
+                &payload[OFF_FINISHED_TAG..],
+            )
     }
 
     fn mac(&self, domain: &[u8], isns: Isns, body: &[u8]) -> HmacSha256 {
@@ -351,7 +393,7 @@ impl Auth {
         mac
     }
 
-    fn sign(&self, domain: &[u8], isns: Isns, body: &[u8]) -> [u8; 32] {
+    fn sign(&self, domain: &[u8], isns: Isns, body: &[u8]) -> [u8; TAG_LEN] {
         self.mac(domain, isns, body).finalize().into_bytes().into()
     }
 

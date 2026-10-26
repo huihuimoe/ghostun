@@ -6,6 +6,8 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use crate::config::{Cidr, Mode, OuterFamily, Transport};
 use crate::sys::{self, SOCKET_MARK};
 
+use crate::config::Config;
+
 #[derive(Clone, Debug)]
 pub struct NftSpec {
     pub mode: Mode,
@@ -22,6 +24,24 @@ pub struct NftSpec {
     pub out_iface: Option<String>,
     /// Exit: masquerade inner subnets on non-TUN egress.
     pub masq: bool,
+}
+
+impl NftSpec {
+    pub fn from_config(cfg: &Config, listen_port: u16) -> Self {
+        Self {
+            mode: cfg.mode,
+            transport: cfg.transport,
+            outer_family: cfg.outer_family,
+            tun_name: cfg.tun_name.clone(),
+            remote: cfg.remote,
+            base_port: cfg.base_port,
+            listen_port,
+            inner_v4: cfg.tun_ipv4,
+            inner_v6: cfg.tun_ipv6,
+            out_iface: cfg.iface.clone(),
+            masq: cfg.masq,
+        }
+    }
 }
 
 pub fn table_name(tun_name: &str) -> String {
