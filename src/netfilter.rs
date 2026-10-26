@@ -1,7 +1,7 @@
 //! Dedicated per-instance nftables table: conntrack/TCP-input bypass, RST suppression, MSS clamping, exit masquerade.
 
 use std::io;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use crate::config::{Cidr, Mode, OuterFamily, Transport};
 use crate::sys::{self, SOCKET_MARK};
@@ -17,11 +17,12 @@ pub struct NftSpec {
     /// Entry: exit node outer address.
     pub remote: Option<SocketAddr>,
     pub base_port: u16,
+    pub listen_ip: Option<IpAddr>,
     pub listen_port: u16,
     pub inner_v4: Cidr<Ipv4Addr>,
     pub inner_v6: Option<Cidr<Ipv6Addr>>,
-    /// Exit: restrict masquerade to this egress interface.
-    pub out_iface: Option<String>,
+    /// Exit: restrict outer rules and masquerade to this interface.
+    pub iface: Option<String>,
     /// Exit: masquerade inner subnets on non-TUN egress.
     pub masq: bool,
 }
@@ -35,10 +36,11 @@ impl NftSpec {
             tun_name: cfg.tun_name.clone(),
             remote: cfg.remote,
             base_port: cfg.base_port,
+            listen_ip: cfg.listen_ip,
             listen_port,
             inner_v4: cfg.tun_ipv4,
             inner_v6: cfg.tun_ipv6,
-            out_iface: cfg.iface.clone(),
+            iface: cfg.iface.clone(),
             masq: cfg.masq,
         }
     }
@@ -65,8 +67,13 @@ pub fn render(spec: &NftSpec) -> String {
         OuterFamily::Ipv4 => ("ipv4", "ip"),
         OuterFamily::Ipv6 => ("ipv6", "ip6"),
     };
+    let oif = spec
+        .iface
+        .as_ref()
+        .map(|i| format!(r#" oifname "{i}""#))
+        .unwrap_or_default();
     // Non-TUN outer frames bypass conntrack and local TCP input (tcp_v4/v6_rcv discard pkt_type != PACKET_HOST).
-    let (outer_in, outer_out) = match spec.mode {
+    let (outer_in, outer_out, in_iif) = match spec.mode {
         Mode::Entry => {
             let r = spec.remote.expect("entry netfilter spec requires remote");
             (
@@ -82,21 +89,31 @@ pub fn render(spec: &NftSpec) -> String {
                     r.port(),
                     spec.base_port
                 ),
+                format!(r#"iifname != "{tun}""#),
             )
         }
-        Mode::Exit => (
-            format!("meta nfproto {proto} tcp dport {}", spec.listen_port),
-            format!("meta nfproto {proto} tcp sport {}", spec.listen_port),
-        ),
+        Mode::Exit => {
+            let (in_ip, out_ip) = match spec.listen_ip {
+                Some(ip) => (format!("{addr} daddr {ip}"), format!("{addr} saddr {ip}")),
+                None => (
+                    format!("meta nfproto {proto}"),
+                    format!("meta nfproto {proto}"),
+                ),
+            };
+            let iif = match &spec.iface {
+                Some(dev) => format!(r#"iifname "{dev}""#),
+                None => format!(r#"iifname != "{tun}""#),
+            };
+            (
+                format!("{in_ip} tcp dport {}", spec.listen_port),
+                format!("{out_ip} tcp sport {}{oif}", spec.listen_port),
+                iif,
+            )
+        }
     };
     let clamp = "tcp flags syn tcp option maxseg size set rt mtu";
     let mark = format!("{SOCKET_MARK:#x}");
     let postrouting = if spec.mode == Mode::Exit && spec.masq {
-        let oif = spec
-            .out_iface
-            .as_ref()
-            .map(|i| format!(r#" oifname "{i}""#))
-            .unwrap_or_default();
         let v4 = spec.inner_v4.network();
         let v6 = spec
             .inner_v6
@@ -122,7 +139,7 @@ pub fn render(spec: &NftSpec) -> String {
         format!(
             r#"chain prerouting {{
         type filter hook prerouting priority raw; policy accept;
-        {outer_in} iifname != "{tun}" notrack meta pkttype set other
+        {outer_in} {in_iif} notrack meta pkttype set other
     }}
     chain output {{
         type filter hook output priority raw; policy accept;
@@ -210,21 +227,22 @@ mod tests {
             tun_name: "ghostun0".into(),
             remote: None,
             base_port: 30000,
+            listen_ip: None,
             listen_port: 443,
             inner_v4: "10.200.0.2/30".parse().unwrap(),
             inner_v6: Some("fd00:200::2/126".parse().unwrap()),
-            out_iface: Some("eth0".into()),
+            iface: Some("eth0".into()),
             masq: true,
         };
         let rules = render(&spec);
         assert!(
             rules.contains(
-                r#"meta nfproto ipv4 tcp dport 443 iifname != "ghostun0" notrack meta pkttype set other"#
+                r#"meta nfproto ipv4 tcp dport 443 iifname "eth0" notrack meta pkttype set other"#
             ),
             "{rules}"
         );
         assert!(
-            rules.contains("meta nfproto ipv4 tcp sport 443 notrack accept"),
+            rules.contains(r#"meta nfproto ipv4 tcp sport 443 oifname "eth0" notrack accept"#),
             "{rules}"
         );
         assert!(
@@ -234,6 +252,19 @@ mod tests {
             "{rules}"
         );
 
+        spec.listen_ip = Some("198.51.100.20".parse().unwrap());
+        spec.iface = None;
+        let ip_rules = render(&spec);
+        assert!(
+            ip_rules.contains(
+                r#"ip daddr 198.51.100.20 tcp dport 443 iifname != "ghostun0" notrack meta pkttype set other"#
+            ),
+            "{ip_rules}"
+        );
+        assert!(
+            ip_rules.contains("ip saddr 198.51.100.20 tcp sport 443 notrack accept"),
+            "{ip_rules}"
+        );
         spec.masq = false;
         for transport in [Transport::Faketcp, Transport::Tcp] {
             spec.transport = transport;

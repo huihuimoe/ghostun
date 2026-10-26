@@ -42,7 +42,7 @@ fn resolve_outer(cfg: &Config) -> Result<Outer, String> {
             (route.src, Some(route.dev))
         }
         _ => (
-            cfg.outer_family.unspecified(),
+            cfg.exit_ip(),
             cfg.iface
                 .clone()
                 .or_else(|| sys::default_route_dev(cfg.outer_family).ok()),
@@ -135,11 +135,14 @@ fn run(mut cfg: Config) -> Result<(), String> {
             Mode::Entry => {
                 faketcp::entry_filter(cfg.remote.expect("validated"), cfg.base_port, cfg.conns, id)
             }
-            Mode::Exit => faketcp::exit_filter(cfg.outer_family, listen_port, cfg.conns, id),
+            Mode::Exit => {
+                faketcp::exit_filter(cfg.outer_family, cfg.listen_ip, listen_port, cfg.conns, id)
+            }
         };
-        let bind_dev = (cfg.mode == Mode::Entry)
-            .then_some(outer.dev.as_deref())
-            .flatten();
+        let bind_dev = match cfg.mode {
+            Mode::Entry => outer.dev.as_deref(),
+            Mode::Exit => cfg.iface.as_deref(),
+        };
         let raw = sys::raw_socket(cfg.outer_family, bind_dev, &filter)
             .map_err(|e| format!("raw socket: {e}"))?;
         let scfg = SessionConfig::from_config(&cfg, outer.local_ip, listen_port, id, mss);

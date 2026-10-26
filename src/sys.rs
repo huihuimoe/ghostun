@@ -332,7 +332,7 @@ impl SockAddr {
 }
 
 /// Binds a single-family kernel listener; IPv6 never silently accepts IPv4-mapped peers.
-pub fn tcp_listener(addr: SocketAddr) -> io::Result<TcpListener> {
+pub fn tcp_listener(addr: SocketAddr, dev: Option<&str>) -> io::Result<TcpListener> {
     let domain = if addr.is_ipv4() {
         libc::AF_INET
     } else {
@@ -341,6 +341,7 @@ pub fn tcp_listener(addr: SocketAddr) -> io::Result<TcpListener> {
     // SAFETY: socket returns an owned descriptor or an error.
     let fd = unsafe { libc::socket(domain, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
     let fd = unsafe { OwnedFd::from_raw_fd(cvt(fd)?) };
+    bind_to_device(&fd, dev)?;
     setsockopt(&fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, &1i32)?;
     if addr.is_ipv6() {
         setsockopt(&fd, libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, &1i32)?;

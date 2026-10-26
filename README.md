@@ -107,8 +107,8 @@ ghostun [options] [entry|exit]
 | `--transport faketcp\|tcp` | `faketcp` | One outer transport per instance; restart to change |
 | `--config PATH` | — | TOML configuration file (required for `auth_key`) |
 | `--remote IP:PORT` | — | Entry only: Exit outer address (IP literal) |
-| `--listen PORT` | — | Exit only: outer listen port |
-| `--outer-family ipv4\|ipv6` | `ipv4` | Exit only: outer transport family (Entry derives it from `--remote`) |
+| `--listen [IP:]PORT` | — | Exit only: outer listen port or `IP:PORT` |
+| `--outer-family ipv4\|ipv6` | `ipv4` | Exit only: outer transport family (inferred when `--listen` includes an IP) |
 | `--conns N` | CPU count | Number of pinned workers and outer connections (`1..=256`) |
 | `--cpus LIST` | all usable CPUs | Worker CPU list or ranges (e.g. `0,1` or `2-3`) |
 | `--tun NAME` | `ghostun0` | Inner TUN device name (`[A-Za-z0-9_.-]`, up to 15 chars) |
@@ -117,7 +117,7 @@ ghostun [options] [entry|exit]
 | `--no-ipv6` | off | Disable inner IPv6 |
 | `--outer-mtu MTU` | egress MTU or `1500` | Outer path MTU |
 | `--tun-mtu MTU` | `outer_mtu - 40` / `- 60` | Inner TUN MTU (IPv4 / IPv6 outer overhead) |
-| `--iface IFACE` | route lookup | Outer egress interface |
+| `--iface IFACE` | route lookup | Outer interface (Entry egress; Exit socket bind and masquerade) |
 | `--base-port PORT` | `32768` | FakeTCP Entry source-port pool; TCP warns and ignores explicit values |
 | `--ping-interval SECS` | `5` | Health probe interval |
 | `--dead-timeout SECS` | `15` | Silence timeout before reconnecting |

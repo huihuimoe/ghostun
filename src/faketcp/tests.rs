@@ -1055,3 +1055,28 @@ fn reload_updates_timers_in_place_and_rotates_session_on_key_change() {
     let data = encap(&mut p.entry, &inner, 40).unwrap();
     assert_eq!(p.exit.on_outer(p.t, &data, &mut w), Some(&inner[..]));
 }
+
+#[test]
+fn exit_bound_ip_ignores_other_local_addresses_while_wildcard_accepts_any() {
+    let t = Instant::now();
+    let other_exit: SocketAddr = "198.51.100.21:443".parse().unwrap();
+    let mut entry_cfg = cfg(Mode::Entry, 0, 1);
+    entry_cfg.remote = Some(other_exit);
+    let mut entry = Session::new(entry_cfg, t, 1).unwrap();
+    let mut bound_exit = Session::new(cfg(Mode::Exit, 0, 1), t, 2).unwrap();
+
+    let mut w = Wire::default();
+    entry.start(t, &mut w);
+    let syn = w.take().pop().unwrap();
+
+    // Bound exit (198.51.100.20) ignores SYN targeting 198.51.100.21:443.
+    assert!(bound_exit.on_outer(t, &syn, &mut w).is_none());
+    assert!(w.take().is_empty());
+
+    // Wildcard exit (0.0.0.0) accepts SYN targeting 198.51.100.21:443.
+    let mut wild_cfg = cfg(Mode::Exit, 0, 1);
+    wild_cfg.local_ip = Ipv4Addr::UNSPECIFIED.into();
+    let mut wild_exit = Session::new(wild_cfg, t, 2).unwrap();
+    assert!(wild_exit.on_outer(t, &syn, &mut w).is_none());
+    assert_eq!(w.take().len(), 1);
+}

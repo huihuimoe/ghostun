@@ -311,7 +311,9 @@ impl Session {
         payload: &'a [u8],
         out: &mut impl Sink,
     ) -> Option<&'a [u8]> {
-        if m.dst.port() != self.cfg.listen_port {
+        if m.dst.port() != self.cfg.listen_port
+            || (!self.cfg.local_ip.is_unspecified() && m.dst.ip() != self.cfg.local_ip)
+        {
             return None;
         }
         let from_peer =

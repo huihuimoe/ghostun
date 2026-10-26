@@ -238,10 +238,10 @@ pub struct Listener {
 impl Listener {
     pub fn bind(cfg: &Config, mtu: u16) -> io::Result<Self> {
         // Explicit IPV6_V6ONLY keeps one selected outer family per instance.
-        let listener = sys::tcp_listener(SocketAddr::new(
-            cfg.outer_family.unspecified(),
-            cfg.listen.unwrap(),
-        ))?;
+        let listener = sys::tcp_listener(
+            SocketAddr::new(cfg.exit_ip(), cfg.listen.unwrap()),
+            cfg.iface.as_deref(),
+        )?;
         listener.set_nonblocking(true)?;
         let slots = Arc::new(
             (0..cfg.conns)

@@ -18,9 +18,9 @@ transport = "faketcp"  # or "tcp", which also supports terminating TCP relays
 remote = "203.0.113.10:443"
 
 # --- exit only (required) ---
-# Outer listen port. Allow inbound TCP to it on the exit host.
+# Outer listen port or IP:PORT (e.g. 443, "192.0.2.10:443", or "[2001:db8::10]:443").
 # listen = 443
-# Outer transport family (exit only; entry derives it from remote).
+# Outer transport family (exit only; inferred when listen includes an IP).
 # outer_family = "ipv4"  # or "ipv6"; one family per instance
 
 # Inner TUN interface; bind your proxy outbound to it (SO_BINDTODEVICE).
@@ -44,7 +44,7 @@ tun_name = "ghostun0"
 # TCP peers must have equal effective MTUs; set a common value if detected defaults differ.
 # tun_mtu = 1460
 
-# Outer egress interface. Default: from the routing table.
+# Outer interface (entry egress or exit bind/masquerade interface). Default: from the routing table.
 # iface = "eth0"
 
 # FakeTCP Entry: first source port of the outer port pool. Worker i uses ports p >= base_port with p % conns == i.

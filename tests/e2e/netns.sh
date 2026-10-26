@@ -18,8 +18,8 @@ fi
 ENTRY_CPU_ARGS=(${ENTRY_CPUS:+--cpus "$ENTRY_CPUS"})
 EXIT_CPU_ARGS=(${EXIT_CPUS:+--cpus "$EXIT_CPUS"})
 case "$OUTER_FAMILY" in
-    ipv4) OVERHEAD=40; EXIT_IP=10.2.0.1; REMOTE=10.2.0.1:443; ADDR_MATCH=ip ;;
-    ipv6) OVERHEAD=60; EXIT_IP=fd00:2::1; REMOTE='[fd00:2::1]:443'; ADDR_MATCH=ip6 ;;
+    ipv4) OVERHEAD=40; EXIT_IP=10.2.0.1; SIBLING_IP=10.2.0.2; REMOTE=10.2.0.1:443; ADDR_MATCH=ip ;;
+    ipv6) OVERHEAD=60; EXIT_IP=fd00:2::1; SIBLING_IP=fd00:2::2; REMOTE='[fd00:2::1]:443'; ADDR_MATCH=ip6 ;;
     *) echo "OUTER_FAMILY must be ipv4 or ipv6" >&2; exit 1 ;;
 esac
 LOG=${LOG:-/tmp/ghostun-e2e}
@@ -53,6 +53,7 @@ setup() {
     for n in entry fw exit inet; do ip netns add "$n"; ns "$n" ip link set lo up; done
     veth entry e0 10.1.0.1/24 fw f0 10.1.0.254/24
     veth fw f1 10.2.0.254/24 exit x0 10.2.0.1/24
+    ns exit ip addr add 10.2.0.2/24 dev x0
     veth exit x1 10.3.0.1/24 inet i0 10.3.0.2/24
     ns exit ip -6 addr add fd00:3::1/64 dev x1 nodad
     ns inet ip -6 addr add fd00:3::2/64 dev i0 nodad
@@ -66,6 +67,7 @@ setup() {
         ns fw ip -6 addr add fd00:1::fe/64 dev f0 nodad
         ns fw ip -6 addr add fd00:2::fe/64 dev f1 nodad
         ns exit ip -6 addr add fd00:2::1/64 dev x0 nodad
+        ns exit ip -6 addr add fd00:2::2/64 dev x0 nodad
         ns entry ip -6 route add default via fd00:1::fe
         ns exit ip -6 route add default via fd00:2::fe
         ns fw sysctl -qw net.ipv6.conf.all.forwarding=1
@@ -73,7 +75,7 @@ setup() {
         ns entry ip -4 route del default
         ns exit ip -4 route del default
         ns entry ip -4 addr del 10.1.0.1/24 dev e0
-        ns exit ip -4 addr del 10.2.0.1/24 dev x0
+        ns exit ip -4 addr flush dev x0
     fi
     ns fw sysctl -qw net.ipv4.ip_forward=1
     # Without loose pickup, packets of a flushed connection are INVALID and silently dropped.
@@ -108,7 +110,7 @@ route_inner() {
 }
 
 start() {
-    ip netns exec exit "$BIN" --config "$LOG/auth.toml" exit --listen 443 --outer-family "$OUTER_FAMILY" --conns "$N" "${EXIT_CPU_ARGS[@]}" --ping-interval 1 --dead-timeout $DEAD >"$LOG/exit.log" 2>&1 &
+    ip netns exec exit "$BIN" --config "$LOG/auth.toml" exit --listen "$REMOTE" --conns "$N" "${EXIT_CPU_ARGS[@]}" --ping-interval 1 --dead-timeout $DEAD >"$LOG/exit.log" 2>&1 &
     EXIT_PID=$!
     PIDS="$EXIT_PID"
     start_entry
@@ -143,6 +145,9 @@ for side in entry exit; do
     ns $side nft list table inet $TABLE >/dev/null || fail "$side nft table missing"
 done
 pass "tun mtu auto-derived as $((MTU - OVERHEAD)) and nft tables installed"
+ns exit iperf3 -s -D -1 -B "$SIBLING_IP" -p 443 && sleep 0.2
+ns fw iperf3 -c "$SIBLING_IP" -p 443 -n 64K >/dev/null || fail "sibling IP port 443 TCP service hijacked by FakeTCP"
+pass "specific listen IP ($REMOTE) leaves sibling IP ($SIBLING_IP:443) kernel TCP untouched"
 
 ns entry ping -c3 -i0.2 -W1 10.3.0.2 >/dev/null || fail "inner IPv4 ping"
 ns entry ping -6 -c3 -i0.2 -W1 fd00:3::2 >/dev/null || fail "inner IPv6 ping"

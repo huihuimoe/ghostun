@@ -424,6 +424,13 @@ const ACCEPT: u32 = u32::MAX;
 struct Prog(Vec<libc::sock_filter>);
 
 impl Prog {
+    fn init(&mut self, family: OuterFamily) -> &mut Self {
+        match family {
+            OuterFamily::Ipv4 => self.stmt(LDX_IHL, 0),
+            OuterFamily::Ipv6 => self.stmt(libc::BPF_LDX | libc::BPF_IMM, 0),
+        }
+    }
+
     fn stmt(&mut self, code: u32, k: u32) -> &mut Self {
         self.0.push(libc::sock_filter {
             code: code as u16,
@@ -431,6 +438,25 @@ impl Prog {
             jf: 0,
             k,
         });
+        self
+    }
+
+    fn ip(&mut self, ip: IpAddr, v4_off: usize, v6_off: usize) -> &mut Self {
+        match ip {
+            IpAddr::V4(ip) => {
+                self.stmt(LD_W_ABS, v4_off as u32).stmt(JEQ, u32::from(ip));
+            }
+            IpAddr::V6(ip) => {
+                // IPv6 raw socket filters see TCP at offset zero; IP headers are network-header relative.
+                for (idx, word) in ip.octets().as_chunks::<4>().0.iter().enumerate() {
+                    self.stmt(
+                        LD_W_ABS,
+                        (libc::SKF_NET_OFF + v6_off as i32 + idx as i32 * 4) as u32,
+                    )
+                    .stmt(JEQ, u32::from_be_bytes(*word));
+                }
+            }
+        }
         self
     }
 
@@ -459,58 +485,37 @@ const MOD: u32 = libc::BPF_ALU | libc::BPF_MOD | libc::BPF_K;
 /// Entry worker `i`: `saddr == exit.ip && sport == exit.port && dport >= base_port && dport % n == i`.
 pub fn entry_filter(exit: SocketAddr, base_port: u16, n: u16, i: u16) -> Vec<libc::sock_filter> {
     let mut p = Prog(Vec::new());
-    match exit.ip() {
-        IpAddr::V4(_) => p.stmt(LDX_IHL, 0),
-        IpAddr::V6(_) => p.stmt(libc::BPF_LDX | libc::BPF_IMM, 0),
-    };
     // Check worker port residue before source address words so N-1 sockets reject early.
-    p.stmt(LD_H_IND, tcp::OFF_SPORT as u32)
+    p.init(OuterFamily::of(exit.ip()))
+        .stmt(LD_H_IND, tcp::OFF_SPORT as u32)
         .stmt(JEQ, u32::from(exit.port()))
         .stmt(LD_H_IND, tcp::OFF_DPORT as u32)
         .stmt(JGE, u32::from(base_port))
         .stmt(MOD, u32::from(n))
-        .stmt(JEQ, u32::from(i));
-    match exit.ip() {
-        IpAddr::V4(ip) => {
-            p.stmt(LD_W_ABS, ipv4::OFF_SRC as u32)
-                .stmt(JEQ, u32::from(ip));
-        }
-        IpAddr::V6(ip) => {
-            // IPv6 raw socket filters see TCP at offset zero; source IP is network-header relative.
-            for (idx, word) in ip.octets().as_chunks::<4>().0.iter().enumerate() {
-                p.stmt(
-                    LD_W_ABS,
-                    (libc::SKF_NET_OFF + ipv6::OFF_SRC as i32 + idx as i32 * 4) as u32,
-                )
-                .stmt(JEQ, u32::from_be_bytes(*word));
-            }
-        }
-    }
-    p.finish()
+        .stmt(JEQ, u32::from(i))
+        .ip(exit.ip(), ipv4::OFF_SRC, ipv6::OFF_SRC)
+        .finish()
 }
 
-/// Exit worker `i`: `dport == listen_port && sport % n == i`.
+/// Exit worker `i`: `dport == listen_port && sport % n == i` (and `daddr == listen_ip` when set).
 pub fn exit_filter(
     family: OuterFamily,
+    listen_ip: Option<IpAddr>,
     listen_port: u16,
     n: u16,
     i: u16,
 ) -> Vec<libc::sock_filter> {
     let mut p = Prog(Vec::new());
-    match family {
-        OuterFamily::Ipv4 => {
-            p.stmt(LDX_IHL, 0);
-        }
-        OuterFamily::Ipv6 => {
-            p.stmt(libc::BPF_LDX | libc::BPF_IMM, 0);
-        }
-    }
-    p.stmt(LD_H_IND, tcp::OFF_DPORT as u32)
+    p.init(family)
+        .stmt(LD_H_IND, tcp::OFF_DPORT as u32)
         .stmt(JEQ, u32::from(listen_port))
         .stmt(LD_H_IND, tcp::OFF_SPORT as u32)
         .stmt(MOD, u32::from(n))
-        .stmt(JEQ, u32::from(i))
-        .finish()
+        .stmt(JEQ, u32::from(i));
+    if let Some(ip) = listen_ip {
+        p.ip(ip, ipv4::OFF_DST, ipv6::OFF_DST);
+    }
+    p.finish()
 }
 
 #[cfg(test)]
@@ -721,17 +726,47 @@ mod tests {
             )
         };
         assert_eq!(
-            run_bpf(&exit_filter(OuterFamily::Ipv4, 443, 3, 2), &from(40001)),
+            run_bpf(
+                &exit_filter(OuterFamily::Ipv4, None, 443, 3, 2),
+                &from(40001)
+            ),
             ACCEPT
         ); // 40001 % 3 == 2
         assert_eq!(
-            run_bpf(&exit_filter(OuterFamily::Ipv4, 443, 3, 0), &from(40001)),
+            run_bpf(
+                &exit_filter(OuterFamily::Ipv4, None, 443, 3, 0),
+                &from(40001)
+            ),
             0
         );
         assert_eq!(
-            run_bpf(&exit_filter(OuterFamily::Ipv4, 444, 3, 2), &from(40001)),
+            run_bpf(
+                &exit_filter(OuterFamily::Ipv4, None, 444, 3, 2),
+                &from(40001)
+            ),
             0,
             "wrong dport"
+        );
+        assert_eq!(
+            run_bpf(
+                &exit_filter(OuterFamily::Ipv4, Some((*me.ip()).into()), 443, 3, 2),
+                &from(40001)
+            ),
+            ACCEPT
+        );
+        assert_eq!(
+            run_bpf(
+                &exit_filter(
+                    OuterFamily::Ipv4,
+                    Some(Ipv4Addr::new(198, 51, 100, 8).into()),
+                    443,
+                    3,
+                    2
+                ),
+                &from(40001)
+            ),
+            0,
+            "wrong destination IP"
         );
         let with_opts = frame_with_options(
             8,
@@ -741,7 +776,7 @@ mod tests {
             me,
         );
         assert_eq!(
-            run_bpf(&exit_filter(OuterFamily::Ipv4, 443, 3, 2), &with_opts),
+            run_bpf(&exit_filter(OuterFamily::Ipv4, None, 443, 3, 2), &with_opts),
             ACCEPT,
             "IHL=28"
         );
@@ -809,15 +844,38 @@ mod tests {
         m.dst = exit;
         write_headers(&mut buf, &m, 0, 0);
         assert_eq!(
-            run_bpf(&exit_filter(OuterFamily::Ipv6, 443, 3, 2), &buf[..len]),
+            run_bpf(
+                &exit_filter(OuterFamily::Ipv6, None, 443, 3, 2),
+                &buf[..len]
+            ),
             ACCEPT
         );
         assert_eq!(
-            run_bpf(&exit_filter(OuterFamily::Ipv6, 443, 3, 1), &buf[..len]),
+            run_bpf(
+                &exit_filter(OuterFamily::Ipv6, Some(exit.ip()), 443, 3, 2),
+                &buf[..len]
+            ),
+            ACCEPT
+        );
+        assert_eq!(
+            run_bpf(
+                &exit_filter(OuterFamily::Ipv6, Some(entry.ip()), 443, 3, 2),
+                &buf[..len]
+            ),
             0
         );
         assert_eq!(
-            run_bpf(&exit_filter(OuterFamily::Ipv6, 444, 3, 2), &buf[..len]),
+            run_bpf(
+                &exit_filter(OuterFamily::Ipv6, None, 443, 3, 1),
+                &buf[..len]
+            ),
+            0
+        );
+        assert_eq!(
+            run_bpf(
+                &exit_filter(OuterFamily::Ipv6, None, 444, 3, 2),
+                &buf[..len]
+            ),
             0
         );
     }

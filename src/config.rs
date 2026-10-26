@@ -171,6 +171,64 @@ impl FromStr for AuthKey {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ListenSpec {
+    ip: Option<IpAddr>,
+    port: u16,
+    family: Option<OuterFamily>,
+}
+
+impl FromStr for ListenSpec {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if let Ok(port) = s.parse::<u16>() {
+            return Ok(Self {
+                ip: None,
+                port,
+                family: None,
+            });
+        }
+        let sa = s
+            .parse::<SocketAddr>()
+            .map_err(|_| format!("invalid `listen` value {s:?}: expected PORT or IP:PORT"))?;
+        let ip = sa.ip();
+        Ok(Self {
+            ip: (!ip.is_unspecified()).then_some(ip),
+            port: sa.port(),
+            family: Some(OuterFamily::of(ip)),
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for ListenSpec {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = ListenSpec;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a port number or \"[IP:]PORT\" string")
+            }
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                self.visit_u64(u64::try_from(v).map_err(|_| E::custom("listen port out of range"))?)
+            }
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                u16::try_from(v)
+                    .map(|port| ListenSpec {
+                        ip: None,
+                        port,
+                        family: None,
+                    })
+                    .map_err(|_| E::custom("listen port out of range"))
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                v.parse().map_err(E::custom)
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
     pub transport: Transport,
@@ -194,6 +252,8 @@ pub struct Config {
     pub remote: Option<SocketAddr>,
     /// Outer listen port; `Some` exactly in exit mode.
     pub listen: Option<u16>,
+    /// Optional specific outer listen IP in exit mode (`None` means wildcard).
+    pub listen_ip: Option<IpAddr>,
     pub outer_family: OuterFamily,
     cli: Cli,
 }
@@ -207,6 +267,12 @@ impl Config {
         } else {
             ipv4::MIN_MTU
         }
+    }
+
+    /// Bound exit listen IP, or the outer family's unspecified wildcard address.
+    pub fn exit_ip(&self) -> IpAddr {
+        self.listen_ip
+            .unwrap_or_else(|| self.outer_family.unspecified())
     }
 
     pub fn resolve_tun_mtu(&self, outer_mtu: u32) -> Result<u32, String> {
@@ -264,9 +330,9 @@ struct Cli {
     /// exit node outer address (entry only)
     #[argh(option, arg_name = "IP:PORT")]
     remote: Option<SocketAddr>,
-    /// outer listen port (exit only)
-    #[argh(option, arg_name = "PORT")]
-    listen: Option<u16>,
+    /// outer listen port or IP:PORT (exit only)
+    #[argh(option, arg_name = "[IP:]PORT")]
+    listen: Option<ListenSpec>,
     /// outer address family; entry derives it from --remote [default: ipv4]
     #[argh(option)]
     outer_family: Option<OuterFamily>,
@@ -338,7 +404,7 @@ struct File {
     #[serde(default)]
     no_masq: bool,
     remote: Option<SocketAddr>,
-    listen: Option<u16>,
+    listen: Option<ListenSpec>,
     outer_family: Option<OuterFamily>,
 }
 
@@ -400,7 +466,10 @@ fn build_config(cli: Cli, running_conns: Option<u16>) -> Result<Config, String> 
         ));
     }
     let remote = cli.remote.or(file.remote);
-    let listen = cli.listen.or(file.listen);
+    let listen_spec = cli.listen.or(file.listen);
+    let listen = listen_spec.map(|l| l.port);
+    let listen_ip = listen_spec.and_then(|l| l.ip);
+    let listen_family = listen_spec.and_then(|l| l.family);
     let outer_family = cli.outer_family.or(file.outer_family);
     if mode == Mode::Entry && outer_family.is_some() {
         return Err(
@@ -408,9 +477,16 @@ fn build_config(cli: Cli, running_conns: Option<u16>) -> Result<Config, String> 
                 .into(),
         );
     }
+    if let (Some(explicit), Some(inferred)) = (outer_family, listen_family) {
+        if explicit != inferred {
+            return Err("`outer_family` conflicts with `listen` address family".into());
+        }
+    }
     let outer_family = remote
         .map(|r| OuterFamily::of(r.ip()))
-        .unwrap_or(outer_family.unwrap_or_default());
+        .or(listen_family)
+        .or(outer_family)
+        .unwrap_or_default();
     let no_masq = cli.no_masq || file.no_masq;
     match mode {
         Mode::Entry if listen.is_some() => return Err("`listen` is only valid in exit mode".into()),
@@ -479,6 +555,7 @@ fn build_config(cli: Cli, running_conns: Option<u16>) -> Result<Config, String> 
         masq: !no_masq,
         remote,
         listen,
+        listen_ip,
         outer_family,
         cli,
     };
@@ -501,7 +578,10 @@ fn ensure_reload_compatible(old: &Config, new: &Config) -> Result<(), String> {
         (old.netfilter != new.netfilter, "no_netfilter"),
         (old.masq != new.masq, "no_masq"),
         (old.remote != new.remote, "remote"),
-        (old.listen != new.listen, "listen"),
+        (
+            old.listen != new.listen || old.listen_ip != new.listen_ip,
+            "listen",
+        ),
         (old.base_port != new.base_port, "base_port"),
     ] {
         if changed {
@@ -964,6 +1044,26 @@ mod tests {
             &[]
         )
         .is_err());
+        let v6_listen = parse(&["exit", "--listen", "[2001:db8::1]:443"]).unwrap();
+        assert_eq!(v6_listen.outer_family, OuterFamily::Ipv6);
+        assert_eq!(v6_listen.listen, Some(443));
+        assert_eq!(v6_listen.listen_ip, Some("2001:db8::1".parse().unwrap()));
+        let v6_wild = with_file("v6-wild", "mode = 'exit'\nlisten = '[::]:8443'\n", &[]).unwrap();
+        assert_eq!(v6_wild.outer_family, OuterFamily::Ipv6);
+        assert_eq!(v6_wild.listen, Some(8443));
+        assert_eq!(v6_wild.listen_ip, None);
+        let v4_wild = parse(&["exit", "--listen", "0.0.0.0:443"]).unwrap();
+        assert_eq!(v4_wild.outer_family, OuterFamily::Ipv4);
+        assert_eq!(v4_wild.listen_ip, None);
+        assert!(parse(&[
+            "exit",
+            "--listen",
+            "192.0.2.1:443",
+            "--outer-family",
+            "ipv6"
+        ])
+        .unwrap_err()
+        .contains("conflicts"));
     }
 
     #[test]
@@ -1089,6 +1189,12 @@ mod tests {
         )
         .unwrap();
         assert!(exit_cfg.reload().unwrap_err().contains("no_masq"));
+        std::fs::write(
+            &path,
+            format!("mode = 'exit'\nlisten = '192.0.2.1:443'\nauth_key = '{key1}'\nconns = 2\n"),
+        )
+        .unwrap();
+        assert!(exit_cfg.reload().unwrap_err().contains("listen"));
 
         // When inner IPv6 was disabled at startup, reload remains compatible without false mismatch.
         std::fs::write(
