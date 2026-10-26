@@ -281,6 +281,7 @@ fn candidates(key: &AuthKey) -> Slots {
                     epoch: 0,
                     timeout: Duration::from_secs(4),
                     pending: None,
+                    wake: -1,
                 })
             })
             .collect(),

@@ -1,6 +1,6 @@
 //! Worker thread control, CPU affinity, TUN queue synchronization, and rolling reload coordination.
 
-use std::os::fd::BorrowedFd;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -17,6 +17,8 @@ pub struct Reload {
 
 pub struct Control {
     initial_cpu: Option<usize>,
+    wake: OwnedFd,
+    main_wake: RawFd,
     target_gen: AtomicU64,
     applied_gen: AtomicU64,
     wait_for_established: AtomicBool,
@@ -25,9 +27,11 @@ pub struct Control {
 }
 
 impl Control {
-    pub fn new(initial_cpu: Option<usize>) -> Self {
+    pub fn new(initial_cpu: Option<usize>, main_wake: RawFd) -> Self {
         Self {
             initial_cpu,
+            wake: sys::eventfd().expect("creating worker eventfd"),
+            main_wake,
             target_gen: AtomicU64::new(0),
             applied_gen: AtomicU64::new(0),
             wait_for_established: AtomicBool::new(false),
@@ -36,9 +40,20 @@ impl Control {
         }
     }
 
+    #[inline(always)]
+    pub fn wake_fd(&self) -> BorrowedFd<'_> {
+        self.wake.as_fd()
+    }
+
+    #[inline]
+    pub fn wake(&self) {
+        sys::eventfd_notify(self.wake.as_raw_fd());
+    }
+
     pub fn publish(&self, generation: u64, reload: Reload) {
         *self.pending.lock().expect("reload lock") = Some((generation, reload));
         self.target_gen.store(generation, Ordering::Release);
+        self.wake();
     }
 
     pub fn is_step_complete(&self, generation: u64) -> bool {
@@ -62,9 +77,20 @@ impl Control {
 
     #[inline]
     pub fn report(&self, generation: u64, established: bool, wait: bool) {
-        self.wait_for_established.store(wait, Ordering::Release);
-        self.established.store(established, Ordering::Release);
-        self.applied_gen.store(generation, Ordering::Release);
+        let prev = (
+            self.applied_gen.load(Ordering::Relaxed),
+            self.established.load(Ordering::Relaxed),
+            self.wait_for_established.load(Ordering::Relaxed),
+        );
+        if prev != (generation, established, wait) {
+            let was_complete = prev.0 == generation && (!prev.2 || prev.1);
+            self.wait_for_established.store(wait, Ordering::Release);
+            self.established.store(established, Ordering::Release);
+            self.applied_gen.store(generation, Ordering::Release);
+            if generation > 0 && !was_complete && (!wait || established) {
+                sys::eventfd_notify(self.main_wake);
+            }
+        }
     }
 
     #[inline(always)]
@@ -146,5 +172,14 @@ pub fn sync_tun_queue(id: usize, tun: BorrowedFd<'_>, attached: &mut bool, estab
             Ok(()) => *attached = established,
             Err(e) => log::warn!("worker {id}: TUN queue attach={established}: {e}"),
         }
+    }
+}
+
+pub struct StopOnDrop(pub &'static AtomicBool, pub RawFd);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+        sys::eventfd_notify(self.1);
     }
 }

@@ -3,7 +3,7 @@
 use std::net::IpAddr;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::config::OuterFamily;
 use crate::faketcp::{Session, Sink};
@@ -14,7 +14,6 @@ const ROUNDS: usize = 4;
 /// Extra slot space beyond `overhead + mss` so incoming frames with IP/TCP options never truncate.
 const OPT_HEADROOM: usize = 80;
 const MIN_STRIDE: usize = 2048;
-const MAX_POLL: Duration = Duration::from_millis(200);
 
 struct RawSink<'a>(BorrowedFd<'a>);
 
@@ -94,19 +93,19 @@ pub fn run(
     let mut fds = [
         sys::pollfd(tun.as_raw_fd(), libc::POLLIN),
         sys::pollfd(raw.as_raw_fd(), libc::POLLIN),
+        sys::pollfd(ctrl.wake_fd().as_raw_fd(), libc::POLLIN),
     ];
-    let mut now = Instant::now();
     let mut busy = false;
     let mut applied_gen = 0;
     while !stop.load(Ordering::Relaxed) {
         let timeout = if busy {
             0
         } else {
-            let wait = session
-                .next_deadline()
-                .saturating_duration_since(now)
-                .min(MAX_POLL);
-            sys::poll_ms(wait)
+            sys::poll_ms(
+                session
+                    .next_deadline()
+                    .saturating_duration_since(Instant::now()),
+            )
         };
         match sys::poll(&mut fds, timeout) {
             Ok(true) => {}
@@ -116,10 +115,11 @@ pub fn run(
                 break;
             }
         }
+        sys::poll_wake(fds[2], ctrl.wake_fd());
         if stop.load(Ordering::Relaxed) {
             break;
         }
-        now = Instant::now();
+        let now = Instant::now();
         let mut tun_ready = fds[0].revents & libc::POLLIN != 0;
         let mut raw_ready = fds[1].revents & libc::POLLIN != 0;
         for _ in 0..ROUNDS {

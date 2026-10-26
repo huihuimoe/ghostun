@@ -5,7 +5,7 @@ mod wire;
 
 use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -23,7 +23,6 @@ const BATCH: usize = 64;
 const fn can_io(pfd: libc::pollfd, event: i16, ready: i16) -> bool {
     pfd.events & event == 0 || pfd.revents & ready != 0
 }
-const MAX_POLL: Duration = Duration::from_millis(50);
 
 struct Connection {
     socket: TcpStream,
@@ -125,7 +124,7 @@ impl Connection {
         now: Instant,
         ping: Duration,
         dead: Duration,
-        fds: &[libc::pollfd; 2],
+        fds: &[libc::pollfd],
     ) -> io::Result<bool> {
         let mtu = mtu as usize;
         if now.duration_since(self.last_rx) >= dead {
@@ -224,6 +223,7 @@ struct Slot {
     epoch: u64,
     timeout: Duration,
     pending: Option<Connection>,
+    wake: RawFd,
 }
 
 type Slots = Arc<Vec<Mutex<Slot>>>;
@@ -231,6 +231,7 @@ type Slots = Arc<Vec<Mutex<Slot>>>;
 /// Owns listener setup before any workers start. The dispatcher never owns a TUN queue.
 pub struct Listener {
     listener: TcpListener,
+    wake: OwnedFd,
     slots: Slots,
     mtu: u16,
 }
@@ -243,6 +244,7 @@ impl Listener {
             cfg.iface.as_deref(),
         )?;
         listener.set_nonblocking(true)?;
+        let wake = sys::eventfd()?;
         let slots = Arc::new(
             (0..cfg.conns)
                 .map(|_| {
@@ -251,31 +253,45 @@ impl Listener {
                         epoch: 0,
                         timeout: cfg.dead_timeout,
                         pending: None,
+                        wake: -1,
                     })
                 })
                 .collect(),
         );
         Ok(Self {
             listener,
+            wake,
             slots,
             mtu,
         })
     }
 
-    pub fn spawn(self, stop: &'static AtomicBool) -> io::Result<std::thread::JoinHandle<()>> {
+    pub fn wake_fd(&self) -> RawFd {
+        self.wake.as_raw_fd()
+    }
+
+    pub fn spawn(
+        self,
+        stop: &'static AtomicBool,
+        main_wake: RawFd,
+    ) -> io::Result<std::thread::JoinHandle<()>> {
         std::thread::Builder::new()
             .name("ghostun-tcp-accept".into())
-            .spawn(move || self.run(stop))
+            .spawn(move || {
+                let _guard = worker::StopOnDrop(stop, main_wake);
+                self.run(stop);
+            })
     }
 
     fn run(self, stop: &AtomicBool) {
         let cap = (2 * self.slots.len()).min(256);
         let mut candidates: Vec<Candidate> = Vec::with_capacity(cap);
-        let mut fds = Vec::with_capacity(cap + 1);
+        let mut fds = Vec::with_capacity(cap + 2);
         while !stop.load(Ordering::Relaxed) {
             // Candidate count is bounded; poll all sockets and listener without per-candidate threads.
             fds.clear();
             fds.push(pollfd(self.listener.as_raw_fd(), libc::POLLIN));
+            fds.push(pollfd(self.wake.as_raw_fd(), libc::POLLIN));
             for c in &candidates {
                 fds.push(pollfd(
                     c.conn.socket.as_raw_fd(),
@@ -288,16 +304,16 @@ impl Listener {
                 ));
             }
             let now = Instant::now();
-            let wait = candidates
+            let timeout = candidates
                 .iter()
                 .map(|c| (c.conn.since + c.timeout).saturating_duration_since(now))
                 .min()
-                .unwrap_or(MAX_POLL)
-                .min(MAX_POLL);
-            if let Err(e) = poll(&mut fds, poll_ms(wait)) {
+                .map_or(-1, poll_ms);
+            if let Err(e) = poll(&mut fds, timeout) {
                 log::error!("tcp accept poll: {e}");
                 return;
             }
+            sys::poll_wake(fds[1], self.wake.as_fd());
             if stop.load(Ordering::Relaxed) {
                 break;
             }
@@ -305,7 +321,7 @@ impl Listener {
             let mut i = 0;
             while i < candidates.len() {
                 let expired = now.duration_since(candidates[i].conn.since) >= candidates[i].timeout;
-                if fds[i + 1].revents == 0 && !expired {
+                if fds[i + 2].revents == 0 && !expired {
                     i += 1;
                     continue;
                 }
@@ -313,7 +329,7 @@ impl Listener {
                     Ok(false) => i += 1,
                     result => {
                         let candidate = candidates.swap_remove(i);
-                        fds.swap_remove(i + 1);
+                        fds.swap_remove(i + 2);
                         let id = candidate.identity.map(|v| v.0);
                         if let Err(e) = result.and_then(|_| candidate.admit(&self.slots, self.mtu))
                         {
@@ -399,12 +415,16 @@ impl Candidate {
 
     fn admit(mut self, slots: &Slots, mtu: u16) -> io::Result<()> {
         let (id, epoch) = self.identity.unwrap();
-        let mut slot = slots[id].lock().unwrap();
-        if slot.epoch != epoch {
-            return Err(invalid("authentication invalidated by key reload"));
-        }
-        self.conn.establish(mtu);
-        slot.pending = Some(self.conn);
+        let wake = {
+            let mut slot = slots[id].lock().unwrap();
+            if slot.epoch != epoch {
+                return Err(invalid("authentication invalidated by key reload"));
+            }
+            self.conn.establish(mtu);
+            slot.pending = Some(self.conn);
+            slot.wake
+        };
+        sys::eventfd_notify(wake);
         log::info!("tcp worker {id}: authenticated candidate admitted");
         Ok(())
     }
@@ -460,8 +480,17 @@ impl Worker {
         let mut retry_at = Instant::now();
         let mut backoff = Backoff { failures: 0 };
         let mut packet = vec![0; self.mtu as usize + 1];
-        let mut fds = [pollfd(-1, 0), pollfd(-1, 0)];
+        if let Some(slots) = &self.slots {
+            slots[id].lock().unwrap().wake = ctrl.wake_fd().as_raw_fd();
+        }
+        let mut check_slot = true;
+        let mut fds = [
+            pollfd(-1, 0),
+            pollfd(-1, 0),
+            pollfd(ctrl.wake_fd().as_raw_fd(), libc::POLLIN),
+        ];
         while !stop.load(Ordering::Relaxed) {
+            check_slot |= sys::poll_wake(fds[2], ctrl.wake_fd());
             if let Some((gen, reload)) = ctrl.take_reload(generation) {
                 wait &= !connection.as_ref().is_some_and(|c| c.auth.is_none());
                 if cpu != reload.cpu {
@@ -488,16 +517,19 @@ impl Worker {
                 }
                 generation = gen;
             }
-            if let Some(slots) = &self.slots {
-                if let Some(new) = slots[id].lock().unwrap().pending.take() {
-                    if connection.is_some() {
-                        log::info!(
-                            "tcp worker {id}: authenticated takeover, closing old connection"
-                        );
+            if check_slot {
+                check_slot = false;
+                if let Some(slots) = &self.slots {
+                    if let Some(new) = slots[id].lock().unwrap().pending.take() {
+                        if connection.is_some() {
+                            log::info!(
+                                "tcp worker {id}: authenticated takeover, closing old connection"
+                            );
+                        }
+                        connection = Some(new);
+                        fds[1] = pollfd(-1, 0);
+                        log::info!("tcp worker {id}: established");
                     }
-                    connection = Some(new);
-                    fds[1] = pollfd(-1, 0);
-                    log::info!("tcp worker {id}: established");
                 }
             }
             let mut now = Instant::now();
@@ -589,7 +621,11 @@ impl Worker {
                 }
                 busy |= drained == ROUNDS * BATCH;
             }
-            fds = [pollfd(self.tun.as_raw_fd(), libc::POLLIN), pollfd(-1, 0)];
+            fds = [
+                pollfd(self.tun.as_raw_fd(), libc::POLLIN),
+                pollfd(-1, 0),
+                pollfd(ctrl.wake_fd().as_raw_fd(), libc::POLLIN),
+            ];
             if let Some(c) = &connection {
                 fds[1] = pollfd(
                     c.socket.as_raw_fd(),
@@ -606,16 +642,23 @@ impl Worker {
                     fds[0].events |= libc::POLLOUT;
                 }
             }
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
             let timeout = if busy {
                 0
             } else {
                 now = Instant::now();
-                let deadline = match &connection {
-                    Some(c) => c.next_deadline(self.cfg.ping_interval, self.cfg.dead_timeout),
-                    None if self.cfg.mode == Mode::Entry => retry_at,
-                    None => now + MAX_POLL,
-                };
-                poll_ms(deadline.saturating_duration_since(now).min(MAX_POLL))
+                match &connection {
+                    Some(c) => poll_ms(
+                        c.next_deadline(self.cfg.ping_interval, self.cfg.dead_timeout)
+                            .saturating_duration_since(now),
+                    ),
+                    None if self.cfg.mode == Mode::Entry => {
+                        poll_ms(retry_at.saturating_duration_since(now))
+                    }
+                    None => -1,
+                }
             };
             if let Err(e) = poll(&mut fds, timeout) {
                 log::error!("tcp worker {id}: poll: {e}");

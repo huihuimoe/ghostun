@@ -6,10 +6,10 @@ mod tcp;
 mod worker;
 
 use std::net::IpAddr;
+use std::os::fd::{AsFd, AsRawFd};
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
 use config::{Config, Mode, Transport};
 use faketcp::{Session, SessionConfig};
@@ -17,6 +17,7 @@ use worker::RollingReload;
 
 static STOP: AtomicBool = AtomicBool::new(false);
 static RELOAD: AtomicBool = AtomicBool::new(false);
+static MAIN_WAKE: AtomicI32 = AtomicI32::new(-1);
 
 extern "C" fn on_signal(sig: libc::c_int) {
     if sig == libc::SIGHUP {
@@ -24,6 +25,7 @@ extern "C" fn on_signal(sig: libc::c_int) {
     } else {
         STOP.store(true, Ordering::Relaxed);
     }
+    sys::eventfd_notify(MAIN_WAKE.load(Ordering::Relaxed));
 }
 
 /// Outer addressing derived from config plus the routing table.
@@ -63,6 +65,9 @@ fn resolve_outer(cfg: &Config) -> Result<Outer, String> {
 }
 
 fn run(mut cfg: Config) -> Result<(), String> {
+    let main_wake = sys::eventfd().map_err(|e| format!("eventfd: {e}"))?;
+    let main_wake_fd = main_wake.as_raw_fd();
+    MAIN_WAKE.store(main_wake_fd, Ordering::Relaxed);
     sys::install_signal_handlers(on_signal).map_err(|e| format!("signal handlers: {e}"))?;
     let outer = resolve_outer(&cfg)?;
     let tun_mtu = cfg.resolve_tun_mtu(outer.mtu)?;
@@ -156,28 +161,38 @@ fn run(mut cfg: Config) -> Result<(), String> {
     let mut workers = Vec::with_capacity(n);
     for (i, start) in slots.into_iter().enumerate() {
         let cpu = worker::cpu_for(&cfg, &default_cpus, i);
-        let ctrl = Arc::new(worker::Control::new(cpu));
+        let ctrl = Arc::new(worker::Control::new(cpu, main_wake_fd));
         let worker_ctrl = Arc::clone(&ctrl);
         controls.push(ctrl);
         workers.push(
             std::thread::Builder::new()
                 .name(format!("ghostun-w{i}"))
-                .spawn(move || match start {
-                    Start::Fake(session, tun, raw) => {
-                        faketcp::run(i, family, *session, tun, raw, &STOP, &worker_ctrl)
+                .spawn(move || {
+                    let _guard = worker::StopOnDrop(&STOP, main_wake_fd);
+                    match start {
+                        Start::Fake(session, tun, raw) => {
+                            faketcp::run(i, family, *session, tun, raw, &STOP, &worker_ctrl)
+                        }
+                        Start::Tcp(tcp) => tcp.run(&STOP, &worker_ctrl),
                     }
-                    Start::Tcp(tcp) => tcp.run(&STOP, &worker_ctrl),
                 })
                 .expect("spawning worker thread"),
         );
     }
 
+    let listener_wake = listener.as_ref().map(tcp::Listener::wake_fd);
     if let Some(listener) = listener {
-        workers.push(listener.spawn(&STOP).expect("spawning TCP accept thread"));
+        workers.push(
+            listener
+                .spawn(&STOP, main_wake_fd)
+                .expect("spawning TCP accept thread"),
+        );
     }
+    let mut poll_fd = [sys::pollfd(main_wake_fd, libc::POLLIN)];
     let mut generation = 0u64;
     let mut rolling = None;
     while !STOP.load(Ordering::Relaxed) {
+        sys::eventfd_drain(main_wake.as_fd());
         if RELOAD.swap(false, Ordering::Relaxed) {
             match cfg.reload() {
                 Ok(next) if next == cfg && rolling.is_none() => {
@@ -194,13 +209,21 @@ fn run(mut cfg: Config) -> Result<(), String> {
             }
         }
         RollingReload::advance(&controls, &default_cpus, &mut rolling);
-        if workers.iter().any(|w| w.is_finished()) {
-            STOP.store(true, Ordering::Relaxed);
+        if STOP.load(Ordering::Relaxed) {
             break;
         }
-        std::thread::sleep(Duration::from_millis(10));
+        if let Err(e) = sys::poll(&mut poll_fd, -1) {
+            log::error!("main poll: {e}");
+            break;
+        }
     }
-
+    STOP.store(true, Ordering::Relaxed);
+    for ctrl in &controls {
+        ctrl.wake();
+    }
+    if let Some(fd) = listener_wake {
+        sys::eventfd_notify(fd);
+    }
     for w in workers {
         if w.join().is_err() {
             log::error!("worker panicked");
@@ -232,7 +255,7 @@ mod tests {
     use crate::config::AuthKey;
     use crate::faketcp::Sink;
     use std::net::{Ipv4Addr, SocketAddr};
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     #[derive(Default)]
     struct Wire(Vec<Vec<u8>>);
@@ -309,8 +332,8 @@ mod tests {
         let now = Instant::now();
         let default_cpus = vec![0, 1];
         let controls = vec![
-            Arc::new(worker::Control::new(Some(0))),
-            Arc::new(worker::Control::new(Some(1))),
+            Arc::new(worker::Control::new(Some(0), -1)),
+            Arc::new(worker::Control::new(Some(1), -1)),
         ];
         let mut entries = [
             make_session(Mode::Entry, 0, 0xa7, now),
@@ -418,8 +441,8 @@ mod tests {
         let now = Instant::now();
         let default_cpus = vec![0, 1];
         let controls = vec![
-            Arc::new(worker::Control::new(Some(0))),
-            Arc::new(worker::Control::new(Some(1))),
+            Arc::new(worker::Control::new(Some(0), -1)),
+            Arc::new(worker::Control::new(Some(1), -1)),
         ];
         let mut exits = [
             make_session(Mode::Exit, 0, 0xa7, now),
