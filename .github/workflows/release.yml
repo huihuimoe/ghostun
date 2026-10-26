@@ -44,7 +44,7 @@ jobs:
               exit 1
             fi
             sed -i "0,/^version = \".*\"/s//version = \"${ver}\"/" Cargo.toml
-            cargo update --workspace --offline
+            cargo update --workspace
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             if ! git diff --quiet Cargo.toml Cargo.lock; then
