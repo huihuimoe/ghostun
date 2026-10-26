@@ -254,6 +254,7 @@ impl Params {
     }
 }
 
+#[inline]
 pub fn hello_params(hello: &[u8]) -> io::Result<Params> {
     if hello.len() != HELLO_LEN
         || hello[OFF_HELLO_KIND] != MSG_HELLO
@@ -271,6 +272,7 @@ pub fn hello_params(hello: &[u8]) -> io::Result<Params> {
     })
 }
 
+#[inline]
 fn init_transcript(hello: &[u8]) -> [u8; TRANSCRIPT_LEN] {
     let mut buf = [0; TRANSCRIPT_LEN];
     buf[..OFF_TRANSCRIPT_HELLO].copy_from_slice(TRANSCRIPT_PREFIX);
@@ -309,10 +311,19 @@ impl Handshake {
     pub fn exit(key: &AuthKey, p: Params, hello: &[u8]) -> io::Result<(Self, [u8; CHALLENGE_LEN])> {
         let peer = hello_params(hello)?;
         if peer.worker != p.worker || peer.worker >= p.conns {
-            return Err(invalid("invalid worker ID"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid worker ID {} (conns={})", peer.worker, p.conns),
+            ));
         }
         if peer.conns != p.conns || peer.mtu != p.mtu {
-            return Err(invalid("incompatible peer conns or effective TUN MTU"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "incompatible peer parameters (peer conns={}, mtu={}; local conns={}, mtu={})",
+                    peer.conns, peer.mtu, p.conns, p.mtu
+                ),
+            ));
         }
         let mut challenge = [0; CHALLENGE_LEN];
         challenge[0] = MSG_CHALLENGE;

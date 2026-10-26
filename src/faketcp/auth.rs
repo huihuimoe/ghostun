@@ -62,6 +62,7 @@ struct EntryState {
     frame: [u8; PROOF_LEN],
     len: usize,
     seq: u32,
+    warned: bool,
 }
 
 struct Completion {
@@ -73,6 +74,7 @@ struct Completion {
 pub enum EntryStep {
     SendProof { rcv_nxt: u32, snd_nxt: u32 },
     Established { rcv_nxt: u32 },
+    AuthFailed(&'static str),
 }
 
 pub struct Promotion {
@@ -151,6 +153,7 @@ impl Auth {
             frame,
             len: HELLO_LEN,
             seq,
+            warned: false,
         });
         Ok(())
     }
@@ -173,31 +176,51 @@ impl Auth {
             entry: iss,
             exit: irs,
         };
-        if pending.len == HELLO_LEN {
-            if m.seq != irs.wrapping_add(1) || m.ack != snd_nxt {
+        let reason = if pending.len == HELLO_LEN {
+            if m.seq != irs.wrapping_add(1)
+                || m.ack != snd_nxt
+                || !is_message(payload, CHALLENGE, CHALLENGE_LEN)
+                || payload[OFF_ENTRY_NONCE..OFF_EXIT_NONCE] != pending.frame[HDR_LEN..HELLO_LEN]
+            {
                 return None;
             }
-            let proof = self.proof(isns, &pending.frame[HDR_LEN..HELLO_LEN], payload)?;
-            self.entry = Some(EntryState {
-                frame: proof,
-                len: PROOF_LEN,
-                seq: snd_nxt,
-            });
-            Some(EntryStep::SendProof {
-                rcv_nxt: m.seq.wrapping_add(CHALLENGE_LEN as u32),
-                snd_nxt: snd_nxt.wrapping_add(PROOF_LEN as u32),
-            })
-        } else if m.seq == irs.wrapping_add(1 + CHALLENGE_LEN as u32)
-            && m.ack == snd_nxt
-            && self.finished(isns, &pending.frame, payload)
-        {
-            self.entry = None;
-            Some(EntryStep::Established {
-                rcv_nxt: irs.wrapping_add(1 + EXIT_BYTES),
-            })
+            if let Some(proof) = self.proof(isns, payload) {
+                self.entry = Some(EntryState {
+                    frame: proof,
+                    len: PROOF_LEN,
+                    seq: snd_nxt,
+                    warned: false,
+                });
+                return Some(EntryStep::SendProof {
+                    rcv_nxt: m.seq.wrapping_add(CHALLENGE_LEN as u32),
+                    snd_nxt: snd_nxt.wrapping_add(PROOF_LEN as u32),
+                });
+            }
+            "challenge verification failed"
         } else {
-            None
-        }
+            if m.seq != irs.wrapping_add(1 + CHALLENGE_LEN as u32)
+                || m.ack != snd_nxt
+                || !is_message(payload, FINISHED, FINISHED_LEN)
+                || payload[OFF_TICKET..OFF_FINISHED_TAG]
+                    != pending.frame[OFF_TICKET..OFF_FINISHED_TAG]
+            {
+                return None;
+            }
+            if self.verify(
+                FINISHED_DOMAIN,
+                isns,
+                &pending.frame[HDR_LEN..OFF_EXIT_TAG],
+                &payload[OFF_FINISHED_TAG..],
+            ) {
+                self.entry = None;
+                return Some(EntryStep::Established {
+                    rcv_nxt: irs.wrapping_add(1 + EXIT_BYTES),
+                });
+            }
+            "finished verification failed"
+        };
+        let pending = self.entry.as_mut()?;
+        (!std::mem::replace(&mut pending.warned, true)).then_some(EntryStep::AuthFailed(reason))
     }
 
     pub fn on_exit_request(
@@ -231,6 +254,7 @@ impl Auth {
         self.syn_cookie_at(meta, self.bucket(now))
     }
 
+    #[inline]
     fn bucket(&self, now: Instant) -> u64 {
         now.saturating_duration_since(self.origin).as_secs() / self.timeout.as_secs()
     }
@@ -293,16 +317,14 @@ impl Auth {
         Ok(Some(frame))
     }
 
-    fn proof(&self, isns: Isns, nonce: &[u8], challenge: &[u8]) -> Option<[u8; PROOF_LEN]> {
-        if !is_message(challenge, CHALLENGE, CHALLENGE_LEN)
-            || challenge[OFF_ENTRY_NONCE..OFF_EXIT_NONCE] != *nonce
-            || !self.verify(
-                EXIT_DOMAIN,
-                isns,
-                &challenge[HDR_LEN..OFF_EXIT_TAG],
-                &challenge[OFF_EXIT_TAG..],
-            )
-        {
+    #[inline]
+    fn proof(&self, isns: Isns, challenge: &[u8]) -> Option<[u8; PROOF_LEN]> {
+        if !self.verify(
+            EXIT_DOMAIN,
+            isns,
+            &challenge[HDR_LEN..OFF_EXIT_TAG],
+            &challenge[OFF_EXIT_TAG..],
+        ) {
             return None;
         }
         let mut frame = [0; PROOF_LEN];
@@ -372,17 +394,7 @@ impl Auth {
         })
     }
 
-    fn finished(&self, isns: Isns, proof: &[u8; PROOF_LEN], payload: &[u8]) -> bool {
-        is_message(payload, FINISHED, FINISHED_LEN)
-            && payload[OFF_TICKET..OFF_FINISHED_TAG] == proof[OFF_TICKET..OFF_FINISHED_TAG]
-            && self.verify(
-                FINISHED_DOMAIN,
-                isns,
-                &proof[HDR_LEN..OFF_EXIT_TAG],
-                &payload[OFF_FINISHED_TAG..],
-            )
-    }
-
+    #[inline]
     fn mac(&self, domain: &[u8], isns: Isns, body: &[u8]) -> HmacSha256 {
         let mut mac = self.key.clone();
         mac.update(domain);
@@ -393,15 +405,18 @@ impl Auth {
         mac
     }
 
+    #[inline]
     fn sign(&self, domain: &[u8], isns: Isns, body: &[u8]) -> [u8; TAG_LEN] {
         self.mac(domain, isns, body).finalize().into_bytes().into()
     }
 
+    #[inline]
     fn verify(&self, domain: &[u8], isns: Isns, body: &[u8], tag: &[u8]) -> bool {
         self.mac(domain, isns, body).verify_slice(tag).is_ok()
     }
 }
 
+#[inline]
 fn address(mac: &mut HmacSha256, addr: SocketAddr) {
     match addr.ip() {
         std::net::IpAddr::V4(ip) => {
@@ -416,6 +431,7 @@ fn address(mac: &mut HmacSha256, addr: SocketAddr) {
     mac.update(&addr.port().to_be_bytes());
 }
 
+#[inline]
 fn tuple_mac(key: &HmacSha256, domain: &[u8], meta: &TcpMeta) -> HmacSha256 {
     let mut mac = key.clone();
     mac.update(domain);
@@ -424,6 +440,7 @@ fn tuple_mac(key: &HmacSha256, domain: &[u8], meta: &TcpMeta) -> HmacSha256 {
     mac
 }
 
+#[inline]
 fn cookie_mac(key: &HmacSha256, meta: &TcpMeta, isns: Isns, body: &[u8]) -> HmacSha256 {
     let mut mac = tuple_mac(key, b"ghostun-cookie-v1", meta);
     mac.update(&isns.entry.to_be_bytes());

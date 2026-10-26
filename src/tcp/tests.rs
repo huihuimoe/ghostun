@@ -19,6 +19,10 @@ fn pair() -> (TcpStream, TcpStream) {
     b.set_nonblocking(true).unwrap();
     (a, b)
 }
+fn conn(socket: TcpStream, now: Instant) -> Connection {
+    let peer = socket.peer_addr().unwrap();
+    Connection::new(socket, peer, now).unwrap()
+}
 fn packet(tag: u8) -> Vec<u8> {
     let mut p = vec![tag; 64];
     p[0] = 0x45;
@@ -257,7 +261,7 @@ fn attempt_deadline_is_absolute_and_jitter_backoff_resets_only_after_stability()
     let key = AuthKey([7; 32]);
     let (a, _b) = pair();
     let start = Instant::now();
-    let mut c = Connection::new(a, start).unwrap();
+    let mut c = conn(a, start);
     c.auth = Some(Handshake::entry(&key, params()).unwrap().0);
     assert!(c
         .authenticate(start + Duration::from_secs(4), Duration::from_secs(4))
@@ -291,12 +295,12 @@ fn candidates(key: &AuthKey) -> Slots {
 fn admit(slots: &Slots, key: &AuthKey) -> Connection {
     let (client, server) = pair();
     let now = Instant::now();
-    let mut client = Connection::new(client, now).unwrap();
+    let mut client = conn(client, now);
     let (auth, hello) = Handshake::entry(key, params()).unwrap();
     client.auth = Some(auth);
     client.tx.push(&hello);
     let mut candidate = Candidate {
-        conn: Connection::new(server, now).unwrap(),
+        conn: conn(server, now),
         identity: None,
         timeout: Duration::from_secs(4),
     };
@@ -351,7 +355,7 @@ fn authenticated_admission_and_takeover_preserve_exact_data_and_ignore_incomplet
     );
     let (bad_socket, _bad_peer) = pair();
     let mut incomplete = Candidate {
-        conn: Connection::new(bad_socket, Instant::now()).unwrap(),
+        conn: conn(bad_socket, Instant::now()),
         identity: None,
         timeout: Duration::from_secs(4),
     };
@@ -378,7 +382,7 @@ fn authenticated_admission_and_takeover_preserve_exact_data_and_ignore_incomplet
 #[test]
 fn blocked_tun_retains_one_frame_then_delivers_in_order_after_resume() {
     let (mut sender, receiver) = pair();
-    let mut c = Connection::new(receiver, Instant::now()).unwrap();
+    let mut c = conn(receiver, Instant::now());
     c.establish(1380);
     let (tun, consumer) = UnixDatagram::pair().unwrap();
     tun.set_nonblocking(true).unwrap();
@@ -416,7 +420,7 @@ fn blocked_tun_retains_one_frame_then_delivers_in_order_after_resume() {
 #[test]
 fn eof_and_illegal_established_control_close_the_stream() {
     let (mut sender, receiver) = pair();
-    let mut c = Connection::new(receiver, Instant::now()).unwrap();
+    let mut c = conn(receiver, Instant::now());
     c.establish(1380);
     let (tun, _consumer) = UnixDatagram::pair().unwrap();
     tun.set_nonblocking(true).unwrap();
@@ -440,12 +444,12 @@ fn key_reload_invalidates_pending_authentication_before_admission() {
     let slots = candidates(&key);
     let (a, b) = pair();
     let now = Instant::now();
-    let mut client = Connection::new(a, now).unwrap();
+    let mut client = conn(a, now);
     let (auth, hello) = Handshake::entry(&key, params()).unwrap();
     client.auth = Some(auth);
     client.tx.push(&hello);
     let mut candidate = Candidate {
-        conn: Connection::new(b, now).unwrap(),
+        conn: conn(b, now),
         identity: None,
         timeout: Duration::from_secs(4),
     };
@@ -476,7 +480,7 @@ fn key_reload_invalidates_pending_authentication_before_admission() {
 #[test]
 fn partial_bytes_do_not_refresh_end_to_end_liveness() {
     let (mut peer, receiver) = pair();
-    let mut c = Connection::new(receiver, Instant::now()).unwrap();
+    let mut c = conn(receiver, Instant::now());
     c.establish(1380);
     let (tun, _consumer) = UnixDatagram::pair().unwrap();
     tun.set_nonblocking(true).unwrap();
@@ -518,7 +522,7 @@ fn slow_tcp_receiver_backpressures_tun_at_the_transmit_bound_then_delivers_exact
         },
         0
     );
-    let mut c = Connection::new(receiver, Instant::now()).unwrap();
+    let mut c = conn(receiver, Instant::now());
     c.establish(1380);
     let (tun, producer) = UnixDatagram::pair().unwrap();
     tun.set_nonblocking(true).unwrap();

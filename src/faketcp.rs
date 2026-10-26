@@ -252,6 +252,13 @@ impl Session {
         if matches!(self.state, State::SynSent | State::Authenticating)
             && now.duration_since(self.last_rx) >= self.cfg.dead_timeout
         {
+            log::warn!(
+                "worker {}: handshake timed out after {:?} ({} <-> {}), reconnecting",
+                self.cfg.worker,
+                self.cfg.dead_timeout,
+                self.local,
+                m.src
+            );
             self.reconnect(now, true, out);
             return None;
         }
@@ -259,6 +266,12 @@ impl Session {
             // Pre-established attempts wait for SYN_RETRY / dead_timeout so a down peer's
             // kernel RSTs cannot spin port rotation or extend the attempt deadline.
             if self.state == State::Established {
+                log::warn!(
+                    "worker {}: connection reset by peer ({} <-> {}), reconnecting",
+                    self.cfg.worker,
+                    self.local,
+                    m.src
+                );
                 self.reconnect(now, false, out);
             }
             return None;
@@ -320,6 +333,12 @@ impl Session {
             self.state == State::Established && Some(m.src) == self.peer && m.dst == self.local;
         if m.flags & flags::RST != 0 {
             if from_peer {
+                log::warn!(
+                    "worker {}: connection reset by peer ({} <-> {})",
+                    self.cfg.worker,
+                    self.local,
+                    m.src
+                );
                 self.close();
             }
             return None;
@@ -353,15 +372,31 @@ impl Session {
             (Mode::Entry, State::Closed) if now >= self.next_syn => self.connect(now, out),
             (_, State::Closed) => {}
             (Mode::Entry, _) if dead => {
+                let peer = self.peer.expect("entry has remote");
                 log::warn!(
-                    "worker {}: peer silent for {:?}, reconnecting",
+                    "worker {}: {} {:?} ({} <-> {}), reconnecting",
                     self.cfg.worker,
-                    self.cfg.dead_timeout
+                    if self.state == State::Established {
+                        "peer silent for"
+                    } else {
+                        "handshake timed out after"
+                    },
+                    self.cfg.dead_timeout,
+                    self.local,
+                    peer
                 );
                 self.reconnect(now, true, out);
             }
             (Mode::Exit, _) if dead => {
-                log::info!("worker {}: peer {:?} timed out", self.cfg.worker, self.peer);
+                if let Some(peer) = self.peer {
+                    log::warn!(
+                        "worker {}: peer silent for {:?} ({} <-> {}), closing",
+                        self.cfg.worker,
+                        self.cfg.dead_timeout,
+                        self.local,
+                        peer
+                    );
+                }
                 self.close();
             }
             (Mode::Entry, State::SynSent) if now >= self.next_syn => {
@@ -497,6 +532,16 @@ impl Session {
                 self.established(now);
                 self.send_ctrl(flags::ACK, &[], out);
             }
+            Some(EntryStep::AuthFailed(reason)) => {
+                if let Some(peer) = self.peer {
+                    log::warn!(
+                        "worker {}: authentication failed ({} <-> {}): {reason}",
+                        self.cfg.worker,
+                        self.local,
+                        peer
+                    );
+                }
+            }
             None => {}
         }
     }
@@ -515,9 +560,19 @@ impl Session {
                 self.reply_auth(m, payload.len(), &finished, out);
             }
             Ok(ExitStep::Promote(p)) => {
-                // Do not reset a reused tuple: conntrack may already associate it with this handshake.
-                if established && (self.peer != Some(m.src) || self.local != m.dst) {
-                    self.send_rsts(out);
+                if established {
+                    if let Some(old_peer) = self.peer {
+                        log::info!(
+                            "worker {}: authenticated takeover, closing {} <-> {}",
+                            self.cfg.worker,
+                            self.local,
+                            old_peer
+                        );
+                    }
+                    // Do not reset a reused tuple: conntrack may already associate it with this handshake.
+                    if self.peer != Some(m.src) || self.local != m.dst {
+                        self.send_rsts(out);
+                    }
                 }
                 self.local = m.dst;
                 self.peer = Some(m.src);

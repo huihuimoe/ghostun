@@ -5,7 +5,7 @@ mod sys;
 mod tcp;
 mod worker;
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::os::fd::{AsFd, AsRawFd};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
@@ -73,18 +73,6 @@ fn run(mut cfg: Config) -> Result<(), String> {
     let tun_mtu = cfg.resolve_tun_mtu(outer.mtu)?;
     let mss = (outer.mtu - cfg.outer_family.overhead() as u32) as u16;
     let listen_port = cfg.listen.unwrap_or(0);
-    log::info!(
-        "{:?} {:?} mode: outer {} via {} (mtu {}), tun {} mtu {}, {} conns",
-        cfg.transport,
-        cfg.mode,
-        outer.local_ip,
-        outer.dev.as_deref().unwrap_or("?"),
-        outer.mtu,
-        cfg.tun_name,
-        tun_mtu,
-        cfg.conns
-    );
-
     if cfg.transport == Transport::Tcp && cfg.base_port_explicit {
         log::warn!("tcp transport: explicitly configured base_port is ignored; kernel assigns source ports");
     }
@@ -102,7 +90,30 @@ fn run(mut cfg: Config) -> Result<(), String> {
     if !ipv6 {
         cfg.disable_inner_ipv6();
     }
-
+    let outer_endpoint = match cfg.mode {
+        Mode::Entry => format!(
+            "outer {} -> {}",
+            outer.local_ip,
+            cfg.remote.expect("validated")
+        ),
+        Mode::Exit => format!("listen {}", SocketAddr::new(outer.local_ip, listen_port)),
+    };
+    let tun_addrs = match cfg.tun_ipv6 {
+        Some(v6) => format!("{}, {v6}", cfg.tun_ipv4),
+        None => cfg.tun_ipv4.to_string(),
+    };
+    log::info!(
+        "{:?} {:?} mode: {} via {} (mtu {}), tun {} {} (mtu {}), {} conns",
+        cfg.transport,
+        cfg.mode,
+        outer_endpoint,
+        outer.dev.as_deref().unwrap_or("?"),
+        outer.mtu,
+        cfg.tun_name,
+        tun_addrs,
+        tun_mtu,
+        cfg.conns
+    );
     // Rules go in before sockets exist so the kernel never RSTs our first handshake.
     let guard = if cfg.netfilter {
         let spec = netfilter::NftSpec::from_config(&cfg, listen_port);
