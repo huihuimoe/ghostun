@@ -1,6 +1,6 @@
 [package]
 name = "ghostun"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 description = "L3 tunnel with FakeTCP and relay-compatible TCP transports"
 license = "AGPL-3.0-or-later"
