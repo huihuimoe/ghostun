@@ -244,6 +244,7 @@ pub fn raw_socket(
     family: OuterFamily,
     bind_dev: Option<&str>,
     filter: &[libc::sock_filter],
+    entry_addresses: Option<(IpAddr, IpAddr)>,
 ) -> io::Result<OwnedFd> {
     // SAFETY: socket(2) with constant arguments; the fd is owned immediately.
     let fd = cvt(unsafe {
@@ -270,6 +271,25 @@ pub fn raw_socket(
                 libc::IPV6_MTU_DISCOVER,
                 &libc::IPV6_PMTUDISC_DO,
             )?;
+        }
+    }
+    if let Some((local, remote)) = entry_addresses {
+        for (ip, bind) in [(local, true), (remote, false)] {
+            let mut address = SockAddr::from_ip(ip);
+            if let (SockAddr::V6(v6), Some(dev)) = (&mut address, bind_dev) {
+                let dev = std::ffi::CString::new(dev)?;
+                // SAFETY: dev is a valid NUL-terminated interface name.
+                v6.sin6_scope_id = unsafe { libc::if_nametoindex(dev.as_ptr()) };
+            }
+            let (ptr, len) = address.as_ptr_len();
+            // SAFETY: address is live and its length matches its family. Raw ports remain zero.
+            unsafe {
+                cvt(if bind {
+                    libc::bind(fd.as_raw_fd(), ptr, len)
+                } else {
+                    libc::connect(fd.as_raw_fd(), ptr, len)
+                })?;
+            }
         }
     }
     setsockopt(&fd, libc::SOL_SOCKET, libc::SO_MARK, &SOCKET_MARK)?;
@@ -688,6 +708,48 @@ pub fn sysctl_set(key: &str, value: &str) -> io::Result<()> {
 mod batch_tests {
     use super::*;
     use std::net::UdpSocket;
+
+    #[test]
+    #[ignore = "requires CAP_NET_RAW and CAP_NET_ADMIN; run in the e2e container"]
+    fn entry_raw_socket_binds_and_connects_both_families() {
+        let filter = [libc::sock_filter {
+            code: 6,
+            jt: 0,
+            jf: 0,
+            k: 0,
+        }];
+        for ip in [
+            "127.0.0.1".parse::<IpAddr>().unwrap(),
+            "::1".parse().unwrap(),
+        ] {
+            let family = OuterFamily::of(ip);
+            let fd = raw_socket(family, None, &filter, Some((ip, ip))).unwrap();
+            for peer in [false, true] {
+                let address = SockAddr::from_ip(family.unspecified());
+                let (_, mut len) = address.as_ptr_len();
+                // SAFETY: address has writable storage of the selected family's exact size.
+                let mut address = address;
+                let ptr = match &mut address {
+                    SockAddr::V4(v) => (v as *mut libc::sockaddr_in).cast(),
+                    SockAddr::V6(v) => (v as *mut libc::sockaddr_in6).cast(),
+                };
+                // SAFETY: ptr and len describe the live, correctly aligned address storage.
+                let result = unsafe {
+                    if peer {
+                        libc::getpeername(fd.as_raw_fd(), ptr, &mut len)
+                    } else {
+                        libc::getsockname(fd.as_raw_fd(), ptr, &mut len)
+                    }
+                };
+                assert_eq!(result, 0);
+                let got = match address {
+                    SockAddr::V4(v) => IpAddr::from(v.sin_addr.s_addr.to_ne_bytes()),
+                    SockAddr::V6(v) => IpAddr::from(v.sin6_addr.s6_addr),
+                };
+                assert_eq!(got, ip);
+            }
+        }
+    }
 
     #[test]
     fn receive_reuses_storage_after_move_truncation_and_empty_read() {

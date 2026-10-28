@@ -154,7 +154,9 @@ fn run(mut cfg: Config) -> Result<(), String> {
             Mode::Entry => outer.dev.as_deref(),
             Mode::Exit => cfg.iface.as_deref(),
         };
-        let raw = sys::raw_socket(cfg.outer_family, bind_dev, &filter)
+        let entry_addresses = (cfg.mode == Mode::Entry)
+            .then(|| (outer.local_ip, cfg.remote.expect("validated").ip()));
+        let raw = sys::raw_socket(cfg.outer_family, bind_dev, &filter, entry_addresses)
             .map_err(|e| format!("raw socket: {e}"))?;
         let scfg = SessionConfig::from_config(&cfg, outer.local_ip, listen_port, id, mss);
         let session = Session::new(scfg, std::time::Instant::now(), seed ^ ((id as u64) << 48))
