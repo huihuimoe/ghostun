@@ -255,6 +255,92 @@ fn writes_preserve_frames_across_partial_prefixes_and_would_block() {
 }
 
 #[test]
+fn send_blocks_preserve_framing_under_sustained_backpressure() {
+    struct Limited {
+        bytes: Vec<u8>,
+        budget: usize,
+        vectored: usize,
+    }
+    impl Write for Limited {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.write_vectored(&[io::IoSlice::new(bytes)])
+        }
+        fn write_vectored(&mut self, buffers: &[io::IoSlice<'_>]) -> io::Result<usize> {
+            if self.budget == 0 {
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            self.vectored += usize::from(buffers.len() > 1);
+            let mut written = 0;
+            for buffer in buffers {
+                let len = buffer.len().min(self.budget);
+                self.bytes.extend_from_slice(&buffer[..len]);
+                self.budget -= len;
+                written += len;
+                if self.budget == 0 {
+                    break;
+                }
+            }
+            Ok(written)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut queue = SendQueue::default();
+    queue.grow();
+    let mut expected = Vec::new();
+    for index in 0..200u8 {
+        let packet = vec![index; 1200];
+        assert!(queue.push(&packet));
+        expected.push(packet);
+    }
+    let mut writer = Limited {
+        bytes: Vec::new(),
+        budget: 70001,
+        vectored: 0,
+    };
+    queue.flush(&mut writer).unwrap();
+    assert_eq!(writer.bytes.len(), 70001);
+    for index in 200..250u8 {
+        assert!(queue
+            .push_in_place(1200, |buffer| {
+                buffer[..1200].fill(index);
+                Ok(Some(1200))
+            })
+            .unwrap());
+        expected.push(vec![index; 1200]);
+    }
+    writer.budget = 60100;
+    queue.flush(&mut writer).unwrap();
+    for index in 0..50u8 {
+        let packet = vec![index; 1200];
+        assert!(queue.push(&packet));
+        expected.push(packet);
+    }
+    assert!(queue.bytes() <= TX_LIMIT);
+    writer.budget = usize::MAX;
+    queue.flush(&mut writer).unwrap();
+    assert!(writer.vectored > 0);
+    assert_eq!(queue.bytes(), 0);
+    let mut reader = Receive::new(1200);
+    let mut input = writer.bytes.as_slice();
+    for packet in expected {
+        assert!(reader.read(&mut input).unwrap());
+        assert_eq!(reader.payload(), packet);
+        reader.clear();
+    }
+    assert!(input.is_empty());
+    // Failed direct reads with changing maxima must not leave empty blocks before real data.
+    for max in [100, 2000, 65000] {
+        assert!(!queue.push_in_place(max, |_| Ok(None)).unwrap());
+    }
+    assert!(queue.push(b"last"));
+    let mut output = Vec::new();
+    queue.flush(&mut output).unwrap();
+    assert_eq!(output, b"\0\x04last");
+}
+
+#[test]
 fn malformed_lengths_and_packets_fail_without_resynchronizing() {
     for bytes in [&[0, 0][..], &[255, 255][..], &[0, 3, 1][..]] {
         let mut input = bytes;

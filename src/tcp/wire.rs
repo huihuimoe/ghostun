@@ -1,5 +1,6 @@
 //! The TCP v1 codec and mutual authentication. See docs/261025-dual-transport-spec.md.
-use std::io::{self, Read, Write};
+use std::collections::VecDeque;
+use std::io::{self, IoSlice, Read, Write};
 use std::mem;
 
 use hmac::{Hmac, KeyInit, Mac};
@@ -149,7 +150,15 @@ impl Receive {
 
 #[derive(Default)]
 pub struct SendQueue {
-    buf: Vec<u8>,
+    blocks: VecDeque<SendBlock>,
+    free: Vec<SendBlock>,
+    bytes: usize,
+    established: bool,
+}
+
+#[derive(Default)]
+struct SendBlock {
+    bytes: Vec<u8>,
     head: usize,
     tail: usize,
 }
@@ -157,7 +166,7 @@ pub struct SendQueue {
 impl SendQueue {
     #[inline(always)]
     pub fn bytes(&self) -> usize {
-        self.tail - self.head
+        self.bytes
     }
 
     #[inline(always)]
@@ -166,26 +175,38 @@ impl SendQueue {
     }
 
     pub fn grow(&mut self) {
-        self.buf.resize(TX_LIMIT + 1, 0);
+        self.established = true;
     }
 
     #[inline]
-    fn ensure(&mut self, space: usize) {
-        if self.buf.len() - self.tail >= space {
-            return;
+    fn tail(&mut self, space: usize) -> &mut SendBlock {
+        if let Some(block) = self.blocks.back_mut() {
+            if block.head == block.tail && block.bytes.len() < space {
+                block.bytes.resize(space, 0);
+            }
         }
-        if self.head > 0 {
-            self.buf.copy_within(self.head..self.tail, 0);
-            self.tail -= self.head;
-            self.head = 0;
+        if self
+            .blocks
+            .back()
+            .is_none_or(|b| b.bytes.len() - b.tail < space)
+        {
+            let mut block = self.free.pop().unwrap_or_default();
+            // Leave a whole queue budget before the largest contiguous direct-read reservation.
+            // A full block therefore holds at least TX_LIMIT committed bytes; at most two such
+            // blocks can be live, even when a maximum-MTU read returns a tiny packet.
+            let size = if self.established {
+                TX_LIMIT + usize::from(u16::MAX) + FRAME_PREFIX_LEN + 1
+            } else {
+                256
+            };
+            block
+                .bytes
+                .resize(block.bytes.len().max(size).max(space), 0);
+            block.head = 0;
+            block.tail = 0;
+            self.blocks.push_back(block);
         }
-        if self.buf.len() - self.tail < space {
-            // Bound retained storage without allocating the full budget for idle candidates.
-            let len = (self.buf.len() * 2)
-                .max(self.tail + space)
-                .min(TX_LIMIT + 1);
-            self.buf.resize(len, 0);
-        }
+        self.blocks.back_mut().expect("tail block was allocated")
     }
 
     #[inline]
@@ -194,10 +215,11 @@ impl SendQueue {
             return false;
         }
         let frame = FRAME_PREFIX_LEN + payload.len();
-        self.ensure(frame);
-        put_be16(&mut self.buf, self.tail, payload.len() as u16);
-        self.buf[self.tail + FRAME_PREFIX_LEN..self.tail + frame].copy_from_slice(payload);
-        self.tail += frame;
+        let block = self.tail(frame);
+        put_be16(&mut block.bytes, block.tail, payload.len() as u16);
+        block.bytes[block.tail + FRAME_PREFIX_LEN..block.tail + frame].copy_from_slice(payload);
+        block.tail += frame;
+        self.bytes += frame;
         true
     }
 
@@ -209,27 +231,40 @@ impl SendQueue {
         if !self.room(max) {
             return Ok(false);
         }
-        self.ensure(max + FRAME_PREFIX_LEN + 1);
-        let payload_start = self.tail + FRAME_PREFIX_LEN;
-        let Some(len) = f(&mut self.buf[payload_start..payload_start + max + 1])? else {
+        let block = self.tail(max + FRAME_PREFIX_LEN + 1);
+        let payload_start = block.tail + FRAME_PREFIX_LEN;
+        let Some(len) = f(&mut block.bytes[payload_start..payload_start + max + 1])? else {
             return Ok(false);
         };
         assert!((1..=max).contains(&len));
-        put_be16(&mut self.buf, self.tail, len as u16);
-        self.tail += FRAME_PREFIX_LEN + len;
+        put_be16(&mut block.bytes, block.tail, len as u16);
+        block.tail += FRAME_PREFIX_LEN + len;
+        self.bytes += FRAME_PREFIX_LEN + len;
         Ok(true)
     }
 
     #[inline]
     pub fn flush(&mut self, output: &mut impl Write) -> io::Result<()> {
-        while self.head < self.tail {
-            match output.write(&self.buf[self.head..self.tail]) {
+        while self.bytes != 0 {
+            let mut slices = [IoSlice::new(&[]); 8];
+            let count = self.blocks.len().min(slices.len());
+            for (slice, block) in slices.iter_mut().zip(&self.blocks) {
+                *slice = IoSlice::new(&block.bytes[block.head..block.tail]);
+            }
+            match output.write_vectored(&slices[..count]) {
                 Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
                 Ok(n) => {
-                    self.head += n;
-                    if self.head == self.tail {
-                        self.head = 0;
-                        self.tail = 0;
+                    self.bytes -= n;
+                    let mut remaining = n;
+                    while remaining != 0 {
+                        let block = self.blocks.front_mut().expect("queued bytes own a block");
+                        let consumed = remaining.min(block.tail - block.head);
+                        block.head += consumed;
+                        remaining -= consumed;
+                        if block.head == block.tail {
+                            self.free
+                                .push(self.blocks.pop_front().expect("front block exists"));
+                        }
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -420,5 +455,43 @@ pub fn validate_packet(p: &[u8], mtu: usize) -> io::Result<()> {
         Err(invalid(
             "invalid framing: malformed inner packet or MTU exceeded",
         ))
+    }
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+
+    #[test]
+    fn large_mtu_tiny_reads_keep_retained_storage_bounded() {
+        let mut queue = SendQueue::default();
+        queue.grow();
+        for _ in 0..3 {
+            let mut packets = 0;
+            while queue
+                .push_in_place(65000, |buffer| {
+                    buffer[..40].fill(7);
+                    Ok(Some(40))
+                })
+                .unwrap()
+            {
+                packets += 1;
+            }
+            assert!(packets > 1000);
+            let retained: usize = queue
+                .blocks
+                .iter()
+                .chain(&queue.free)
+                .map(|b| b.bytes.len())
+                .sum();
+            assert!(retained <= 2 * (TX_LIMIT + usize::from(u16::MAX) + FRAME_PREFIX_LEN + 1));
+            let mut bytes = Vec::new();
+            queue.flush(&mut bytes).unwrap();
+            assert_eq!(bytes.len(), packets * 42);
+            for frame in bytes.as_chunks::<42>().0 {
+                assert_eq!(&frame[..2], &[0, 40]);
+                assert!(frame[2..].iter().all(|&v| v == 7));
+            }
+        }
     }
 }
