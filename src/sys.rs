@@ -4,7 +4,7 @@ pub mod netlink;
 
 use std::fs::File;
 use std::io::{self, Write};
-use std::mem::{size_of, zeroed, MaybeUninit};
+use std::mem::{size_of, zeroed};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
@@ -20,11 +20,6 @@ pub const RAW_BATCH: usize = 64;
 pub const READ_READY: i16 = libc::POLLIN | libc::POLLERR | libc::POLLHUP;
 pub const WRITE_READY: i16 = libc::POLLOUT | libc::POLLERR | libc::POLLHUP;
 type CmsgBuf = [usize; 8];
-
-#[inline(always)]
-fn uninit_batch<T>() -> [MaybeUninit<T>; RAW_BATCH] {
-    [const { MaybeUninit::uninit() }; RAW_BATCH]
-}
 
 #[inline(always)]
 fn cvt(ret: libc::c_int) -> io::Result<libc::c_int> {
@@ -423,140 +418,197 @@ pub fn tcp_connect(remote: SocketAddr, dev: Option<&str>) -> io::Result<TcpStrea
     Ok(stream)
 }
 
+/// Reusable descriptor storage. Every pointer targets a separate stable heap allocation.
+pub struct RawSender {
+    iovs: Box<[libc::iovec]>,
+    hdrs: Box<[libc::mmsghdr]>,
+    destinations: Box<[SockAddr]>,
+}
+
+impl RawSender {
+    pub fn new(family: OuterFamily) -> Self {
+        // SAFETY: zero is valid for these plain C descriptors; pointers are installed below.
+        let mut sender = Self {
+            iovs: (0..RAW_BATCH).map(|_| unsafe { zeroed() }).collect(),
+            hdrs: (0..RAW_BATCH).map(|_| unsafe { zeroed() }).collect(),
+            destinations: vec![SockAddr::from_ip(family.unspecified()); RAW_BATCH].into(),
+        };
+        for k in 0..RAW_BATCH {
+            sender.hdrs[k].msg_hdr.msg_iov = &mut sender.iovs[k];
+            sender.hdrs[k].msg_hdr.msg_iovlen = 1;
+        }
+        sender
+    }
+
+    pub fn send(&mut self, fd: BorrowedFd<'_>, frames: &[(&[u8], IpAddr)]) -> io::Result<()> {
+        assert!(frames.len() <= RAW_BATCH);
+        for (k, &(frame, dst)) in frames.iter().enumerate() {
+            self.destinations[k] = SockAddr::from_ip(dst);
+            let (addr, len) = self.destinations[k].as_ptr_len();
+            self.iovs[k].iov_base = frame.as_ptr().cast_mut().cast();
+            self.iovs[k].iov_len = frame.len();
+            self.hdrs[k].msg_hdr.msg_name = addr.cast_mut().cast();
+            self.hdrs[k].msg_hdr.msg_namelen = len;
+        }
+        let mut first_err = None;
+        let mut sent = 0;
+        while sent < count {
+            // SAFETY: active descriptors point into live frames, destinations and boxed iovecs.
+            let n = unsafe {
+                libc::sendmmsg(
+                    fd.as_raw_fd(),
+                    self.hdrs[sent..].as_mut_ptr(),
+                    (count - sent) as _,
+                    libc::MSG_DONTWAIT as _,
+                )
+            };
+            if n > 0 {
+                sent += n as usize;
+                continue;
+            }
+            let e = io::Error::last_os_error();
+            if matches!(
+                e.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+            ) {
+                return Err(e);
+            }
+            first_err.get_or_insert(e);
+            sent += 1;
+        }
+        first_err.map_or(Ok(()), Err)
+    }
+}
+
 #[inline]
 pub fn send_raw(fd: BorrowedFd<'_>, frame: &[u8], dst: IpAddr) -> io::Result<()> {
-    send_raw_batch(fd, frame, frame.len(), &[frame.len()], dst)
-}
-
-#[inline]
-pub fn send_raw_batch(
-    fd: BorrowedFd<'_>,
-    bufs: &[u8],
-    stride: usize,
-    lens: &[usize],
-    dst: IpAddr,
-) -> io::Result<()> {
-    let count = lens.len();
     let sa = SockAddr::from_ip(dst);
-    let (addr_ptr, namelen) = sa.as_ptr_len();
-    let mut iovs = uninit_batch::<libc::iovec>();
-    let mut hdrs = uninit_batch::<libc::mmsghdr>();
-    // SAFETY: POD socket structs; active indices 0..count are fully initialized before sendmmsg.
-    unsafe {
-        let mut base: libc::mmsghdr = zeroed();
-        base.msg_hdr.msg_name = addr_ptr.cast_mut().cast();
-        base.msg_hdr.msg_namelen = namelen;
-        base.msg_hdr.msg_iovlen = 1;
-        for (k, &len) in lens.iter().enumerate() {
-            let iov = iovs[k].write(libc::iovec {
-                iov_base: bufs[k * stride..].as_ptr().cast_mut().cast(),
-                iov_len: len,
-            });
-            let mut hdr = base;
-            hdr.msg_hdr.msg_iov = iov;
-            hdrs[k].write(hdr);
-        }
+    let (addr, len) = sa.as_ptr_len();
+    // SAFETY: frame and destination remain live until the synchronous sendto returns.
+    let n = unsafe {
+        libc::sendto(
+            fd.as_raw_fd(),
+            frame.as_ptr().cast(),
+            frame.len(),
+            libc::MSG_DONTWAIT,
+            addr,
+            len,
+        )
+    };
+    if n < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
     }
-    let mut first_err = None;
-    let mut sent = 0;
-    while sent < count {
-        // SAFETY: hdrs[sent..count] were initialized above and reference live iovecs and buffers.
-        let n = unsafe {
-            libc::sendmmsg(
-                fd.as_raw_fd(),
-                hdrs[sent..].as_mut_ptr().cast(),
-                (count - sent) as libc::c_uint,
-                libc::MSG_DONTWAIT as _,
-            )
-        };
-        if n > 0 {
-            sent += n as usize;
-            continue;
-        }
-        let e = io::Error::last_os_error();
-        if matches!(
-            e.kind(),
-            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-        ) {
-            return Err(e);
-        }
-        first_err.get_or_insert(e);
-        sent += 1;
-    }
-    first_err.map_or(Ok(()), Err)
 }
 
-/// Receives up to `RAW_BATCH` frames via `recvmmsg`, normalizing IPv6 headers in place.
-/// Slots with truncated or malformed ancillary data are marked with length `0`.
-#[inline]
-pub fn recv_raw_batch(
-    fd: BorrowedFd<'_>,
-    family: OuterFamily,
-    bufs: &mut [u8],
+/// Owns receive buffers and ancillary storage; none of the backing allocations are resized.
+pub struct RawReceiver {
+    bufs: Box<[u8]>,
+    pub lens: [usize; RAW_BATCH],
     stride: usize,
-    lens: &mut [usize; RAW_BATCH],
-) -> io::Result<usize> {
-    // SAFETY: receive buffers and ancillary storage live through recvmmsg; CMSG traversal is
-    // bounded by the returned controllen, and flags are checked before reading pktinfo.
-    unsafe {
-        let mut iovs = uninit_batch::<libc::iovec>();
-        let mut hdrs = uninit_batch::<libc::mmsghdr>();
-        let mut sources = uninit_batch::<libc::sockaddr_in6>();
-        let mut controls = uninit_batch::<CmsgBuf>();
-        let mut base: libc::mmsghdr = zeroed();
-        base.msg_hdr.msg_iovlen = 1;
+    family: OuterFamily,
+    _iovs: Box<[libc::iovec]>,
+    hdrs: Box<[libc::mmsghdr]>,
+    sources: Box<[libc::sockaddr_in6]>,
+    _controls: Box<[CmsgBuf]>,
+    used: usize,
+}
+
+impl RawReceiver {
+    pub fn new(family: OuterFamily, stride: usize) -> Self {
+        // SAFETY: all zeroed types are plain C storage; initialized pointers are set below.
+        let mut rx = Self {
+            bufs: vec![0; RAW_BATCH * stride].into(),
+            lens: [0; RAW_BATCH],
+            stride,
+            family,
+            _iovs: (0..RAW_BATCH).map(|_| unsafe { zeroed() }).collect(),
+            hdrs: (0..RAW_BATCH).map(|_| unsafe { zeroed() }).collect(),
+            sources: (0..RAW_BATCH).map(|_| unsafe { zeroed() }).collect(),
+            _controls: vec![[0; 8]; RAW_BATCH].into(),
+            used: RAW_BATCH,
+        };
         let offset = if family == OuterFamily::Ipv6 {
-            base.msg_hdr.msg_namelen = size_of::<libc::sockaddr_in6>() as libc::socklen_t;
-            base.msg_hdr.msg_controllen = size_of::<CmsgBuf>() as _;
             IPV6_HDR
         } else {
             0
         };
         for k in 0..RAW_BATCH {
-            let iov = iovs[k].write(libc::iovec {
-                iov_base: bufs[k * stride + offset..].as_mut_ptr().cast(),
+            rx._iovs[k] = libc::iovec {
+                iov_base: rx.bufs[k * stride + offset..].as_mut_ptr().cast(),
                 iov_len: stride - offset,
-            });
-            let mut hdr = base;
-            hdr.msg_hdr.msg_iov = iov;
+            };
+            let msg = &mut rx.hdrs[k].msg_hdr;
+            msg.msg_iov = &mut rx._iovs[k];
+            msg.msg_iovlen = 1;
             if family == OuterFamily::Ipv6 {
-                hdr.msg_hdr.msg_name = sources[k].as_mut_ptr().cast();
-                hdr.msg_hdr.msg_control = controls[k].as_mut_ptr().cast();
+                msg.msg_name = (&mut rx.sources[k] as *mut libc::sockaddr_in6).cast();
+                msg.msg_control = rx._controls[k].as_mut_ptr().cast();
             }
-            hdrs[k].write(hdr);
         }
-        let m = libc::recvmmsg(
-            fd.as_raw_fd(),
-            hdrs.as_mut_ptr().cast(),
-            RAW_BATCH as libc::c_uint,
-            libc::MSG_DONTWAIT as _,
-            std::ptr::null_mut(),
-        );
+        rx
+    }
+
+    pub fn buffers(&self) -> &[u8] {
+        &self.bufs
+    }
+
+    pub fn buffers_mut(&mut self) -> &mut [u8] {
+        &mut self.bufs
+    }
+
+    fn reset(&mut self) {
+        for hdr in &mut self.hdrs[..self.used] {
+            hdr.msg_len = 0;
+            hdr.msg_hdr.msg_flags = 0;
+            if self.family == OuterFamily::Ipv6 {
+                hdr.msg_hdr.msg_namelen = size_of::<libc::sockaddr_in6>() as _;
+                hdr.msg_hdr.msg_controllen = size_of::<CmsgBuf>();
+            }
+        }
+    }
+
+    /// Truncated frames and malformed IPv6 ancillary data have length zero.
+    pub fn receive(&mut self, fd: BorrowedFd<'_>) -> io::Result<usize> {
+        self.reset();
+        // SAFETY: boxed buffers, descriptors and ancillary storage remain live and fixed.
+        let m = unsafe {
+            libc::recvmmsg(
+                fd.as_raw_fd(),
+                self.hdrs.as_mut_ptr(),
+                RAW_BATCH as _,
+                libc::MSG_DONTWAIT as _,
+                std::ptr::null_mut(),
+            )
+        };
+        self.used = 0;
         if m < 0 {
             return Err(io::Error::last_os_error());
         }
-        let m = m as usize;
-        for k in 0..m {
-            let hdr = hdrs[k].assume_init_ref();
+        self.used = m as usize;
+        for k in 0..self.used {
+            let hdr = &self.hdrs[k];
             let msg = &hdr.msg_hdr;
             let n = hdr.msg_len as usize;
-            if msg.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0 {
-                lens[k] = 0;
-            } else if family == OuterFamily::Ipv4 {
-                lens[k] = n;
-            } else if let Some(dst) = pktinfo_dst(msg) {
+            self.lens[k] = if msg.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0 {
+                0
+            } else if self.family == OuterFamily::Ipv4 {
+                n
+            // SAFETY: recvmmsg populated the bounded ancillary buffer referenced by msg.
+            } else if let Some(dst) = unsafe { pktinfo_dst(msg) } {
                 pkt::write_ipv6_header(
-                    &mut bufs[k * stride..(k + 1) * stride],
-                    Ipv6Addr::from(sources[k].assume_init_ref().sin6_addr.s6_addr),
+                    &mut self.bufs[k * self.stride..(k + 1) * self.stride],
+                    Ipv6Addr::from(self.sources[k].sin6_addr.s6_addr),
                     dst,
                     n,
                 );
-                lens[k] = IPV6_HDR + n;
+                IPV6_HDR + n
             } else {
-                lens[k] = 0;
-            }
+                0
+            };
         }
-        Ok(m)
+        Ok(self.used)
     }
 }
 
@@ -625,4 +677,48 @@ pub fn sysctl_set(key: &str, value: &str) -> io::Result<()> {
     File::create(&path)
         .and_then(|mut f| f.write_all(value.as_bytes()))
         .map_err(annotate)
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+    use std::net::UdpSocket;
+
+    #[test]
+    fn receive_reuses_storage_after_move_truncation_and_empty_read() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let rx = RawReceiver::new(OuterFamily::Ipv4, 32);
+        let mut moved = Box::new(rx);
+        peer.send_to(&[7; 40], socket.local_addr().unwrap())
+            .unwrap();
+        assert_eq!(moved.receive(socket.as_fd()).unwrap(), 1);
+        assert_eq!(moved.lens[0], 0);
+        assert_eq!(
+            moved.receive(socket.as_fd()).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        for payload in [b"one".as_slice(), b"second"] {
+            peer.send_to(payload, socket.local_addr().unwrap()).unwrap();
+            assert_eq!(moved.receive(socket.as_fd()).unwrap(), 1);
+            assert_eq!(&moved.buffers()[..moved.lens[0]], payload);
+        }
+    }
+
+    #[test]
+    fn ipv6_ancillary_capacity_is_restored_for_repeated_short_batches() {
+        let socket = UdpSocket::bind("[::1]:0").unwrap();
+        let peer = UdpSocket::bind("[::1]:0").unwrap();
+        let fd: OwnedFd = socket.try_clone().unwrap().into();
+        setsockopt(&fd, libc::IPPROTO_IPV6, libc::IPV6_RECVPKTINFO, &1i32).unwrap();
+        let mut rx = RawReceiver::new(OuterFamily::Ipv6, 128);
+        for _ in 0..3 {
+            peer.send_to(b"packet", socket.local_addr().unwrap())
+                .unwrap();
+            assert_eq!(rx.receive(socket.as_fd()).unwrap(), 1);
+            assert_eq!(rx.lens[0], IPV6_HDR + 6);
+            assert_eq!(&rx.buffers()[IPV6_HDR..rx.lens[0]], b"packet");
+            assert_eq!(&rx.buffers()[24..40], &Ipv6Addr::LOCALHOST.octets());
+        }
+    }
 }

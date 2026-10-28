@@ -88,8 +88,8 @@ pub fn run(
     let mut attached = false;
 
     // Reserve the selected outer headers in each slot so TUN payloads never need to be moved.
-    let mut bufs = vec![0u8; RAW_BATCH * stride];
-    let mut lens = [0usize; RAW_BATCH];
+    let mut rx = sys::RawReceiver::new(family, stride);
+    let mut tx = sys::RawSender::new(family);
     let mut fds = [
         sys::pollfd(tun.as_raw_fd(), libc::POLLIN),
         sys::pollfd(raw.as_raw_fd(), libc::POLLIN),
@@ -124,52 +124,53 @@ pub fn run(
         let mut raw_ready = fds[1].revents & libc::POLLIN != 0;
         for _ in 0..ROUNDS {
             if raw_ready {
-                raw_ready =
-                    match sys::recv_raw_batch(raw.as_fd(), family, &mut bufs, stride, &mut lens) {
-                        Ok(m) => {
-                            for (k, &n) in lens[..m].iter().enumerate() {
-                                if n == 0 {
-                                    continue;
-                                }
-                                let frame = &bufs[k * stride..k * stride + n];
-                                if let Some(inner) = session.on_outer(now, frame, &mut out) {
-                                    match sys::tun_write(tun.as_fd(), inner) {
-                                        Ok(true) => tun_ready = true,
-                                        Ok(false) => {}
-                                        Err(e) => log::debug!("worker {id}: tun write: {e}"),
-                                    }
+                raw_ready = match rx.receive(raw.as_fd()) {
+                    Ok(m) => {
+                        for (k, &n) in rx.lens[..m].iter().enumerate() {
+                            if n == 0 {
+                                continue;
+                            }
+                            let frame = &rx.buffers()[k * stride..k * stride + n];
+                            if let Some(inner) = session.on_outer(now, frame, &mut out) {
+                                match sys::tun_write(tun.as_fd(), inner) {
+                                    Ok(true) => tun_ready = true,
+                                    Ok(false) => {}
+                                    Err(e) => log::debug!("worker {id}: tun write: {e}"),
                                 }
                             }
-                            m == RAW_BATCH
                         }
-                        Err(e) => {
-                            if e.kind() != std::io::ErrorKind::WouldBlock {
-                                log::debug!("worker {id}: raw receive: {e}");
-                            }
-                            false
+                        m == RAW_BATCH
+                    }
+                    Err(e) => {
+                        if e.kind() != std::io::ErrorKind::WouldBlock {
+                            log::debug!("worker {id}: raw receive: {e}");
                         }
-                    };
+                        false
+                    }
+                };
             }
             if tun_ready {
                 let mut reads = 0;
                 let mut count = 0;
                 let mut batch_dst = None;
                 while reads < RAW_BATCH {
-                    let slot = &mut bufs[count * stride..(count + 1) * stride];
+                    let slot = &mut rx.buffers_mut()[count * stride..(count + 1) * stride];
                     let Ok(Some(n)) = sys::tun_read(tun.as_fd(), &mut slot[overhead..]) else {
                         break;
                     };
                     reads += 1;
                     if let Some((len, dst)) = session.encap(slot, n) {
-                        lens[count] = len;
+                        rx.lens[count] = len;
                         batch_dst = Some(dst);
                         count += 1;
                     }
                 }
                 if let Some(dst) = batch_dst {
-                    if let Err(e) =
-                        sys::send_raw_batch(raw.as_fd(), &bufs, stride, &lens[..count], dst)
-                    {
+                    let frames = rx.lens[..count]
+                        .iter()
+                        .enumerate()
+                        .map(|(k, &n)| (&rx.buffers()[k * stride..k * stride + n], dst));
+                    if let Err(e) = tx.send(raw.as_fd(), frames) {
                         log::debug!("worker {id}: send to {dst}: {e}");
                     }
                 }
