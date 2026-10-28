@@ -123,6 +123,7 @@ This feature authenticates connections but does not add encryption or cryptograp
 ### 6. Bounded Buffering and Backpressure
 
 - Cap pending application-level transmit bytes at 256 KiB per worker, including frame prefixes. This is an internal constant, not a new tuning option.
+- Use the same per-worker budget to size each TUN ring to at most 256 packets and 256 KiB of MTU-sized payload. Set `TCP_NOTSENT_LOWAT` to 64 KiB and limit each application socket write to 64 KiB. The socket option is a backpressure threshold, not a strict byte cap; it may overshoot within a write. Keep kernel send-buffer autotuning for data already transmitted but not acknowledged. These limits do not imply a measured latency improvement.
 - Stop reading the corresponding TUN queue when there is insufficient space for another maximum-size frame. Preserve partial-write state without copying or rebuilding already queued frames unnecessarily.
 - Cap pending application-level receive bytes at 64 KiB per established worker (and one authentication frame for unauthenticated candidates). If writing a decoded data packet to TUN would block, retain the buffered bytes and stop reading that TCP stream until delivery can proceed.
 - Keep control-message and authentication buffering bounded too; repeated timer events or blocked writes must not create unbounded queues.

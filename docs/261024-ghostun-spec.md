@@ -91,7 +91,7 @@ Design and deliver `ghostun`: a high-performance, low-memory L3-over-FakeTCP tun
 ### 2. Inner Multi-Queue TUN and Dual-Stack Addressing
 
 - Create the virtual interface through Linux `/dev/net/tun` and `TUNSETIFF` with `IFF_TUN | IFF_NO_PI | IFF_MULTI_QUEUE`; default name `ghostun0`. Do not set `IFF_PERSIST`.
-- Match the queue count to the worker count and configure `txqueuelen 8192` so multi-queue ring division does not tail-drop bursts. Automatically configure inner IPv4 (Entry `10.200.0.1/30`, Exit `10.200.0.2/30`) and IPv6 ULA (Entry `fd00:200::1/126`, Exit `fd00:200::2/126`) addresses, with `--no-ipv6` available to disable IPv6.
+- Match the TUN queue count to the worker count. Linux applies `txqueuelen` independently to each queue; set it to `min(256, floor(256 KiB / tun_mtu))` packets per queue. Automatically configure inner IPv4 (Entry `10.200.0.1/30`, Exit `10.200.0.2/30`) and IPv6 ULA (Entry `fd00:200::1/126`, Exit `fd00:200::2/126`) addresses, with `--no-ipv6` available to disable IPv6.
 - Configure the TUN before installing firewall rules. If inner IPv6 configuration fails because IPv6 is unavailable, log a warning and continue with inner IPv4; omit IPv6 forwarding sysctls and masquerade rules. Do not change the selected outer transport family.
 - With `IFF_NO_PI`, the kernel identifies the address family from each packet's first IP version nibble (`4` or `6`); user space does not prepend a four-byte PI header.
 

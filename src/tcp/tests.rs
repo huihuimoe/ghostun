@@ -266,6 +266,9 @@ fn send_blocks_preserve_framing_under_sustained_backpressure() {
             self.write_vectored(&[io::IoSlice::new(bytes)])
         }
         fn write_vectored(&mut self, buffers: &[io::IoSlice<'_>]) -> io::Result<usize> {
+            assert!(
+                buffers.iter().map(|b| b.len()).sum::<usize>() <= crate::budget::TCP_WRITE_BATCH
+            );
             if self.budget == 0 {
                 return Err(io::ErrorKind::WouldBlock.into());
             }
@@ -610,7 +613,8 @@ fn partial_bytes_do_not_refresh_end_to_end_liveness() {
 #[test]
 fn slow_tcp_receiver_backpressures_tun_at_the_transmit_bound_then_delivers_exact_data() {
     let (mut peer, receiver) = pair();
-    let small = 4096i32;
+    // A large send buffer leaves the unsent watermark responsible for applying backpressure.
+    let send_buffer = 1024 * 1024i32;
     // SAFETY: valid socket and option pointer with matching c_int size.
     assert_eq!(
         unsafe {
@@ -618,13 +622,29 @@ fn slow_tcp_receiver_backpressures_tun_at_the_transmit_bound_then_delivers_exact
                 receiver.as_raw_fd(),
                 libc::SOL_SOCKET,
                 libc::SO_SNDBUF,
-                (&small as *const i32).cast(),
+                (&send_buffer as *const i32).cast(),
                 4,
             )
         },
         0
     );
     let mut c = conn(receiver, Instant::now());
+    let mut lowat = 0u32;
+    let mut size = std::mem::size_of_val(&lowat) as libc::socklen_t;
+    // SAFETY: writable u32 option storage with the matching socket option length.
+    assert_eq!(
+        unsafe {
+            libc::getsockopt(
+                c.socket.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_NOTSENT_LOWAT,
+                (&mut lowat as *mut u32).cast(),
+                &mut size,
+            )
+        },
+        0
+    );
+    assert_eq!(lowat, crate::budget::TCP_NOTSENT);
     c.establish(1380);
     let (tun, producer) = UnixDatagram::pair().unwrap();
     tun.set_nonblocking(true).unwrap();
@@ -643,6 +663,15 @@ fn slow_tcp_receiver_backpressures_tun_at_the_transmit_bound_then_delivers_exact
         c.pump(&tun, 1380, Duration::from_secs(30), Duration::from_secs(60))
             .unwrap();
         assert!(c.tx.bytes() <= TX_LIMIT);
+        let mut unsent = 0i32;
+        // SAFETY: SIOCOUTQNSD returns unsent bytes into a writable int for this TCP socket.
+        assert_eq!(
+            unsafe { libc::ioctl(c.socket.as_raw_fd(), 0x894b, &mut unsent) },
+            0
+        );
+        assert!(
+            unsent as usize <= crate::budget::TCP_NOTSENT as usize + crate::budget::TCP_WRITE_BATCH
+        );
         if !c.tx.room(1380) {
             break;
         }

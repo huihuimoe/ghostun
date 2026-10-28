@@ -13,7 +13,7 @@ use crate::faketcp::pkt::{be16, is_valid_inner_ip, put_be16};
 use crate::sys;
 
 pub const FRAME_PREFIX_LEN: usize = 2;
-pub const TX_LIMIT: usize = 256 * 1024;
+pub const TX_LIMIT: usize = crate::budget::BYTES;
 pub const RX_LIMIT: usize = 64 * 1024;
 pub const PING: u8 = 0x10;
 pub const PONG: u8 = 0x11;
@@ -248,8 +248,11 @@ impl SendQueue {
         while self.bytes != 0 {
             let mut slices = [IoSlice::new(&[]); 8];
             let count = self.blocks.len().min(slices.len());
+            let mut allowance = crate::budget::TCP_WRITE_BATCH;
             for (slice, block) in slices.iter_mut().zip(&self.blocks) {
-                *slice = IoSlice::new(&block.bytes[block.head..block.tail]);
+                let len = (block.tail - block.head).min(allowance);
+                *slice = IoSlice::new(&block.bytes[block.head..block.head + len]);
+                allowance -= len;
             }
             match output.write_vectored(&slices[..count]) {
                 Ok(0) => return Err(io::ErrorKind::WriteZero.into()),

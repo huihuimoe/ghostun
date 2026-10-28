@@ -209,7 +209,12 @@ pub fn set_tun_queue(fd: BorrowedFd<'_>, attach: bool) -> io::Result<()> {
     tun_ioctl(fd, libc::TUNSETQUEUE as _, &mut req)
 }
 
-fn setsockopt<T>(fd: &OwnedFd, level: libc::c_int, name: libc::c_int, value: &T) -> io::Result<()> {
+fn setsockopt<T>(
+    fd: &impl AsRawFd,
+    level: libc::c_int,
+    name: libc::c_int,
+    value: &T,
+) -> io::Result<()> {
     // SAFETY: `value` points to a live T of the length passed.
     cvt(unsafe {
         libc::setsockopt(
@@ -221,6 +226,15 @@ fn setsockopt<T>(fd: &OwnedFd, level: libc::c_int, name: libc::c_int, value: &T)
         )
     })
     .map(drop)
+}
+
+pub fn tcp_notsent_lowat(stream: &TcpStream) -> io::Result<()> {
+    setsockopt(
+        stream,
+        libc::IPPROTO_TCP,
+        libc::TCP_NOTSENT_LOWAT,
+        &crate::budget::TCP_NOTSENT,
+    )
 }
 
 fn bind_to_device(fd: &OwnedFd, dev: Option<&str>) -> io::Result<()> {

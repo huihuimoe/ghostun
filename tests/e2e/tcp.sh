@@ -137,6 +137,8 @@ check_data
 [[ $(active) == "$N" ]] || fail "stable connection count"
 for side in entry exit; do
     [[ $(ns "$side" cat /sys/class/net/ghostun0/mtu) == "$MTU" ]] || fail "MTU"
+    qlen=$((262144 / MTU)); ((qlen <= 256)) || qlen=256
+    [[ $(ns "$side" cat /sys/class/net/ghostun0/tx_queue_len) == "$qlen" ]] || fail "$side TUN per-queue budget"
     rules=$(ns "$side" nft list table inet ghostun_ghostun0)
     ! [[ $rules =~ notrack|pkttype|flags\ rst ]] || fail "FakeTCP rule in TCP instance"
 done

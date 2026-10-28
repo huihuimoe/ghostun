@@ -21,9 +21,6 @@ use netlink_sys::{Socket, SocketAddr};
 
 use crate::config::{Cidr, OuterFamily};
 
-// Multi-queue TUN divides this length among its queues; retain room for bursts.
-const TUN_TXQUEUELEN: u32 = 8192;
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Route {
     pub src: IpAddr,
@@ -309,7 +306,7 @@ pub fn configure_tun(
     message.header.change_mask = LinkFlags::Up;
     message.attributes = vec![
         LinkAttribute::Mtu(mtu),
-        LinkAttribute::TxQueueLen(TUN_TXQUEUELEN),
+        LinkAttribute::TxQueueLen(crate::budget::tun_packets(mtu)),
     ];
     request(RouteNetlinkMessage::NewLink(message), NLM_F_ACK, |_| Ok(()))?;
     add_address(index, v4.addr.into(), v4.prefix)?;

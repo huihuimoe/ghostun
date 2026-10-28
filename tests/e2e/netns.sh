@@ -151,6 +151,8 @@ done
 for side in entry exit; do
     mtu=$(ns $side cat /sys/class/net/ghostun0/mtu)
     [[ $mtu == $((MTU - OVERHEAD)) ]] || fail "$side tun mtu $mtu, want $((MTU - OVERHEAD))"
+    qlen=$((262144 / mtu)); ((qlen <= 256)) || qlen=256
+    [[ $(ns "$side" cat /sys/class/net/ghostun0/tx_queue_len) == "$qlen" ]] || fail "$side TUN per-queue budget"
     ns $side nft list table inet $TABLE >/dev/null || fail "$side nft table missing"
 done
 pass "tun mtu auto-derived as $((MTU - OVERHEAD)) and nft tables installed"

@@ -48,6 +48,7 @@ impl Connection {
     fn new(socket: TcpStream, peer: SocketAddr, now: Instant) -> io::Result<Self> {
         socket.set_nonblocking(true)?;
         socket.set_nodelay(true)?;
+        sys::tcp_notsent_lowat(&socket)?;
         let local = socket.local_addr()?;
         Ok(Self {
             socket,
