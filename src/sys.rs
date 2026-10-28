@@ -440,9 +440,14 @@ impl RawSender {
         sender
     }
 
-    pub fn send(&mut self, fd: BorrowedFd<'_>, frames: &[(&[u8], IpAddr)]) -> io::Result<()> {
-        assert!(frames.len() <= RAW_BATCH);
-        for (k, &(frame, dst)) in frames.iter().enumerate() {
+    pub fn send<'a>(
+        &mut self,
+        fd: BorrowedFd<'_>,
+        frames: impl ExactSizeIterator<Item = (&'a [u8], IpAddr)>,
+    ) -> io::Result<()> {
+        let count = frames.len();
+        assert!(count <= RAW_BATCH);
+        for (k, (frame, dst)) in frames.enumerate() {
             self.destinations[k] = SockAddr::from_ip(dst);
             let (addr, len) = self.destinations[k].as_ptr_len();
             self.iovs[k].iov_base = frame.as_ptr().cast_mut().cast();
