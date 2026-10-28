@@ -34,4 +34,5 @@ The container needs four usable CPUs. Inspect logs under `target/` with
 - `e2e/tcp.sh`: direct/relayed TCP, exact bidirectional IPv4/IPv6 TCP/UDP payloads,
   rejection and admission limits, takeover, restarts, blackholes, reload and cleanup.
 - `e2e/ipv6-disabled.sh`: IPv4 fallback with kernel IPv6 disabled, for both transports.
-- Rust tests cover deterministic framing, authentication and bounded backpressure.
+- Rust tests cover fixed wire-format vectors, sliced packet buffers, strict message lengths,
+  deterministic framing, authentication and bounded backpressure.

@@ -34,6 +34,22 @@ fn packet(tag: u8) -> Vec<u8> {
 fn mutual_authentication_rejects_wrong_keys_reflection_replay_and_parameters() {
     let key = AuthKey([7; 32]);
     let (mut entry, hello) = Handshake::entry(&key, params()).unwrap();
+    assert_eq!(&hello[..12], b"\x01GTCP\x01\x00\x01\x00\x02\x05\x64");
+    for len in 0..hello.len() {
+        assert!(wire::hello_params(&hello[..len]).is_err());
+    }
+    let mut padded = vec![0xff];
+    padded.extend_from_slice(&hello);
+    let decoded = wire::hello_params(&padded[1..]).unwrap();
+    assert_eq!((decoded.worker, decoded.conns, decoded.mtu), (1, 2, 1380));
+    padded.push(0);
+    assert!(wire::hello_params(&padded[1..]).is_err());
+    let mut bad_magic = hello;
+    bad_magic[1] ^= 1;
+    assert!(wire::hello_params(&bad_magic).is_err());
+    let mut bad_kind = hello;
+    bad_kind[0] = 2;
+    assert!(wire::hello_params(&bad_kind).is_err());
     let (mut exit, challenge) = Handshake::exit(&key, params(), &hello).unwrap();
     assert!(!entry.done());
     assert!(!exit.done());

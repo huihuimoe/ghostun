@@ -1,8 +1,11 @@
 //! The TCP v1 codec and mutual authentication. See docs/261025-dual-transport-spec.md.
 use std::io::{self, Read, Write};
+use std::mem;
 
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
+use zerocopy::byteorder::network_endian::U16;
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 use crate::config::AuthKey;
 use crate::faketcp::pkt::{be16, is_valid_inner_ip, put_be16};
@@ -25,14 +28,19 @@ const PROTOCOL_VERSION: u8 = 1;
 const NONCE_LEN: usize = 32;
 const TAG_LEN: usize = 32;
 
-const OFF_HELLO_KIND: usize = 0;
-const OFF_HELLO_MAGIC: usize = 1;
-const OFF_HELLO_VERSION: usize = OFF_HELLO_MAGIC + HELLO_MAGIC.len();
-const OFF_HELLO_WORKER: usize = OFF_HELLO_VERSION + 1;
-const OFF_HELLO_CONNS: usize = OFF_HELLO_WORKER + 2;
-const OFF_HELLO_MTU: usize = OFF_HELLO_CONNS + 2;
-const OFF_HELLO_NONCE: usize = OFF_HELLO_MTU + 2;
-pub const HELLO_LEN: usize = OFF_HELLO_NONCE + NONCE_LEN;
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct HelloWire {
+    kind: u8,
+    magic: [u8; 4],
+    version: u8,
+    worker: U16,
+    conns: U16,
+    mtu: U16,
+    nonce: [u8; NONCE_LEN],
+}
+
+pub const HELLO_LEN: usize = mem::size_of::<HelloWire>();
 
 const CHALLENGE_PREFIX_LEN: usize = 1 + NONCE_LEN;
 pub const CHALLENGE_LEN: usize = CHALLENGE_PREFIX_LEN + TAG_LEN;
@@ -242,33 +250,33 @@ pub struct Params {
 
 impl Params {
     fn encode_hello(self) -> io::Result<[u8; HELLO_LEN]> {
-        let mut hello = [0; HELLO_LEN];
-        hello[OFF_HELLO_KIND] = MSG_HELLO;
-        hello[OFF_HELLO_MAGIC..OFF_HELLO_VERSION].copy_from_slice(HELLO_MAGIC);
-        hello[OFF_HELLO_VERSION] = PROTOCOL_VERSION;
-        put_be16(&mut hello, OFF_HELLO_WORKER, self.worker);
-        put_be16(&mut hello, OFF_HELLO_CONNS, self.conns);
-        put_be16(&mut hello, OFF_HELLO_MTU, self.mtu);
-        sys::random(&mut hello[OFF_HELLO_NONCE..])?;
-        Ok(hello)
+        let mut bytes = [0; HELLO_LEN];
+        let hello = HelloWire::mut_from_bytes(&mut bytes).expect("fixed-size Hello buffer");
+        hello.kind = MSG_HELLO;
+        hello.magic = *HELLO_MAGIC;
+        hello.version = PROTOCOL_VERSION;
+        hello.worker.set(self.worker);
+        hello.conns.set(self.conns);
+        hello.mtu.set(self.mtu);
+        sys::random(&mut hello.nonce)?;
+        Ok(bytes)
     }
 }
 
 #[inline]
 pub fn hello_params(hello: &[u8]) -> io::Result<Params> {
-    if hello.len() != HELLO_LEN
-        || hello[OFF_HELLO_KIND] != MSG_HELLO
-        || &hello[OFF_HELLO_MAGIC..OFF_HELLO_VERSION] != HELLO_MAGIC
-    {
+    let hello =
+        HelloWire::ref_from_bytes(hello).map_err(|_| invalid("malformed authentication Hello"))?;
+    if hello.kind != MSG_HELLO || &hello.magic != HELLO_MAGIC {
         return Err(invalid("malformed authentication Hello"));
     }
-    if hello[OFF_HELLO_VERSION] != PROTOCOL_VERSION {
+    if hello.version != PROTOCOL_VERSION {
         return Err(invalid("unsupported TCP protocol version"));
     }
     Ok(Params {
-        worker: be16(hello, OFF_HELLO_WORKER),
-        conns: be16(hello, OFF_HELLO_CONNS),
-        mtu: be16(hello, OFF_HELLO_MTU),
+        worker: hello.worker.get(),
+        conns: hello.conns.get(),
+        mtu: hello.mtu.get(),
     })
 }
 

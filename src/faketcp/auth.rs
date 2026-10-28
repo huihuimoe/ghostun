@@ -1,15 +1,18 @@
 //! Connection-time authentication only; ordinary tunnel packets never enter this module.
 
 use std::io;
+use std::mem;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
+use zerocopy::byteorder::network_endian::U64;
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 type HmacSha256 = Hmac<Sha256>;
 
-use super::pkt::{be64, put_be64, TcpMeta};
+use super::pkt::TcpMeta;
 use crate::config::{AuthKey, Mode};
 use crate::sys;
 
@@ -20,25 +23,70 @@ pub(crate) const CHALLENGE: u8 = 2;
 pub(crate) const PROOF: u8 = 3;
 pub(crate) const FINISHED: u8 = 4;
 
-const HDR_LEN: usize = 3;
-const TICKET_LEN: usize = 8;
 const NONCE_LEN: usize = 32;
 const TAG_LEN: usize = 32;
 
-const OFF_KIND: usize = 2;
-const OFF_TICKET: usize = HDR_LEN;
-const OFF_ISSUED: usize = OFF_TICKET + TICKET_LEN;
-const OFF_ENTRY_NONCE: usize = OFF_ISSUED + 8;
-const OFF_EXIT_NONCE: usize = OFF_ENTRY_NONCE + NONCE_LEN;
-const OFF_COOKIE: usize = OFF_EXIT_NONCE + NONCE_LEN;
-const OFF_EXIT_TAG: usize = OFF_COOKIE + TAG_LEN;
-const OFF_ENTRY_TAG: usize = OFF_EXIT_TAG + TAG_LEN;
-const OFF_FINISHED_TAG: usize = OFF_TICKET + TICKET_LEN;
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned, PartialEq, Eq)]
+#[repr(C)]
+struct Header {
+    control: u8,
+    version: u8,
+    kind: u8,
+}
 
-pub const HELLO_LEN: usize = HDR_LEN + NONCE_LEN;
-const CHALLENGE_LEN: usize = OFF_EXIT_TAG + TAG_LEN;
-pub const PROOF_LEN: usize = OFF_ENTRY_TAG + TAG_LEN;
-const FINISHED_LEN: usize = OFF_FINISHED_TAG + TAG_LEN;
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct Hello {
+    header: Header,
+    nonce: [u8; NONCE_LEN],
+}
+
+// The cookie authenticates these fields; the peer tags also cover the cookie.
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct ChallengeTranscript {
+    ticket: U64,
+    issued_ms: U64,
+    entry_nonce: [u8; NONCE_LEN],
+    exit_nonce: [u8; NONCE_LEN],
+}
+
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct ChallengeBody {
+    transcript: ChallengeTranscript,
+    cookie: [u8; TAG_LEN],
+}
+
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct Challenge {
+    header: Header,
+    body: ChallengeBody,
+    exit_tag: [u8; TAG_LEN],
+}
+
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct Proof {
+    header: Header,
+    body: ChallengeBody,
+    exit_tag: [u8; TAG_LEN],
+    entry_tag: [u8; TAG_LEN],
+}
+
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct Finished {
+    header: Header,
+    ticket: U64,
+    tag: [u8; TAG_LEN],
+}
+
+pub const HELLO_LEN: usize = mem::size_of::<Hello>();
+const CHALLENGE_LEN: usize = mem::size_of::<Challenge>();
+pub const PROOF_LEN: usize = mem::size_of::<Proof>();
+const FINISHED_LEN: usize = mem::size_of::<Finished>();
 
 const ENTRY_BYTES: u32 = (HELLO_LEN + PROOF_LEN) as u32;
 pub(crate) const EXIT_BYTES: u32 = (CHALLENGE_LEN + FINISHED_LEN) as u32;
@@ -102,13 +150,12 @@ pub struct Auth {
 }
 
 #[inline]
-fn header(kind: u8) -> [u8; HDR_LEN] {
-    [CONTROL, VERSION, kind]
-}
-
-#[inline]
-fn is_message(payload: &[u8], kind: u8, len: usize) -> bool {
-    payload.len() == len && payload[..HDR_LEN] == header(kind)
+fn header(kind: u8) -> Header {
+    Header {
+        control: CONTROL,
+        version: VERSION,
+        kind,
+    }
 }
 
 impl Auth {
@@ -147,8 +194,9 @@ impl Auth {
 
     pub fn begin_entry(&mut self, seq: u32) -> io::Result<()> {
         let mut frame = [0; PROOF_LEN];
-        frame[..HDR_LEN].copy_from_slice(&header(HELLO));
-        sys::random(&mut frame[HDR_LEN..HELLO_LEN])?;
+        let hello = Hello::mut_from_bytes(&mut frame[..HELLO_LEN]).expect("Hello buffer");
+        hello.header = header(HELLO);
+        sys::random(&mut hello.nonce)?;
         self.entry = Some(EntryState {
             frame,
             len: HELLO_LEN,
@@ -177,14 +225,16 @@ impl Auth {
             exit: irs,
         };
         let reason = if pending.len == HELLO_LEN {
+            let challenge = Challenge::ref_from_bytes(payload).ok()?;
+            let hello = Hello::ref_from_bytes(&pending.frame[..HELLO_LEN]).expect("pending Hello");
             if m.seq != irs.wrapping_add(1)
                 || m.ack != snd_nxt
-                || !is_message(payload, CHALLENGE, CHALLENGE_LEN)
-                || payload[OFF_ENTRY_NONCE..OFF_EXIT_NONCE] != pending.frame[HDR_LEN..HELLO_LEN]
+                || challenge.header != header(CHALLENGE)
+                || challenge.body.transcript.entry_nonce != hello.nonce
             {
                 return None;
             }
-            if let Some(proof) = self.proof(isns, payload) {
+            if let Some(proof) = self.proof(isns, challenge) {
                 self.entry = Some(EntryState {
                     frame: proof,
                     len: PROOF_LEN,
@@ -198,20 +248,16 @@ impl Auth {
             }
             "challenge verification failed"
         } else {
+            let finished = Finished::ref_from_bytes(payload).ok()?;
+            let proof = Proof::ref_from_bytes(&pending.frame).expect("pending Proof");
             if m.seq != irs.wrapping_add(1 + CHALLENGE_LEN as u32)
                 || m.ack != snd_nxt
-                || !is_message(payload, FINISHED, FINISHED_LEN)
-                || payload[OFF_TICKET..OFF_FINISHED_TAG]
-                    != pending.frame[OFF_TICKET..OFF_FINISHED_TAG]
+                || finished.header != header(FINISHED)
+                || finished.ticket != proof.body.transcript.ticket
             {
                 return None;
             }
-            if self.verify(
-                FINISHED_DOMAIN,
-                isns,
-                &pending.frame[HDR_LEN..OFF_EXIT_TAG],
-                &payload[OFF_FINISHED_TAG..],
-            ) {
+            if self.verify(FINISHED_DOMAIN, isns, proof.body.as_bytes(), &finished.tag) {
                 self.entry = None;
                 return Some(EntryStep::Established {
                     rcv_nxt: irs.wrapping_add(1 + EXIT_BYTES),
@@ -230,8 +276,11 @@ impl Auth {
         m: &TcpMeta,
         payload: &[u8],
     ) -> io::Result<ExitStep> {
-        if is_message(payload, HELLO, HELLO_LEN) {
-            return Ok(match self.challenge(now, m, payload)? {
+        if let Some(hello) = Hello::ref_from_bytes(payload)
+            .ok()
+            .filter(|hello| hello.header == header(HELLO))
+        {
+            return Ok(match self.challenge(now, m, hello)? {
                 Some(challenge) => ExitStep::Challenge(challenge),
                 None => ExitStep::Ignore,
             });
@@ -276,11 +325,8 @@ impl Auth {
         &mut self,
         now: Instant,
         meta: &TcpMeta,
-        payload: &[u8],
+        hello: &Hello,
     ) -> io::Result<Option<[u8; CHALLENGE_LEN]>> {
-        if !is_message(payload, HELLO, HELLO_LEN) {
-            return Ok(None);
-        }
         let isns = Isns {
             entry: meta.seq.wrapping_sub(1),
             exit: meta.ack.wrapping_sub(1),
@@ -302,49 +348,55 @@ impl Auth {
         };
         server.next_ticket = ticket;
         let mut frame = [0; CHALLENGE_LEN];
-        frame[..HDR_LEN].copy_from_slice(&header(CHALLENGE));
-        put_be64(&mut frame, OFF_TICKET, ticket);
+        let challenge = Challenge::mut_from_bytes(&mut frame).expect("Challenge buffer");
+        challenge.header = header(CHALLENGE);
+        challenge.body.transcript.ticket.set(ticket);
         let issued_ms = now.saturating_duration_since(self.origin).as_millis() as u64;
-        put_be64(&mut frame, OFF_ISSUED, issued_ms);
-        frame[OFF_ENTRY_NONCE..OFF_EXIT_NONCE].copy_from_slice(&payload[HDR_LEN..]);
-        sys::random(&mut frame[OFF_EXIT_NONCE..OFF_COOKIE])?;
-        let cookie = cookie_mac(&server.cookie_key, meta, isns, &frame[HDR_LEN..OFF_COOKIE])
-            .finalize()
-            .into_bytes();
-        frame[OFF_COOKIE..OFF_EXIT_TAG].copy_from_slice(cookie.as_ref());
-        let tag = self.sign(EXIT_DOMAIN, isns, &frame[HDR_LEN..OFF_EXIT_TAG]);
-        frame[OFF_EXIT_TAG..].copy_from_slice(tag.as_ref());
+        challenge.body.transcript.issued_ms.set(issued_ms);
+        challenge.body.transcript.entry_nonce = hello.nonce;
+        sys::random(&mut challenge.body.transcript.exit_nonce)?;
+        challenge.body.cookie = cookie_mac(
+            &server.cookie_key,
+            meta,
+            isns,
+            challenge.body.transcript.as_bytes(),
+        )
+        .finalize()
+        .into_bytes()
+        .into();
+        challenge.exit_tag = self.sign(EXIT_DOMAIN, isns, challenge.body.as_bytes());
         Ok(Some(frame))
     }
 
     #[inline]
-    fn proof(&self, isns: Isns, challenge: &[u8]) -> Option<[u8; PROOF_LEN]> {
+    fn proof(&self, isns: Isns, challenge: &Challenge) -> Option<[u8; PROOF_LEN]> {
         if !self.verify(
             EXIT_DOMAIN,
             isns,
-            &challenge[HDR_LEN..OFF_EXIT_TAG],
-            &challenge[OFF_EXIT_TAG..],
+            challenge.body.as_bytes(),
+            &challenge.exit_tag,
         ) {
             return None;
         }
         let mut frame = [0; PROOF_LEN];
-        frame[..CHALLENGE_LEN].copy_from_slice(challenge);
-        frame[OFF_KIND] = PROOF;
-        let tag = self.sign(ENTRY_DOMAIN, isns, &challenge[HDR_LEN..OFF_EXIT_TAG]);
-        frame[OFF_ENTRY_TAG..].copy_from_slice(tag.as_ref());
+        frame[..CHALLENGE_LEN].copy_from_slice(challenge.as_bytes());
+        let proof = Proof::mut_from_bytes(&mut frame).expect("Proof buffer");
+        proof.header.kind = PROOF;
+        proof.entry_tag = self.sign(ENTRY_DOMAIN, isns, challenge.body.as_bytes());
         Some(frame)
     }
 
     /// A verified ticket is consumed before promotion; failed requests never move the watermark.
     fn accept(&mut self, now: Instant, meta: &TcpMeta, proof: &[u8]) -> Option<Promotion> {
-        if !is_message(proof, PROOF, PROOF_LEN) {
+        let proof = Proof::ref_from_bytes(proof).ok()?;
+        if proof.header != header(PROOF) {
             return None;
         }
-        let ticket = be64(proof, OFF_TICKET);
+        let ticket = proof.body.transcript.ticket.get();
         if ticket <= self.server.as_ref()?.accepted {
             return None;
         }
-        let issued = be64(proof, OFF_ISSUED);
+        let issued = proof.body.transcript.issued_ms.get();
         let elapsed = now.saturating_duration_since(self.origin).as_millis();
         if u128::from(issued) > elapsed
             || elapsed - u128::from(issued) > self.timeout.as_millis() * 2
@@ -355,34 +407,29 @@ impl Auth {
             entry: meta.seq.wrapping_sub(1 + HELLO_LEN as u32),
             exit: meta.ack.wrapping_sub(1 + CHALLENGE_LEN as u32),
         };
-        let transcript = &proof[HDR_LEN..OFF_EXIT_TAG];
+        let transcript = proof.body.as_bytes();
         if cookie_mac(
             &self.server.as_ref()?.cookie_key,
             meta,
             isns,
-            &proof[HDR_LEN..OFF_COOKIE],
+            proof.body.transcript.as_bytes(),
         )
-        .verify_slice(&proof[OFF_COOKIE..OFF_EXIT_TAG])
+        .verify_slice(&proof.body.cookie)
         .is_err()
-            || !self.verify(
-                EXIT_DOMAIN,
-                isns,
-                transcript,
-                &proof[OFF_EXIT_TAG..OFF_ENTRY_TAG],
-            )
-            || !self.verify(ENTRY_DOMAIN, isns, transcript, &proof[OFF_ENTRY_TAG..])
+            || !self.verify(EXIT_DOMAIN, isns, transcript, &proof.exit_tag)
+            || !self.verify(ENTRY_DOMAIN, isns, transcript, &proof.entry_tag)
         {
             return None;
         }
         let mut finished = [0; FINISHED_LEN];
-        finished[..HDR_LEN].copy_from_slice(&header(FINISHED));
-        put_be64(&mut finished, OFF_TICKET, ticket);
-        finished[OFF_FINISHED_TAG..]
-            .copy_from_slice(self.sign(FINISHED_DOMAIN, isns, transcript).as_ref());
+        let message = Finished::mut_from_bytes(&mut finished).expect("Finished buffer");
+        message.header = header(FINISHED);
+        message.ticket.set(ticket);
+        message.tag = self.sign(FINISHED_DOMAIN, isns, transcript);
         self.server.as_mut()?.accepted = ticket;
         self.completion = Some(Completion {
             request: *meta,
-            proof: proof.try_into().unwrap(),
+            proof: proof.as_bytes().try_into().unwrap(),
             finished,
         });
         Some(Promotion {
