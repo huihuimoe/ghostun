@@ -4,10 +4,9 @@ services:
     container_name: ghostun-exit
     restart: unless-stopped
     network_mode: host
-    # Optional tun_io_uring=true: use a default-derived profile allowing the three
-    # io_uring syscalls; see README. Install the profile beside this Compose file.
+    # Optional: allow io_uring by disabling this container's seccomp filter.
     # security_opt:
-    #   - seccomp=./seccomp-io-uring.json
+    #   - seccomp=unconfined
     cap_add:
       - NET_ADMIN
       - NET_RAW

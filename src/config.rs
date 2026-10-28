@@ -225,7 +225,6 @@ impl<'de> Deserialize<'de> for ListenSpec {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
     pub transport: Transport,
-    pub tun_io_uring: bool,
     pub base_port_explicit: bool,
     pub mode: Mode,
     pub auth_key: AuthKey,
@@ -318,9 +317,6 @@ struct Cli {
     /// outer transport: faketcp or tcp [default: faketcp]
     #[argh(option)]
     transport: Option<Transport>,
-    /// enable experimental FakeTCP TUN io_uring fast path; falls back to poll
-    #[argh(switch)]
-    tun_io_uring: bool,
     /// node role: entry or exit
     #[argh(positional)]
     role: Option<Mode>,
@@ -381,8 +377,6 @@ struct Cli {
 #[serde(deny_unknown_fields)]
 struct File {
     transport: Option<Transport>,
-    #[serde(default)]
-    tun_io_uring: bool,
     mode: Option<Mode>,
     auth_key: Option<String>,
     tun_name: Option<String>,
@@ -528,7 +522,6 @@ fn build_config(cli: Cli, running_conns: Option<u16>) -> Result<Config, String> 
     });
     let cfg = Config {
         transport: cli.transport.or(file.transport).unwrap_or_default(),
-        tun_io_uring: cli.tun_io_uring || file.tun_io_uring,
         base_port_explicit: cli.base_port.is_some() || file.base_port.is_some(),
         mode,
         auth_key: file
@@ -567,7 +560,6 @@ fn ensure_reload_compatible(old: &Config, new: &Config) -> Result<(), String> {
     for (changed, field) in [
         (old.mode != new.mode, "mode"),
         (old.transport != new.transport, "transport"),
-        (old.tun_io_uring != new.tun_io_uring, "tun_io_uring"),
         (old.outer_family != new.outer_family, "outer_family"),
         (old.tun_name != new.tun_name, "tun_name"),
         (old.tun_ipv4 != new.tun_ipv4, "tun_ipv4"),
@@ -624,9 +616,6 @@ fn parse_cpus(spec: &str) -> Result<Vec<usize>, String> {
 }
 
 fn validate(c: &Config) -> Result<(), String> {
-    if c.tun_io_uring && c.transport != Transport::Faketcp {
-        return Err("`tun_io_uring` requires faketcp transport".into());
-    }
     let name = &c.tun_name;
     if name.is_empty()
         || name.len() > 15
@@ -692,18 +681,6 @@ mod tests {
         let mut args = vec!["entry", "--remote", "203.0.113.9:443"];
         args.extend_from_slice(extra);
         parse(&args)
-    }
-
-    #[test]
-    fn tun_fast_path_is_opt_in_faketcp_only_and_requires_restart() {
-        assert!(!entry(&[]).unwrap().tun_io_uring);
-        assert!(entry(&["--tun-io-uring"]).unwrap().tun_io_uring);
-        assert!(entry(&["--transport", "tcp", "--tun-io-uring"]).is_err());
-        let old = entry(&[]).unwrap();
-        let new = entry(&["--tun-io-uring"]).unwrap();
-        assert!(ensure_reload_compatible(&old, &new)
-            .unwrap_err()
-            .contains("tun_io_uring"));
     }
 
     fn with_file(name: &str, toml: &str, args: &[&str]) -> Result<Config, String> {

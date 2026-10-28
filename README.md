@@ -107,7 +107,6 @@ ghostun [options] [entry|exit]
 | Flag | Default | Description |
 |---|---|---|
 | `--transport faketcp\|tcp` | `faketcp` | One outer transport per instance; restart to change |
-| `--tun-io-uring` | off | Experimental FakeTCP TUN fast path on Linux 6.7+; falls back to poll if unavailable; restart to change |
 | `--config PATH` | — | TOML configuration file (required for `auth_key`) |
 | `--remote IP:PORT` | — | Entry only: Exit outer address (IP literal) |
 | `--listen [IP:]PORT` | — | Exit only: outer listen port or `IP:PORT` |
@@ -182,22 +181,11 @@ install -m600 config.example.toml exit.toml    # set auth_key and role settings
 docker compose -f compose.exit.yml up -d
 ```
 
-### Optional TUN io_uring fast path
-
-FakeTCP supports `tun_io_uring = true` (or `--tun-io-uring`) on Linux 6.7+.
-It defaults to off and requires a restart to change. Each worker probes policy,
-kernel support and required operations; initialization or runtime failures fall back to poll.
-
-[Docker's default seccomp profile](https://docs.docker.com/engine/security/seccomp/)
-blocks `io_uring_setup`, `io_uring_enter` and `io_uring_register`. Podman follows
-its installed seccomp policy. To enable the fast path in a container, copy the
-runtime's default profile, permit these three syscalls and keep its other restrictions.
-Set Compose `security_opt: ["seccomp=./seccomp-io-uring.json"]`, or Quadlet
-[`SeccompProfile=/etc/ghostun/seccomp-io-uring.json`](https://docs.podman.io/en/latest/markdown/podman-systemd.unit.5.html),
-using the prepared profile. The deployment examples include these optional settings.
-Host kernel policy still applies. Check logs for `TUN io_uring fast-path enabled`
-or the reason for poll fallback. With the default setting, existing container
-permissions are sufficient.
+FakeTCP automatically probes the TUN io_uring fast path on Linux 6.7+ and falls
+back to poll when unsupported or denied. No configuration is needed.
+[Docker's default seccomp policy](https://docs.docker.com/engine/security/seccomp/)
+blocks io_uring; Podman follows its installed policy. The deployment templates
+keep the runtime defaults. Logs report fast-path activation or the fallback reason.
 
 ## Performance
 

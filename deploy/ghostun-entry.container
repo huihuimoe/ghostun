@@ -8,8 +8,8 @@ ContainerName=ghostun-entry
 Network=host
 AddCapability=CAP_NET_ADMIN CAP_NET_RAW
 AddDevice=/dev/net/tun
-# Optional tun_io_uring=true: default-derived profile allowing io_uring_setup/enter/register.
-# SeccompProfile=/etc/ghostun/seccomp-io-uring.json
+# Optional: allow io_uring with --security-opt seccomp=unconfined.
+# SeccompProfile=unconfined
 SecurityLabelDisable=true
 Environment=RUST_LOG=info
 Volume=/etc/ghostun/entry.toml:/etc/ghostun/config.toml:ro

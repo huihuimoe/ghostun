@@ -127,7 +127,6 @@ pub fn sync_reload(
 }
 
 /// Runs until `stop` is set, then resets the outer connection so firewalls free its slot.
-#[allow(clippy::too_many_arguments)]
 pub fn run(
     id: usize,
     family: OuterFamily,
@@ -136,7 +135,6 @@ pub fn run(
     raw: OwnedFd,
     stop: &AtomicBool,
     ctrl: &Control,
-    tun_io_uring: bool,
 ) {
     let mut cpu = ctrl.initial_cpu();
     worker::pin(id, cpu);
@@ -149,7 +147,7 @@ pub fn run(
     };
     session.start(Instant::now(), &mut out);
     let mut generation = session.generation();
-    let mut driver = TunDriver::new(tun.as_fd(), stride - overhead, tun_io_uring);
+    let mut driver = TunDriver::new(tun.as_fd(), stride - overhead);
     let mut attached = false;
     let mut rx = sys::RawReceiver::new(family, stride);
     let mut fds = [

@@ -278,24 +278,26 @@ impl Drop for Fast {
 }
 
 impl<'a> TunDriver<'a> {
-    pub fn new(fd: BorrowedFd<'a>, stride: usize, fast_path: bool) -> Self {
-        let fast = if fast_path {
-            match Fast::new(stride) {
-                Ok(fast) => {
-                    log::info!("TUN io_uring fast-path enabled");
-                    Some(Box::new(fast))
-                }
-                Err(error) => {
-                    log::info!("TUN io_uring fast-path unavailable ({error}), using poll fallback");
-                    None
-                }
+    pub fn new(fd: BorrowedFd<'a>, stride: usize) -> Self {
+        let fast = match Fast::new(stride) {
+            Ok(fast) => {
+                log::info!("TUN io_uring fast-path enabled");
+                Some(Box::new(fast))
             }
-        } else {
-            None
+            Err(error) => {
+                log::info!("TUN io_uring fast-path unavailable ({error}), using poll fallback");
+                None
+            }
         };
+        let mut driver = Self::poll(fd, stride);
+        driver.fast = fast;
+        driver
+    }
+
+    fn poll(fd: BorrowedFd<'a>, stride: usize) -> Self {
         Self {
             fd,
-            fast,
+            fast: None,
             pending: Pending::default(),
             stride,
             recovered: VecDeque::new(),
@@ -469,7 +471,7 @@ mod tests {
         let (socket, peer) = UnixDatagram::pair().unwrap();
         socket.set_nonblocking(true).unwrap();
         peer.set_nonblocking(true).unwrap();
-        let mut driver = TunDriver::new(socket.as_fd(), 2048, true);
+        let mut driver = TunDriver::new(socket.as_fd(), 2048);
         assert!(driver.fast.is_some(), "test must exercise io_uring");
         let mut buffer = [0; 2048];
         for sequence in 0u32..200 {
@@ -556,7 +558,7 @@ mod tests {
         let (writer, reader) = UnixDatagram::pair().unwrap();
         writer.set_nonblocking(true).unwrap();
         reader.set_nonblocking(true).unwrap();
-        let mut driver = TunDriver::new(writer.as_fd(), 2048, false);
+        let mut driver = TunDriver::poll(writer.as_fd(), 2048);
         let mut count = 0usize;
         loop {
             let packet = vec![(count % 251) as u8; 1024];

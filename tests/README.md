@@ -44,9 +44,9 @@ The container needs four usable CPUs. Inspect logs under `target/` with
 - Rust tests cover fixed wire-format vectors, sliced packet buffers, strict message lengths,
   deterministic framing, authentication and bounded backpressure.
 
-For the optional FakeTCP TUN fast path, run `netns.sh` with `TUN_IO_URING=1`
+For the automatic FakeTCP TUN fast path, run `netns.sh` with `EXPECT_TUN_DRIVER=uring`
 for each outer family; the suite requires io_uring to stay enabled. Run it again
-with `TUN_IO_URING=fallback` in a container started with
+with `EXPECT_TUN_DRIVER=poll` in a container started with
 `--security-opt seccomp="$PWD/tests/deny-io-uring.json"` to check policy fallback.
 Run the ignored `sys::batch_tests::entry_raw_socket_binds_and_connects_both_families`
 and `faketcp::tun::tests::uring_recycles_buffers_and_preserves_backlog_across_runtime_fallback`
