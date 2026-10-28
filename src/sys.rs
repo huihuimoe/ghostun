@@ -134,25 +134,24 @@ pub fn tun_read(tun: BorrowedFd<'_>, buf: &mut [u8]) -> io::Result<Option<usize>
 
 #[inline]
 pub fn tun_write(tun: BorrowedFd<'_>, packet: &[u8]) -> io::Result<bool> {
-    // SAFETY: valid descriptor and readable packet slice. TUN writes preserve packet boundaries.
-    let n = unsafe { libc::write(tun.as_raw_fd(), packet.as_ptr().cast(), packet.len()) };
-    if n == packet.len() as isize {
-        return Ok(true);
-    }
-    if n >= 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::WriteZero,
-            "short TUN packet write",
-        ));
-    }
-    let e = io::Error::last_os_error();
-    if matches!(
-        e.kind(),
-        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-    ) {
-        Ok(false)
-    } else {
-        Err(e)
+    loop {
+        // SAFETY: valid descriptor and readable packet slice. TUN preserves packet boundaries.
+        let n = unsafe { libc::write(tun.as_raw_fd(), packet.as_ptr().cast(), packet.len()) };
+        if n == packet.len() as isize {
+            return Ok(true);
+        }
+        if n >= 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "short TUN packet write",
+            ));
+        }
+        let e = io::Error::last_os_error();
+        match e.kind() {
+            io::ErrorKind::Interrupted => continue,
+            io::ErrorKind::WouldBlock => return Ok(false),
+            _ => return Err(e),
+        }
     }
 }
 
@@ -464,7 +463,7 @@ impl RawSender {
         &mut self,
         fd: BorrowedFd<'_>,
         frames: impl ExactSizeIterator<Item = (&'a [u8], IpAddr)>,
-    ) -> io::Result<()> {
+    ) -> usize {
         let count = frames.len();
         assert!(count <= RAW_BATCH);
         for (k, (frame, dst)) in frames.enumerate() {
@@ -475,9 +474,7 @@ impl RawSender {
             self.hdrs[k].msg_hdr.msg_name = addr.cast_mut().cast();
             self.hdrs[k].msg_hdr.msg_namelen = len;
         }
-        let mut first_err = None;
-        let mut sent = 0;
-        while sent < count {
+        send_progress(count, |sent| {
             // SAFETY: active descriptors point into live frames, destinations and boxed iovecs.
             let n = unsafe {
                 libc::sendmmsg(
@@ -487,22 +484,31 @@ impl RawSender {
                     libc::MSG_DONTWAIT as _,
                 )
             };
-            if n > 0 {
-                sent += n as usize;
-                continue;
+            if n < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(n as usize)
             }
-            let e = io::Error::last_os_error();
-            if matches!(
-                e.kind(),
-                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-            ) {
-                return Err(e);
-            }
-            first_err.get_or_insert(e);
-            sent += 1;
-        }
-        first_err.map_or(Ok(()), Err)
+        })
     }
+}
+
+/// Counts the completed prefix, including explicitly dropped non-retryable packets.
+fn send_progress(count: usize, mut send: impl FnMut(usize) -> io::Result<usize>) -> usize {
+    let mut completed = 0;
+    while completed < count {
+        match send(completed) {
+            Ok(0) => break,
+            Ok(n) => completed += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(e) => {
+                log::debug!("raw send: {e}; dropping packet");
+                completed += 1;
+            }
+        }
+    }
+    completed
 }
 
 #[inline]
@@ -708,6 +714,35 @@ pub fn sysctl_set(key: &str, value: &str) -> io::Result<()> {
 mod batch_tests {
     use super::*;
     use std::net::UdpSocket;
+
+    #[test]
+    fn partial_send_keeps_progress_across_interrupt_and_backpressure() {
+        let mut results = [
+            Ok(2),
+            Err(io::ErrorKind::Interrupted.into()),
+            Err(io::ErrorKind::WouldBlock.into()),
+        ]
+        .into_iter();
+        let mut positions = Vec::new();
+        assert_eq!(
+            send_progress(5, |offset| {
+                positions.push(offset);
+                results.next().unwrap()
+            }),
+            2
+        );
+        assert_eq!(positions, [0, 2, 2]);
+        let mut results = [Err(io::Error::from_raw_os_error(libc::EMSGSIZE)), Ok(2)].into_iter();
+        let mut positions = Vec::new();
+        assert_eq!(
+            send_progress(3, |offset| {
+                positions.push(offset);
+                results.next().unwrap()
+            }),
+            3
+        );
+        assert_eq!(positions, [0, 1]);
+    }
 
     #[test]
     #[ignore = "requires CAP_NET_RAW and CAP_NET_ADMIN; run in the e2e container"]

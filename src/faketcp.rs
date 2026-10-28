@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 pub mod auth;
 pub mod pkt;
+mod queue;
 #[cfg(test)]
 mod tests;
 pub mod worker;
@@ -73,6 +74,7 @@ impl SessionConfig {
 
 pub trait Sink {
     fn send(&mut self, frame: &[u8], dst: IpAddr);
+    fn reset(&mut self) {}
 }
 
 /// Received payload bytes after which a bare ACK is sent even without outbound traffic,
@@ -94,6 +96,7 @@ pub struct Session {
     cfg: SessionConfig,
     auth: Auth,
     state: State,
+    generation: u64,
     local: SocketAddr,
     peer: Option<SocketAddr>,
     iss: u32,
@@ -131,6 +134,7 @@ impl Session {
             cfg,
             auth,
             state: State::Closed,
+            generation: 0,
             local,
             peer,
             iss: 0,
@@ -154,6 +158,10 @@ impl Session {
     }
 
     #[inline(always)]
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     pub fn mss(&self) -> u16 {
         self.cfg.mss
     }
@@ -339,7 +347,7 @@ impl Session {
                     self.local,
                     m.src
                 );
-                self.close();
+                self.close(out);
             }
             return None;
         }
@@ -397,7 +405,7 @@ impl Session {
                         peer
                     );
                 }
-                self.close();
+                self.close(out);
             }
             (Mode::Entry, State::SynSent) if now >= self.next_syn => {
                 self.next_syn = now + SYN_RETRY;
@@ -429,13 +437,19 @@ impl Session {
     }
 
     pub fn shutdown(&mut self, out: &mut impl Sink) {
+        self.reset_output(out);
         if self.state != State::Closed && self.peer.is_some() {
             self.send_rsts(out);
         }
-        self.close();
+        self.close_state();
     }
 
-    fn close(&mut self) {
+    fn close(&mut self, out: &mut impl Sink) {
+        self.reset_output(out);
+        self.close_state();
+    }
+
+    fn close_state(&mut self) {
         self.state = State::Closed;
         self.auth.reset();
         if self.cfg.mode == Mode::Exit {
@@ -560,6 +574,7 @@ impl Session {
                 self.reply_auth(m, payload.len(), &finished, out);
             }
             Ok(ExitStep::Promote(p)) => {
+                self.reset_output(out);
                 if established {
                     if let Some(old_peer) = self.peer {
                         log::info!(
@@ -611,12 +626,18 @@ impl Session {
         emit(&mut self.scratch, &meta, frame, id, out);
     }
 
+    fn reset_output(&mut self, out: &mut impl Sink) {
+        self.generation = self.generation.wrapping_add(1);
+        out.reset();
+    }
+
     fn connect(&mut self, now: Instant, out: &mut impl Sink) {
+        self.generation = self.generation.wrapping_add(1);
         let iss = self.next_isn();
         let snd_nxt = iss.wrapping_add(1);
         if let Err(e) = self.auth.begin_entry(snd_nxt) {
             log::error!("worker {}: authentication randomness: {e}", self.cfg.worker);
-            self.close();
+            self.close(out);
             self.next_syn = now + SYN_RETRY;
             return;
         }
@@ -630,6 +651,7 @@ impl Session {
     }
 
     fn reconnect(&mut self, now: Instant, send_rst: bool, out: &mut impl Sink) {
+        self.reset_output(out);
         if send_rst {
             self.send_rsts(out);
         }

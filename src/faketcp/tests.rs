@@ -7,9 +7,12 @@ const EXIT: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 
 const MS: Duration = Duration::from_millis(1);
 
 #[derive(Default)]
-struct Wire(Vec<Vec<u8>>);
+struct Wire(Vec<Vec<u8>>, usize);
 
 impl Sink for Wire {
+    fn reset(&mut self) {
+        self.1 += 1;
+    }
     fn send(&mut self, frame: &[u8], _dst: IpAddr) {
         assert!(
             (frame[0] >> 4 == 6 || pkt::ipv4_header_checksum_ok(frame))
@@ -355,7 +358,12 @@ fn legitimate_replacement_survives_unrelated_attempts_and_old_proof_replays() {
             Some(&[0x45; 20][..])
         );
     }
+    let old_generation = pair.exit.generation();
+    let old_resets = wire.1;
     pair.exit.on_outer(now, &proof, &mut wire);
+    assert!(pair.exit.is_established());
+    assert_ne!(pair.exit.generation(), old_generation);
+    assert_eq!(wire.1, old_resets + 1);
     let mut promoted = wire.take();
     let resets: Vec<_> = promoted
         .iter()
@@ -957,6 +965,7 @@ fn shutdown_resets_live_session() {
 fn reload_updates_timers_in_place_and_rotates_session_on_key_change() {
     let mut p = Pair::new(0, 2, 41);
     let first_tuple = p.connect();
+    let original_generation = p.entry.generation();
     let key1 = AuthKey([0xa7; 32]);
     let key2 = AuthKey([0xb8; 32]);
 
@@ -970,6 +979,8 @@ fn reload_updates_timers_in_place_and_rotates_session_on_key_change() {
         &mut w,
     ));
     assert!(w.0.is_empty());
+    assert_eq!(w.1, 0);
+    assert_eq!(p.entry.generation(), original_generation);
     assert!(p.entry.is_established());
     assert_eq!(p.entry.next_deadline(), p.t + Duration::from_secs(2));
 
@@ -987,6 +998,8 @@ fn reload_updates_timers_in_place_and_rotates_session_on_key_change() {
         &mut w,
     ));
     assert!(!p.entry.is_established());
+    assert!(w.1 > 0);
+    assert_ne!(p.entry.generation(), original_generation);
     let frames = w.take();
     assert!(frames.iter().any(|f| {
         let m = parsed(f).meta;
@@ -1079,4 +1092,26 @@ fn exit_bound_ip_ignores_other_local_addresses_while_wildcard_accepts_any() {
     let mut wild_exit = Session::new(wild_cfg, t, 2).unwrap();
     assert!(wild_exit.on_outer(t, &syn, &mut w).is_none());
     assert_eq!(w.take().len(), 1);
+}
+
+#[test]
+fn shutdown_discards_old_backlog_before_queueing_closing_controls() {
+    struct Queued(super::queue::Pending<IpAddr>);
+    impl Sink for Queued {
+        fn send(&mut self, frame: &[u8], dst: IpAddr) {
+            assert!(self.0.push(frame, dst, true));
+        }
+        fn reset(&mut self) {
+            self.0.clear();
+        }
+    }
+    let mut pair = Pair::new(0, 1, 101);
+    pair.connect();
+    let mut out = Queued(Default::default());
+    assert!(out.0.push(b"old data", EXIT.ip(), false));
+    pair.entry.shutdown(&mut out);
+    assert_eq!(out.0.packets.len(), 2);
+    for packet in &out.0.packets {
+        assert_ne!(parsed(&packet.bytes).meta.flags & flags::RST, 0);
+    }
 }
