@@ -81,6 +81,8 @@ jobs:
         with:
           tool: cargo-zigbuild
       - name: Build amd64 and arm64 release binaries
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
         run: |
           cargo zigbuild --locked --release --target x86_64-unknown-linux-gnu.2.17 --target aarch64-unknown-linux-gnu.2.17
           mkdir -p dist
