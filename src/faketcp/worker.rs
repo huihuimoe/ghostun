@@ -4,6 +4,7 @@ use std::io;
 use std::net::IpAddr;
 
 use super::queue::Pending;
+use super::tun::TunDriver;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -25,6 +26,12 @@ struct RawSink<'a> {
 }
 
 impl RawSink<'_> {
+    fn room(&self, driver: &TunDriver<'_>, bytes: usize, count: usize) -> bool {
+        let (reserved_bytes, reserved_slots) = driver.read_budget();
+        self.pending
+            .room_for(bytes + reserved_bytes, count + reserved_slots)
+    }
+
     fn flush(&mut self) {
         let frames = self
             .pending
@@ -76,28 +83,6 @@ impl Sink for RawSink<'_> {
     }
 }
 
-fn write_tun(fd: BorrowedFd<'_>, packet: &[u8]) -> bool {
-    match sys::tun_write(fd, packet) {
-        Ok(done) => done,
-        Err(e) => {
-            log::debug!("TUN write: {e}; dropping packet");
-            true
-        }
-    }
-}
-
-fn flush_tun(fd: BorrowedFd<'_>, pending: &mut Pending<()>) {
-    for _ in 0..RAW_BATCH {
-        let Some(packet) = pending.packets.front() else {
-            break;
-        };
-        if !write_tun(fd, &packet.bytes) {
-            break;
-        }
-        pending.pop();
-    }
-}
-
 #[inline]
 fn apply_reload(
     ctrl: &Control,
@@ -142,6 +127,7 @@ pub fn sync_reload(
 }
 
 /// Runs until `stop` is set, then resets the outer connection so firewalls free its slot.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     id: usize,
     family: OuterFamily,
@@ -150,6 +136,7 @@ pub fn run(
     raw: OwnedFd,
     stop: &AtomicBool,
     ctrl: &Control,
+    tun_io_uring: bool,
 ) {
     let mut cpu = ctrl.initial_cpu();
     worker::pin(id, cpu);
@@ -162,25 +149,31 @@ pub fn run(
     };
     session.start(Instant::now(), &mut out);
     let mut generation = session.generation();
-    let mut tun_pending = Pending::default();
+    let mut driver = TunDriver::new(tun.as_fd(), stride - overhead, tun_io_uring);
     let mut attached = false;
     let mut rx = sys::RawReceiver::new(family, stride);
     let mut fds = [
         sys::pollfd(tun.as_raw_fd(), libc::POLLIN),
         sys::pollfd(raw.as_raw_fd(), libc::POLLIN),
         sys::pollfd(ctrl.wake_fd().as_raw_fd(), libc::POLLIN),
+        sys::pollfd(-1, libc::POLLIN),
     ];
     let mut busy = false;
     let mut applied_gen = 0;
     while !stop.load(Ordering::Relaxed) {
-        fds[0].events = if out.pending.room(stride) {
+        fds[3].fd = if driver.read_fd() == tun.as_raw_fd() {
+            -1
+        } else {
+            driver.read_fd()
+        };
+        fds[0].events = if fds[3].fd == -1 && out.room(&driver, stride, 1) {
             libc::POLLIN
         } else {
             0
-        } | if tun_pending.packets.is_empty() {
-            0
-        } else {
+        } | if driver.wants_write() {
             libc::POLLOUT
+        } else {
+            0
         };
         fds[1].events = libc::POLLIN
             | if out.pending.packets.is_empty() {
@@ -188,7 +181,7 @@ pub fn run(
             } else {
                 libc::POLLOUT
             };
-        let timeout = if busy {
+        let timeout = if busy || (driver.has_reads() && out.room(&driver, stride, 1)) {
             0
         } else {
             sys::poll_ms(
@@ -210,13 +203,16 @@ pub fn run(
             break;
         }
         let now = Instant::now();
+        let read_allowed = out.room(&driver, stride, 1);
+        driver.service(attached, read_allowed);
         if fds[1].revents & sys::WRITE_READY != 0 {
             out.flush();
         }
         if fds[0].revents & sys::WRITE_READY != 0 {
-            flush_tun(tun.as_fd(), &mut tun_pending);
+            driver.flush();
         }
-        let mut tun_ready = fds[0].revents & libc::POLLIN != 0 && out.pending.room(stride);
+        let mut tun_ready = (fds[0].revents & libc::POLLIN != 0 || driver.has_reads())
+            && out.room(&driver, stride, 1);
         let mut raw_ready = fds[1].revents & libc::POLLIN != 0;
         for _ in 0..ROUNDS {
             if raw_ready {
@@ -230,14 +226,11 @@ pub fn run(
                             let frame = &rx.buffers()[k * stride..k * stride + n];
                             let inner = session.on_outer(now, frame, &mut out);
                             if generation != session.generation() {
-                                tun_pending.clear();
+                                driver.reset();
                                 generation = session.generation();
                             }
                             if let Some(inner) = inner {
-                                if !(tun_pending.packets.is_empty()
-                                    && write_tun(tun.as_fd(), inner))
-                                    && !tun_pending.push(inner, (), false)
-                                {
+                                if !driver.write(inner) {
                                     log::debug!(
                                         "worker {id}: TUN queue full; dropping new data packet"
                                     );
@@ -254,14 +247,14 @@ pub fn run(
                     }
                 };
             }
-            if tun_ready && out.pending.room(stride) {
+            if tun_ready && out.room(&driver, stride, 1) {
                 let mut reads = 0;
                 let mut count = 0;
                 let mut bytes = 0;
                 let mut batch_dst = None;
-                while reads < RAW_BATCH && out.pending.room_for(bytes + stride, count + 1) {
+                while reads < RAW_BATCH && out.room(&driver, bytes + stride, count + 1) {
                     let slot = &mut rx.buffers_mut()[count * stride..(count + 1) * stride];
-                    let Ok(Some(n)) = sys::tun_read(tun.as_fd(), &mut slot[overhead..]) else {
+                    let Ok(Some(n)) = driver.read(&mut slot[overhead..]) else {
                         break;
                     };
                     reads += 1;
@@ -280,7 +273,7 @@ pub fn run(
                             .map(|(k, &n)| (&rx.buffers()[k * stride..k * stride + n], dst)),
                     );
                 }
-                tun_ready = reads == RAW_BATCH && out.pending.room(stride);
+                tun_ready = reads == RAW_BATCH && out.room(&driver, stride, 1);
             } else {
                 tun_ready = false;
             }
@@ -302,11 +295,13 @@ pub fn run(
             &mut out,
         );
         if generation != session.generation() {
-            tun_pending.clear();
+            driver.reset();
             generation = session.generation();
         }
         let established = session.is_established();
         worker::sync_tun_queue(id, tun.as_fd(), &mut attached, established);
+        let read_allowed = out.room(&driver, stride, 1);
+        driver.service(attached, read_allowed);
         ctrl.report(applied_gen, established, wait);
     }
     out.reset();

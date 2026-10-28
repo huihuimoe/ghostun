@@ -13,6 +13,11 @@ mode = "entry"
 # Exactly one outer transport per instance. Both peers must match; change requires restart.
 transport = "faketcp"  # or "tcp", which also supports terminating TCP relays
 
+# Experimental FakeTCP TUN fast path (Linux 6.7+); change requires restart.
+# Containers must permit io_uring_setup/enter/register in their seccomp profile.
+# Unsupported or restricted environments fall back to poll; see README deployment notes.
+tun_io_uring = false
+
 # --- entry only (required) ---
 # Outer address of the exit node. IPv6 example: "[2001:db8::10]:443".
 remote = "203.0.113.10:443"

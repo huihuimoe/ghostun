@@ -61,6 +61,10 @@ impl<T> Pending<T> {
     }
 
     pub fn pop(&mut self) {
+        drop(self.take_front());
+    }
+
+    pub fn take_front(&mut self) -> Option<Packet<T>> {
         if let Some(packet) = self.packets.pop_front() {
             if packet.control {
                 self.controls -= 1;
@@ -68,6 +72,9 @@ impl<T> Pending<T> {
                 self.bytes -= packet.bytes.len();
                 self.data -= 1;
             }
+            Some(packet)
+        } else {
+            None
         }
     }
 

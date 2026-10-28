@@ -9,6 +9,9 @@ N=${N:-2}
 MTU=1420
 DEAD=4
 OUTER_FAMILY=${OUTER_FAMILY:-ipv4}
+TUN_IO_URING=${TUN_IO_URING:-0}
+TUN_IO_ARGS=()
+if [[ $TUN_IO_URING != 0 ]]; then TUN_IO_ARGS+=(--tun-io-uring); fi
 if [[ -z ${ENTRY_CPUS:-} && -z ${EXIT_CPUS:-} ]]; then
     mapfile -t CPUS < <(awk '/^Cpus_allowed_list:/ { n=split($2, a, ","); for (i=1; i<=n; i++) if (split(a[i], r, "-") == 2) for (c=r[1]; c<=r[2]; c++) print c; else print a[i] }' /proc/self/status)
     if ((${#CPUS[@]} >= 2 * N)); then
@@ -93,7 +96,7 @@ EOF
 
 start_entry() {
     # Not via ns(): backgrounding a shell function makes $! a subshell, not ghostun.
-    ip netns exec entry "$BIN" --config "$LOG/auth.toml" entry --remote "$REMOTE" --iface e0 --conns "$N" "${ENTRY_CPU_ARGS[@]}" --ping-interval 1 --dead-timeout $DEAD >"$LOG/entry.log" 2>&1 &
+    ip netns exec entry "$BIN" --config "$LOG/auth.toml" entry --remote "$REMOTE" --iface e0 --conns "$N" "${ENTRY_CPU_ARGS[@]}" "${TUN_IO_ARGS[@]}" --ping-interval 1 --dead-timeout $DEAD >"$LOG/entry.log" 2>&1 &
     ENTRY_PID=$!
     PIDS="$EXIT_PID $ENTRY_PID"
 }
@@ -110,7 +113,7 @@ route_inner() {
 }
 
 start() {
-    ip netns exec exit "$BIN" --config "$LOG/auth.toml" exit --listen "$REMOTE" --conns "$N" "${EXIT_CPU_ARGS[@]}" --ping-interval 1 --dead-timeout $DEAD >"$LOG/exit.log" 2>&1 &
+    ip netns exec exit "$BIN" --config "$LOG/auth.toml" exit --listen "$REMOTE" --conns "$N" "${EXIT_CPU_ARGS[@]}" "${TUN_IO_ARGS[@]}" --ping-interval 1 --dead-timeout $DEAD >"$LOG/exit.log" 2>&1 &
     EXIT_PID=$!
     PIDS="$EXIT_PID"
     start_entry
@@ -138,6 +141,14 @@ start
 
 t=$(wait_ping 10) || fail "tunnel never came up"
 pass "$OUTER_FAMILY outer tunnel up in ${t}s"
+for side in entry exit; do
+    if [[ $TUN_IO_URING == 1 ]]; then
+        grep -q 'TUN io_uring fast-path enabled' "$LOG/$side.log" || fail "$side fast path not enabled"
+        ! grep -q 'using poll fallback' "$LOG/$side.log" || fail "$side unexpectedly fell back to poll"
+    elif [[ $TUN_IO_URING == fallback ]]; then
+        grep -q 'using poll fallback' "$LOG/$side.log" || fail "$side did not fall back to poll"
+    fi
+done
 
 for side in entry exit; do
     mtu=$(ns $side cat /sys/class/net/ghostun0/mtu)
@@ -324,7 +335,7 @@ pass "SIGTERM: RSTs released firewall slots, ghostun0 and nft tables removed"
 # FakeTCP bypass and Exit MSS clamping (Exit tun_mtu=1280 < Entry tun_mtu and inet MTU=1420).
 ns inet ip route add 10.200.0.0/30 via 10.3.0.1
 ns inet ip -6 route add fd00:200::/126 via fd00:3::1
-ip netns exec exit "$BIN" --config "$LOG/auth.toml" exit --listen 443 --outer-family "$OUTER_FAMILY" --conns "$N" "${EXIT_CPU_ARGS[@]}" --tun-mtu 1280 --no-masq --ping-interval 1 --dead-timeout $DEAD >"$LOG/exit-nomasq.log" 2>&1 &
+ip netns exec exit "$BIN" --config "$LOG/auth.toml" exit --listen 443 --outer-family "$OUTER_FAMILY" --conns "$N" "${EXIT_CPU_ARGS[@]}" "${TUN_IO_ARGS[@]}" --tun-mtu 1280 --no-masq --ping-interval 1 --dead-timeout $DEAD >"$LOG/exit-nomasq.log" 2>&1 &
 EXIT_PID=$!
 PIDS="$EXIT_PID"
 start_entry
@@ -368,4 +379,7 @@ for side in entry exit; do
     ! ns $side nft list table inet "$TABLE" >/dev/null 2>&1 || fail "--no-masq $side nft table survived shutdown"
 done
 pass "--no-masq: routed IPv4/IPv6 preserved source IPs in both directions with Exit-clamped MSS"
+if [[ $TUN_IO_URING == 1 ]]; then
+    ! grep -q 'using poll fallback' "$LOG/entry.log" "$LOG/exit.log" "$LOG/exit-nomasq.log" || fail "fast path unexpectedly fell back during e2e"
+fi
 echo "ALL PASSED"

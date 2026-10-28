@@ -10,6 +10,7 @@ pub mod pkt;
 mod queue;
 #[cfg(test)]
 mod tests;
+mod tun;
 pub mod worker;
 
 use crate::config::{AuthKey, Config, Mode, OuterFamily};

@@ -1,6 +1,7 @@
 //! Thin OS wrappers: TUN, raw/TCP sockets, poll, signals, CSPRNG, CPU affinity, routing.
 
 pub mod netlink;
+pub mod uring;
 
 use std::fs::File;
 use std::io::{self, Write};

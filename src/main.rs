@@ -164,6 +164,7 @@ fn run(mut cfg: Config) -> Result<(), String> {
         slots.push(Start::Fake(Box::new(session), tun, raw));
     }
     let family = cfg.outer_family;
+    let tun_io_uring = cfg.tun_io_uring;
     let default_cpus = sys::usable_cpus();
     let mut controls = Vec::with_capacity(n);
     let mut workers = Vec::with_capacity(n);
@@ -178,9 +179,16 @@ fn run(mut cfg: Config) -> Result<(), String> {
                 .spawn(move || {
                     let _guard = worker::StopOnDrop(&STOP, main_wake_fd);
                     match start {
-                        Start::Fake(session, tun, raw) => {
-                            faketcp::run(i, family, *session, tun, raw, &STOP, &worker_ctrl)
-                        }
+                        Start::Fake(session, tun, raw) => faketcp::run(
+                            i,
+                            family,
+                            *session,
+                            tun,
+                            raw,
+                            &STOP,
+                            &worker_ctrl,
+                            tun_io_uring,
+                        ),
                         Start::Tcp(tcp) => tcp.run(&STOP, &worker_ctrl),
                     }
                 })
