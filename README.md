@@ -25,7 +25,7 @@ flowchart TB
 ## Requirements
 
 - Linux with `CAP_NET_ADMIN` and `CAP_NET_RAW` (or root)
-- `nftables` (`nft`, unless `--no-netfilter` is set)
+- Kernel nftables support (unless `--no-netfilter` is set); no `ip` or `nft` executable is required
 - Inbound TCP allowed on the Exit `--listen` port
 
 ## Build

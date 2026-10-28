@@ -154,9 +154,9 @@ Design and deliver `ghostun`: a high-performance, low-memory L3-over-FakeTCP tun
 
 ### 6. Self-Contained Netfilter Lifecycle (`--no-netfilter` Opt-out)
 
-- Unless `--no-netfilter` is set, manage rules at startup using `nft -f -`. Use table name `ghostun_<tun_name>`, replacing characters outside `[A-Za-z0-9_]` with `_` to support multiple instances on one host:
-  1. Attempt to delete any old `table inet ghostun_<tun_name>`, idempotently clearing rules left by an earlier crash.
-  2. Atomically create the dedicated table and its rules:
+- Unless `--no-netfilter` is set, manage rules directly through `NETLINK_NETFILTER`, without invoking `nft`. Use table name `ghostun_<tun_name>`, replacing characters outside `[A-Za-z0-9_]` with `_` to support multiple instances on one host:
+  1. In one batch transaction, ensure the table exists, delete it, and recreate it with the required chains and rules. This clears stale state on success while preserving the old table if any operation fails.
+  2. Preserve these rule semantics:
      - **Shared Entry/Exit rules**: In the prerouting chain, match non-TUN outer tunnel frames (`iifname != "<tun>"`) and apply `notrack meta pkttype set other` so outer traffic bypasses host conntrack and is discarded immediately at local `tcp_v4_rcv` / `tcp_v6_rcv` entry after `SOCK_RAW` delivery. In the output chain, match `notrack` and drop fallback kernel-generated `tcp flags rst` for local tunnel ports in the selected outer family. Use `ip`/`ip6` endpoint matching on Entry, and `meta nfproto ipv4`/`ipv6` on Exit. Ghostun sockets set `SO_MARK = 0x67687374`; `meta mark != 0x67687374` exempts intentionally emitted RSTs.
      - **Exit-specific rules**: Enable `net.ipv4.ip_forward=1` and, in dual-stack mode, `net.ipv6.conf.all.forwarding=1`. In the forward chain, apply `maxseg size set rt mtu` to TCP SYNs entering or leaving `ghostun0`. In postrouting, masquerade inner networks (`10.200.0.0/30` and `fd00:200::/126`) on traffic leaving through non-tunnel interfaces.
   3. On SIGINT/SIGTERM, have Entry send RSTs for every outer connection to release firewall slots, then remove `table inet ghostun_<tun_name>` before exiting.

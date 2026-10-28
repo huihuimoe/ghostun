@@ -82,7 +82,9 @@ jobs:
             'tcp-ipv4-direct'   'LOG=/tmp/e2e OUTER_FAMILY=ipv4 RELAY=0 bash tests/e2e/tcp.sh' \
             'tcp-ipv6-direct'   'LOG=/tmp/e2e OUTER_FAMILY=ipv6 RELAY=0 bash tests/e2e/tcp.sh' \
             'noipv6-faketcp'    'LOG=/tmp/e2e TRANSPORT=faketcp bash tests/e2e/ipv6-disabled.sh' \
-            'noipv6-tcp'        'LOG=/tmp/e2e TRANSPORT=tcp bash tests/e2e/ipv6-disabled.sh' |
+            'noipv6-tcp'        'LOG=/tmp/e2e TRANSPORT=tcp bash tests/e2e/ipv6-disabled.sh' \
+            'nftables-atomic'   'set -e; for binary in target/debug/deps/ghostun-*; do if [[ -f "$binary" && -x "$binary" ]]; then "$binary" --ignored --exact netfilter::tests::atomic_table_replacement; fi; done' \
+            'nftables-no-executable' 'LOG=/src/target/e2e-nftables bash tests/e2e/nftables.sh' |
             xargs -0 -n 2 -P 4 bash -ceu 'run_suite "$1" "$2"' _
       - name: Remove network test containers
         if: always() && steps.filter.outputs.e2e == 'true'

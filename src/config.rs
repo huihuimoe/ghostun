@@ -617,7 +617,6 @@ fn parse_cpus(spec: &str) -> Result<Vec<usize>, String> {
 
 fn validate(c: &Config) -> Result<(), String> {
     let name = &c.tun_name;
-    // Interpolated into nft scripts, so keep to a conservative charset.
     if name.is_empty()
         || name.len() > 15
         || !name

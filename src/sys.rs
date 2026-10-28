@@ -8,7 +8,6 @@ use std::mem::{size_of, zeroed, MaybeUninit};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use crate::config::OuterFamily;
@@ -626,63 +625,4 @@ pub fn sysctl_set(key: &str, value: &str) -> io::Result<()> {
     File::create(&path)
         .and_then(|mut f| f.write_all(value.as_bytes()))
         .map_err(annotate)
-}
-
-/// `/usr/sbin` and `/sbin` are often missing from service and non-root `PATH`s.
-fn find_program(prog: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    std::env::split_paths(&path)
-        .chain(["/usr/sbin", "/sbin", "/usr/bin", "/bin"].map(PathBuf::from))
-        .map(|dir| dir.join(prog))
-        .find(|p| p.is_file())
-}
-
-pub fn run(prog: &str, args: &[&str], stdin: Option<&str>) -> io::Result<String> {
-    let path = find_program(prog)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("{prog} not found")))?;
-    let mut child = Command::new(&path)
-        .args(args)
-        .stdin(if stdin.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    if let Some(input) = stdin {
-        child
-            .stdin
-            .take()
-            .expect("piped stdin")
-            .write_all(input.as_bytes())?;
-    }
-    let out = child.wait_with_output()?;
-    if !out.status.success() {
-        return Err(io::Error::other(format!(
-            "`{prog} {}` failed ({}): {}",
-            args.join(" "),
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn run_reports_failure_with_stderr() {
-        assert_eq!(run("sh", &["-c", "cat"], Some("hi")).unwrap(), "hi");
-        let err = run("sh", &["-c", "echo boom >&2; exit 3"], None).unwrap_err();
-        assert!(err.to_string().contains("boom"));
-        assert_eq!(
-            run("definitely-not-a-program-xyz", &[], None)
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::NotFound
-        );
-    }
 }

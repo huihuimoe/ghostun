@@ -23,6 +23,7 @@ getrandom = "0.4.3"
 netlink-sys = "0.9"
 netlink-packet-core = "0.9"
 netlink-packet-route = "0.33"
+netlink-packet-netfilter = "0.4"
 zerocopy = { version = "0.8", features = ["derive"] }
 
 [profile.release]
