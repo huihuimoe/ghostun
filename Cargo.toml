@@ -20,6 +20,9 @@ toml = "1.1.8"
 hmac = "0.13.0"
 sha2 = "0.11.1"
 getrandom = "0.4.3"
+netlink-sys = "0.9"
+netlink-packet-core = "0.9"
+netlink-packet-route = "0.33"
 
 [profile.release]
 opt-level = 3

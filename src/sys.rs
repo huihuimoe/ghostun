@@ -1,5 +1,7 @@
 //! Thin OS wrappers: TUN, raw/TCP sockets, poll, signals, CSPRNG, CPU affinity, routing.
 
+pub mod netlink;
+
 use std::fs::File;
 use std::io::{self, Write};
 use std::mem::{size_of, zeroed, MaybeUninit};
@@ -16,8 +18,6 @@ use crate::faketcp::pkt::{self, IPV6_HDR};
 pub const SOCKET_MARK: u32 = 0x6768_7374;
 const SOCKET_BUF: libc::c_int = 4 << 20;
 pub const RAW_BATCH: usize = 64;
-/// Multi-queue TUN divides `tx_queue_len / numqueues` per ring; 8192 prevents burst tail-drops.
-const TUN_TXQUEUELEN: &str = "8192";
 pub const READ_READY: i16 = libc::POLLIN | libc::POLLERR | libc::POLLHUP;
 pub const WRITE_READY: i16 = libc::POLLOUT | libc::POLLERR | libc::POLLHUP;
 type CmsgBuf = [usize; 8];
@@ -606,85 +606,14 @@ pub fn pin_to_cpu(cpu: usize) -> io::Result<()> {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Route {
-    pub src: IpAddr,
-    pub dev: String,
-}
-
-fn token_after<'a>(line: &'a str, key: &str) -> Option<&'a str> {
-    let mut it = line.split_whitespace();
-    it.by_ref().find(|t| *t == key)?;
-    it.next()
-}
-
-fn invalid(msg: String) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, msg)
-}
-
-fn parse_route_get(out: &str) -> Option<Route> {
-    let line = out.lines().next()?;
-    Some(Route {
-        src: token_after(line, "src")?.parse().ok()?,
-        dev: token_after(line, "dev")?.to_owned(),
-    })
-}
-
-fn parse_default_dev(out: &str) -> Option<String> {
-    out.lines()
-        .find_map(|l| token_after(l, "dev"))
-        .map(str::to_owned)
-}
-
-pub fn route_to(dst: IpAddr, dev: Option<&str>) -> io::Result<Route> {
-    let address = dst.to_string();
-    let mut args = vec![OuterFamily::of(dst).ip_flag(), "route", "get", &address];
-    if let Some(dev) = dev {
-        args.extend(["oif", dev]);
-    }
-    let out = run("ip", &args, None)?;
-    parse_route_get(&out).ok_or_else(|| invalid(format!("cannot parse route to {dst}: {out:?}")))
-}
-
-pub fn default_route_dev(family: OuterFamily) -> io::Result<String> {
-    let out = run("ip", &[family.ip_flag(), "route", "show", "default"], None)?;
-    parse_default_dev(&out).ok_or_else(|| invalid(format!("no {family:?} default route")))
-}
-
 pub fn iface_mtu(dev: &str) -> io::Result<u32> {
     let text = std::fs::read_to_string(Path::new("/sys/class/net").join(dev).join("mtu"))?;
-    text.trim()
-        .parse()
-        .map_err(|_| invalid(format!("bad MTU for {dev}: {text:?}")))
-}
-
-/// Sets MTU and `TUN_TXQUEUELEN` (avoiding per-queue burst tail-drops), brings the device up, and
-/// assigns inner addresses. An IPv6 failure only warns; returns whether IPv6 got configured.
-pub fn configure_tun(name: &str, mtu: u32, v4: &str, v6: Option<&str>) -> io::Result<bool> {
-    run(
-        "ip",
-        &[
-            "link",
-            "set",
-            "dev",
-            name,
-            "mtu",
-            &mtu.to_string(),
-            "txqueuelen",
-            TUN_TXQUEUELEN,
-            "up",
-        ],
-        None,
-    )?;
-    run("ip", &["-4", "addr", "add", v4, "dev", name], None)?;
-    let Some(v6) = v6 else { return Ok(false) };
-    match run("ip", &["-6", "addr", "add", v6, "dev", name, "nodad"], None) {
-        Ok(_) => Ok(true),
-        Err(e) => {
-            log::warn!("inner IPv6 disabled: cannot add {v6} to {name}: {e}");
-            Ok(false)
-        }
-    }
+    text.trim().parse().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("bad MTU for {dev}: {text:?}"),
+        )
+    })
 }
 
 /// No-op when the value is already set, so read-only `/proc/sys` (containers) works if the host pre-set it.
@@ -743,47 +672,6 @@ pub fn run(prog: &str, args: &[&str], stdin: Option<&str>) -> io::Result<String>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv4Addr;
-
-    #[test]
-    fn route_get_via_gateway() {
-        let out = "203.0.113.9 via 10.0.0.1 dev eth0 src 10.0.0.5 uid 1000 \n    cache \n";
-        assert_eq!(
-            parse_route_get(out),
-            Some(Route {
-                src: Ipv4Addr::new(10, 0, 0, 5).into(),
-                dev: "eth0".into()
-            })
-        );
-    }
-
-    #[test]
-    fn route_get_on_link() {
-        let out = "10.1.0.2 dev veth-e src 10.1.0.1 uid 0 \n    cache \n";
-        assert_eq!(
-            parse_route_get(out),
-            Some(Route {
-                src: Ipv4Addr::new(10, 1, 0, 1).into(),
-                dev: "veth-e".into()
-            })
-        );
-        assert_eq!(
-            parse_route_get("RTNETLINK answers: Network is unreachable\n"),
-            None
-        );
-    }
-
-    #[test]
-    fn default_route_dev_parsed() {
-        assert_eq!(
-            parse_default_dev(
-                "default via 10.0.0.1 dev ens3 proto dhcp src 10.0.0.5 metric 100 \n"
-            )
-            .as_deref(),
-            Some("ens3")
-        );
-        assert_eq!(parse_default_dev(""), None);
-    }
 
     #[test]
     fn run_reports_failure_with_stderr() {

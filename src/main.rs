@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use config::{Config, Mode, Transport};
 use faketcp::{Session, SessionConfig};
+use sys::netlink;
 use worker::RollingReload;
 
 static STOP: AtomicBool = AtomicBool::new(false);
@@ -39,7 +40,7 @@ struct Outer {
 fn resolve_outer(cfg: &Config) -> Result<Outer, String> {
     let (local_ip, dev) = match (cfg.mode, cfg.remote) {
         (Mode::Entry, Some(remote)) => {
-            let route = sys::route_to(remote.ip(), cfg.iface.as_deref())
+            let route = netlink::route_to(remote.ip(), cfg.iface.as_deref())
                 .map_err(|e| format!("route to {remote}: {e}"))?;
             (route.src, Some(route.dev))
         }
@@ -47,7 +48,7 @@ fn resolve_outer(cfg: &Config) -> Result<Outer, String> {
             cfg.exit_ip(),
             cfg.iface
                 .clone()
-                .or_else(|| sys::default_route_dev(cfg.outer_family).ok()),
+                .or_else(|| netlink::default_route_dev(cfg.outer_family).ok()),
         ),
     };
     let mtu = match (cfg.outer_mtu, &dev) {
@@ -79,14 +80,8 @@ fn run(mut cfg: Config) -> Result<(), String> {
     let n = usize::from(cfg.conns);
     let tuns = sys::create_tun(&cfg.tun_name, n)
         .map_err(|e| format!("creating TUN {}: {e}", cfg.tun_name))?;
-    let v6 = cfg.tun_ipv6.map(|c| c.to_string());
-    let ipv6 = sys::configure_tun(
-        &cfg.tun_name,
-        tun_mtu,
-        &cfg.tun_ipv4.to_string(),
-        v6.as_deref(),
-    )
-    .map_err(|e| format!("configuring {}: {e}", cfg.tun_name))?;
+    let ipv6 = netlink::configure_tun(&cfg.tun_name, tun_mtu, cfg.tun_ipv4, cfg.tun_ipv6)
+        .map_err(|e| format!("configuring {}: {e}", cfg.tun_name))?;
     if !ipv6 {
         cfg.disable_inner_ipv6();
     }

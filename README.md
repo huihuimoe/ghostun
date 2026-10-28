@@ -25,7 +25,7 @@ flowchart TB
 ## Requirements
 
 - Linux with `CAP_NET_ADMIN` and `CAP_NET_RAW` (or root)
-- `iproute2` (`ip`) and `nftables` (`nft`, unless `--no-netfilter` is set)
+- `nftables` (`nft`, unless `--no-netfilter` is set)
 - Inbound TCP allowed on the Exit `--listen` port
 
 ## Build

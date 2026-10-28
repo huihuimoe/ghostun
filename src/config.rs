@@ -60,13 +60,6 @@ impl OuterFamily {
         }
     }
 
-    pub fn ip_flag(self) -> &'static str {
-        match self {
-            Self::Ipv4 => "-4",
-            Self::Ipv6 => "-6",
-        }
-    }
-
     pub fn unspecified(self) -> IpAddr {
         match self {
             Self::Ipv4 => Ipv4Addr::UNSPECIFIED.into(),
@@ -624,7 +617,7 @@ fn parse_cpus(spec: &str) -> Result<Vec<usize>, String> {
 
 fn validate(c: &Config) -> Result<(), String> {
     let name = &c.tun_name;
-    // Interpolated into nft scripts and `ip` arguments, so keep to a conservative charset.
+    // Interpolated into nft scripts, so keep to a conservative charset.
     if name.is_empty()
         || name.len() > 15
         || !name

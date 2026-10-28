@@ -26,7 +26,7 @@ RUN case "$TARGETARCH" in \
     && install -D -m 0755 "target/$rust_target/release/ghostun" /out/usr/local/bin/ghostun
 
 FROM alpine:3.24.3
-RUN apk add --no-cache iproute2-minimal nftables
+RUN apk add --no-cache nftables
 COPY --from=build /out/ /
 STOPSIGNAL SIGTERM
 ENTRYPOINT ["/usr/local/bin/ghostun"]
