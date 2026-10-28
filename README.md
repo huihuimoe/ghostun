@@ -35,7 +35,9 @@ cargo build --release --locked
 docker build -t ghostun .
 ```
 
-Pre-built multi-arch Docker images are available at `ghcr.io/huihuimoe/ghostun:latest`.
+Pre-built, statically linked Linux binaries for amd64 and arm64 are available on
+[GitHub Releases](https://github.com/huihuimoe/ghostun/releases). Multi-arch Docker
+images are available at `ghcr.io/huihuimoe/ghostun:latest`.
 
 ## Quick start
 
@@ -144,7 +146,7 @@ Use `exit.toml` and `deploy/ghostun-exit.service` on the Exit host.
 
 ### Podman Quadlet
 
-Quadlet units in [`deploy/`](deploy/) use `ghcr.io/huihuimoe/ghostun:latest`:
+Quadlet units in [`deploy/`](deploy/):
 
 ```sh
 install -d -m700 /etc/ghostun
@@ -158,7 +160,7 @@ On the Exit host, enable IP forwarding (`sysctl -w net.ipv4.ip_forward=1 net.ipv
 
 ### Docker Compose
 
-Compose files in [`deploy/`](deploy/) use `ghcr.io/huihuimoe/ghostun:latest`:
+Compose files in [`deploy/`](deploy/):
 
 **Entry:**
 

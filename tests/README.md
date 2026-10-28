@@ -28,8 +28,7 @@ sudo docker exec ghostun-e2e bash -c '
     done
     for transport in faketcp tcp; do
       LOG=/src/target/e2e-noipv6-$transport TRANSPORT=$transport bash tests/e2e/ipv6-disabled.sh
-    done
-    LOG=/src/target/e2e-nftables bash tests/e2e/nftables.sh'
+    done'
 ```
 
 The container needs four usable CPUs. Inspect logs under `target/` with
@@ -39,8 +38,6 @@ The container needs four usable CPUs. Inspect logs under `target/` with
 - `e2e/netns.sh`: FakeTCP forwarding, authentication, firewall recovery, reload and cleanup.
 - `e2e/tcp.sh`: direct/relayed TCP, exact bidirectional IPv4/IPv6 TCP/UDP payloads,
   rejection and admission limits, takeover, restarts, blackholes, reload and cleanup.
-- `e2e/nftables.sh`: both transports start, forward, and clean up owned nftables state
-  while `nft` is hidden from Ghostun but remains available to the test observer.
 - `e2e/ipv6-disabled.sh`: IPv4 fallback with kernel IPv6 disabled, for both transports.
 - The ignored `atomic_table_replacement` Rust test runs only in the container; it checks
   failed-install rollback, preservation of an existing table, replacement, and removal.

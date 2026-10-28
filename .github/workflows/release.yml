@@ -75,20 +75,15 @@ jobs:
           ref: refs/tags/${{ needs.prepare.outputs.tag }}
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu
-      - uses: mlugg/setup-zig@v2
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-zigbuild
+          targets: x86_64-unknown-linux-musl, aarch64-unknown-linux-musl
       - name: Build amd64 and arm64 release binaries
         env:
-          RUSTFLAGS: -C target-feature=+crt-static
+          RUSTFLAGS: -C linker=rust-lld
         run: |
-          cargo zigbuild --locked --release --target x86_64-unknown-linux-gnu.2.17 --target aarch64-unknown-linux-gnu.2.17
+          cargo build --locked --release --target x86_64-unknown-linux-musl --target aarch64-unknown-linux-musl
           mkdir -p dist
-          install -m 0755 target/x86_64-unknown-linux-gnu/release/ghostun dist/ghostun-linux-amd64
-          install -m 0755 target/aarch64-unknown-linux-gnu/release/ghostun dist/ghostun-linux-arm64
-          (cd dist && sha256sum ghostun-linux-amd64 ghostun-linux-arm64 > SHA256SUMS)
+          install -m 0755 target/x86_64-unknown-linux-musl/release/ghostun dist/ghostun-linux-amd64
+          install -m 0755 target/aarch64-unknown-linux-musl/release/ghostun dist/ghostun-linux-arm64
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
@@ -97,7 +92,6 @@ jobs:
           files: |
             dist/ghostun-linux-amd64
             dist/ghostun-linux-arm64
-            dist/SHA256SUMS
 
   build-image:
     needs: prepare
