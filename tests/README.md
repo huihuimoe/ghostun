@@ -46,8 +46,11 @@ The container needs four usable CPUs. Inspect logs under `target/` with
 
 For the automatic FakeTCP TUN fast path, run `netns.sh` with `EXPECT_TUN_DRIVER=uring`
 for each outer family; the suite requires io_uring to stay enabled. Run it again
-with `EXPECT_TUN_DRIVER=poll` in a container started with
-`--security-opt seccomp="$PWD/tests/deny-io-uring.json"` to check policy fallback.
+with `EXPECT_TUN_DRIVER=poll` to check policy fallback. For that container, replace
+`--privileged` with `--cap-add=ALL --device=/dev/net/tun
+--security-opt apparmor=unconfined --security-opt systempaths=unconfined
+--security-opt seccomp="$PWD/tests/deny-io-uring.json"`;
+Docker bypasses seccomp in privileged containers.
 Run the ignored `sys::batch_tests::entry_raw_socket_binds_and_connects_both_families`
 and `faketcp::tun::tests::uring_recycles_buffers_and_preserves_backlog_across_runtime_fallback`
 tests inside the privileged container too.

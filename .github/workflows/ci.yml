@@ -61,13 +61,16 @@ jobs:
           run_suite() {
             local name=$1 cmd=$2 start=$SECONDS
             local out="target/e2e-$name.out"
-            local security=()
+            local security=(--privileged)
             if [[ $name == faketcp-* ]]; then
-              security=(--security-opt "seccomp=$PWD/tests/deny-io-uring.json")
+              # Docker bypasses seccomp for --privileged containers.
+              security=(--cap-add=ALL --device=/dev/net/tun
+                --security-opt apparmor=unconfined --security-opt systempaths=unconfined
+                --security-opt "seccomp=$PWD/tests/deny-io-uring.json")
             fi
             mkdir -p target
             if sudo docker run --rm --name "ghostun-e2e-$name" --label ghostun-e2e=1 \
-              --privileged --network none \
+              --network none \
               "${security[@]}" \
               -v "$PWD":/src -w /src -e BIN=/src/target/release/ghostun \
               ghostun-e2e -c "$cmd" >"$out" 2>&1; then

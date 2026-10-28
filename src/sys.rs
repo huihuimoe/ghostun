@@ -774,7 +774,7 @@ mod batch_tests {
         ] {
             let family = OuterFamily::of(ip);
             let fd = raw_socket(family, None, &filter, Some((ip, ip))).unwrap();
-            for peer in [false, true] {
+            {
                 let address = SockAddr::from_ip(family.unspecified());
                 let (_, mut len) = address.as_ptr_len();
                 // SAFETY: address has writable storage of the selected family's exact size.
@@ -784,19 +784,43 @@ mod batch_tests {
                     SockAddr::V6(v) => (v as *mut libc::sockaddr_in6).cast(),
                 };
                 // SAFETY: ptr and len describe the live, correctly aligned address storage.
-                let result = unsafe {
-                    if peer {
-                        libc::getpeername(fd.as_raw_fd(), ptr, &mut len)
-                    } else {
-                        libc::getsockname(fd.as_raw_fd(), ptr, &mut len)
-                    }
-                };
-                assert_eq!(result, 0);
+                let result = unsafe { libc::getsockname(fd.as_raw_fd(), ptr, &mut len) };
+                assert_eq!(result, 0, "{}", io::Error::last_os_error());
                 let got = match address {
                     SockAddr::V4(v) => IpAddr::from(v.sin_addr.s_addr.to_ne_bytes()),
                     SockAddr::V6(v) => IpAddr::from(v.sin6_addr.s6_addr),
                 };
                 assert_eq!(got, ip);
+            }
+            let mut frame = [0u8; pkt::MAX_OVERHEAD];
+            let len = pkt::write_headers(
+                &mut frame,
+                &pkt::TcpMeta {
+                    src: SocketAddr::new(ip, 40000),
+                    dst: SocketAddr::new(ip, 40001),
+                    seq: 1,
+                    ack: 0,
+                    flags: pkt::flags::RST,
+                    window: 0,
+                },
+                0,
+                0,
+            );
+            // Raw sockets use port zero, so getpeername reports ENOTCONN even after connect.
+            // Sending without a destination must fail before connect and succeed after it.
+            let unconnected = raw_socket(family, None, &filter, None).unwrap();
+            for (socket, connected) in [(&unconnected, false), (&fd, true)] {
+                // SAFETY: frame holds len initialized bytes and the socket is live.
+                let sent = unsafe { libc::send(socket.as_raw_fd(), frame.as_ptr().cast(), len, 0) };
+                if connected {
+                    assert_eq!(sent, len as isize, "{}", io::Error::last_os_error());
+                } else {
+                    assert_eq!(sent, -1);
+                    assert_eq!(
+                        io::Error::last_os_error().raw_os_error(),
+                        Some(libc::EDESTADDRREQ)
+                    );
+                }
             }
         }
     }

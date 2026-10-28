@@ -302,7 +302,6 @@ pub fn run(
         driver.service(attached, read_allowed);
         ctrl.report(applied_gen, established, wait);
     }
-    out.reset();
     session.shutdown(&mut out);
     out.flush();
 }
