@@ -228,13 +228,8 @@ fn setsockopt<T>(
     .map(drop)
 }
 
-pub fn tcp_notsent_lowat(stream: &TcpStream) -> io::Result<()> {
-    setsockopt(
-        stream,
-        libc::IPPROTO_TCP,
-        libc::TCP_NOTSENT_LOWAT,
-        &crate::budget::TCP_NOTSENT,
-    )
+pub fn tcp_notsent_lowat(stream: &TcpStream, bytes: u32) -> io::Result<()> {
+    setsockopt(stream, libc::IPPROTO_TCP, libc::TCP_NOTSENT_LOWAT, &bytes)
 }
 
 fn bind_to_device(fd: &OwnedFd, dev: Option<&str>) -> io::Result<()> {

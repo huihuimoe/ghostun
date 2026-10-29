@@ -13,6 +13,11 @@ mode = "entry"
 # Exactly one outer transport per instance. Both peers must match; change requires restart.
 transport = "faketcp"  # or "tcp", which also supports terminating TCP relays
 
+# TCP only: unsent low watermark and per-write batch limit in KiB; restart to change.
+# Default 64 favors short queues. Consider 128 for sustained >1 Gbit/s LAN/IDC traffic;
+# larger values allow more unsent data to queue. CLI: --tcp-notsent 128.
+# tcp_notsent = 64
+
 # --- entry only (required) ---
 # Outer address of the exit node. IPv6 example: "[2001:db8::10]:443".
 remote = "203.0.113.10:443"

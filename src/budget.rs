@@ -2,7 +2,6 @@
 pub const BYTES: usize = 256 * 1024;
 pub const PACKETS: usize = 256;
 pub const TCP_NOTSENT: u32 = (BYTES / 4) as u32;
-pub const TCP_WRITE_BATCH: usize = BYTES / 4;
 
 // Linux applies txqueuelen to every TUN ring independently, including detached queues.
 pub fn tun_packets(mtu: u32) -> u32 {

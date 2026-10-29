@@ -107,6 +107,7 @@ ghostun [options] [entry|exit]
 | Flag | Default | Description |
 |---|---|---|
 | `--transport faketcp\|tcp` | `faketcp` | One outer transport per instance; restart to change |
+| `--tcp-notsent KIB` | `64` | TCP unsent low watermark and write batch limit in KiB; restart to change |
 | `--config PATH` | — | TOML configuration file (required for `auth_key`) |
 | `--remote IP:PORT` | — | Entry only: Exit outer address (IP literal) |
 | `--listen [IP:]PORT` | — | Exit only: outer listen port or `IP:PORT` |
@@ -188,6 +189,11 @@ blocks io_uring; Podman follows its installed policy. The deployment templates
 keep the runtime defaults. Logs report fast-path activation or the fallback reason.
 
 ## Performance
+
+TCP defaults to `tcp_notsent = 64` (KiB). For sustained >1 Gbit/s LAN/IDC
+traffic, consider `tcp_notsent = 128` or `--tcp-notsent 128` on each peer.
+Larger values permit more unsent data to queue; measure throughput and latency
+on your link. This setting has no effect on FakeTCP and requires a restart.
 
 ### Transport comparison (100 Mbit/s)
 

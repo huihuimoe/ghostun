@@ -54,3 +54,14 @@ Docker bypasses seccomp in privileged containers.
 Run the ignored `sys::batch_tests::entry_raw_socket_binds_and_connects_both_families`
 and `faketcp::tun::tests::uring_recycles_buffers_and_preserves_backlog_across_runtime_fallback`
 tests inside the privileged container too.
+
+To run the performance scenarios from `README.md`, run:
+
+```sh
+sudo docker exec ghostun-e2e python3 tests/perf/benchmark.py --mode all
+```
+
+TCP peers use `tcp_notsent = 64` KiB for the 100 Mbit/s comparison and
+`128` KiB for uncapped large, mixed and small packet throughput.
+The JSON results record `tcp_notsent_kib`; stored baselines may use different tuning.
+`perf/tcp-perf.sh` also uses 64 KiB for its 100 Mbit/s measurements.

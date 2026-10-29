@@ -225,6 +225,8 @@ impl<'de> Deserialize<'de> for ListenSpec {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
     pub transport: Transport,
+    /// TCP unsent low watermark and write batch limit, in bytes.
+    pub tcp_notsent: u32,
     pub base_port_explicit: bool,
     pub mode: Mode,
     pub auth_key: AuthKey,
@@ -317,6 +319,9 @@ struct Cli {
     /// outer transport: faketcp or tcp [default: faketcp]
     #[argh(option)]
     transport: Option<Transport>,
+    /// TCP unsent low watermark and write batch in KiB; restart to change [default: 64]
+    #[argh(option, arg_name = "KIB")]
+    tcp_notsent: Option<u32>,
     /// node role: entry or exit
     #[argh(positional)]
     role: Option<Mode>,
@@ -377,6 +382,7 @@ struct Cli {
 #[serde(deny_unknown_fields)]
 struct File {
     transport: Option<Transport>,
+    tcp_notsent: Option<u32>,
     mode: Option<Mode>,
     auth_key: Option<String>,
     tun_name: Option<String>,
@@ -522,6 +528,13 @@ fn build_config(cli: Cli, running_conns: Option<u16>) -> Result<Config, String> 
     });
     let cfg = Config {
         transport: cli.transport.or(file.transport).unwrap_or_default(),
+        tcp_notsent: cli
+            .tcp_notsent
+            .or(file.tcp_notsent)
+            .unwrap_or(crate::budget::TCP_NOTSENT / 1024)
+            .checked_mul(1024)
+            .filter(|&bytes| bytes != 0)
+            .ok_or("`tcp_notsent` must be within 1..=4194303 KiB")?,
         base_port_explicit: cli.base_port.is_some() || file.base_port.is_some(),
         mode,
         auth_key: file
@@ -560,6 +573,7 @@ fn ensure_reload_compatible(old: &Config, new: &Config) -> Result<(), String> {
     for (changed, field) in [
         (old.mode != new.mode, "mode"),
         (old.transport != new.transport, "transport"),
+        (old.tcp_notsent != new.tcp_notsent, "tcp_notsent"),
         (old.outer_family != new.outer_family, "outer_family"),
         (old.tun_name != new.tun_name, "tun_name"),
         (old.tun_ipv4 != new.tun_ipv4, "tun_ipv4"),
@@ -735,6 +749,45 @@ mod tests {
             &["entry", "--remote", "192.0.2.1:443"]
         )
         .is_err());
+    }
+
+    #[test]
+    fn tcp_notsent_defaults_precedence_validation_and_reload() {
+        assert_eq!(entry(&[]).unwrap().tcp_notsent, 64 * 1024);
+        for (role, address) in [("entry", "--remote"), ("exit", "--listen")] {
+            let endpoint = if role == "entry" {
+                "192.0.2.1:443"
+            } else {
+                "443"
+            };
+            let args = [role, address, endpoint, "--transport", "tcp"];
+            let cfg = with_file("notsent-file", "tcp_notsent = 128", &args).unwrap();
+            assert_eq!(cfg.tcp_notsent, 128 * 1024);
+            let mut override_args = args.to_vec();
+            override_args.extend(["--tcp-notsent", "32"]);
+            let overridden = with_file("notsent-cli", "tcp_notsent = 128", &override_args).unwrap();
+            assert_eq!(overridden.tcp_notsent, 32 * 1024);
+            assert!(ensure_reload_compatible(&cfg, &overridden)
+                .unwrap_err()
+                .contains("tcp_notsent"));
+            assert!(ensure_reload_compatible(&cfg, &cfg).is_ok());
+            for value in ["0", "-1", "4194304", "4294967295"] {
+                assert!(
+                    with_file("notsent-invalid", &format!("tcp_notsent = {value}"), &args).is_err()
+                );
+            }
+            assert!(Cli::from_args(&["ghostun"], &["--tcp-notsent", "-1"]).is_err());
+            for value in ["0", "4194304", "4294967295"] {
+                let mut invalid_args = args.to_vec();
+                invalid_args.extend(["--tcp-notsent", value]);
+                assert!(with_file("notsent-invalid-cli", "", &invalid_args).is_err());
+            }
+        }
+        assert_eq!(entry(&["--tcp-notsent", "1"]).unwrap().tcp_notsent, 1024);
+        assert_eq!(
+            entry(&["--tcp-notsent", "4194303"]).unwrap().tcp_notsent,
+            4194303 * 1024
+        );
     }
 
     #[test]

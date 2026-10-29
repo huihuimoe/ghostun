@@ -148,12 +148,12 @@ impl Receive {
     }
 }
 
-#[derive(Default)]
 pub struct SendQueue {
     blocks: VecDeque<SendBlock>,
     free: Vec<SendBlock>,
     bytes: usize,
     established: bool,
+    write_batch: usize,
 }
 
 #[derive(Default)]
@@ -164,6 +164,16 @@ struct SendBlock {
 }
 
 impl SendQueue {
+    pub fn new(write_batch: usize) -> Self {
+        Self {
+            blocks: VecDeque::new(),
+            free: Vec::new(),
+            bytes: 0,
+            established: false,
+            write_batch,
+        }
+    }
+
     #[inline(always)]
     pub fn bytes(&self) -> usize {
         self.bytes
@@ -248,7 +258,7 @@ impl SendQueue {
         while self.bytes != 0 {
             let mut slices = [IoSlice::new(&[]); 8];
             let count = self.blocks.len().min(slices.len());
-            let mut allowance = crate::budget::TCP_WRITE_BATCH;
+            let mut allowance = self.write_batch;
             for (slice, block) in slices.iter_mut().zip(&self.blocks) {
                 let len = (block.tail - block.head).min(allowance);
                 *slice = IoSlice::new(&block.bytes[block.head..block.head + len]);
@@ -467,7 +477,7 @@ mod queue_tests {
 
     #[test]
     fn large_mtu_tiny_reads_keep_retained_storage_bounded() {
-        let mut queue = SendQueue::default();
+        let mut queue = SendQueue::new(crate::budget::TCP_NOTSENT as usize);
         queue.grow();
         for _ in 0..3 {
             let mut packets = 0;

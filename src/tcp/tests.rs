@@ -21,7 +21,7 @@ fn pair() -> (TcpStream, TcpStream) {
 }
 fn conn(socket: TcpStream, now: Instant) -> Connection {
     let peer = socket.peer_addr().unwrap();
-    Connection::new(socket, peer, now).unwrap()
+    Connection::new(socket, peer, now, crate::budget::TCP_NOTSENT).unwrap()
 }
 fn packet(tag: u8) -> Vec<u8> {
     let mut p = vec![tag; 64];
@@ -133,7 +133,7 @@ impl Write for SplitIo {
 #[test]
 fn split_prefix_payload_coalescing_and_partial_writes_preserve_packets_and_cap() {
     let packets = [packet(10), packet(20), vec![PING; 9]];
-    let mut tx = SendQueue::default();
+    let mut tx = SendQueue::new(crate::budget::TCP_NOTSENT as usize);
     for p in &packets {
         assert!(tx.push(p));
     }
@@ -211,7 +211,7 @@ fn writes_preserve_frames_across_partial_prefixes_and_would_block() {
         }
     }
     let mut packets = vec![packet(1), packet(2), vec![PING; 9]];
-    let mut tx = SendQueue::default();
+    let mut tx = SendQueue::new(crate::budget::TCP_NOTSENT as usize);
     for p in &packets {
         assert!(tx.push(p));
     }
@@ -256,91 +256,98 @@ fn writes_preserve_frames_across_partial_prefixes_and_would_block() {
 
 #[test]
 fn send_blocks_preserve_framing_under_sustained_backpressure() {
-    struct Limited {
-        bytes: Vec<u8>,
-        budget: usize,
-        vectored: usize,
-    }
-    impl Write for Limited {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            self.write_vectored(&[io::IoSlice::new(bytes)])
+    for write_batch in [1024, 64 * 1024, 128 * 1024] {
+        struct Limited {
+            bytes: Vec<u8>,
+            budget: usize,
+            vectored: usize,
+            write_batch: usize,
+            largest: usize,
         }
-        fn write_vectored(&mut self, buffers: &[io::IoSlice<'_>]) -> io::Result<usize> {
-            assert!(
-                buffers.iter().map(|b| b.len()).sum::<usize>() <= crate::budget::TCP_WRITE_BATCH
-            );
-            if self.budget == 0 {
-                return Err(io::ErrorKind::WouldBlock.into());
+        impl Write for Limited {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.write_vectored(&[io::IoSlice::new(bytes)])
             }
-            self.vectored += usize::from(buffers.len() > 1);
-            let mut written = 0;
-            for buffer in buffers {
-                let len = buffer.len().min(self.budget);
-                self.bytes.extend_from_slice(&buffer[..len]);
-                self.budget -= len;
-                written += len;
+            fn write_vectored(&mut self, buffers: &[io::IoSlice<'_>]) -> io::Result<usize> {
+                let offered = buffers.iter().map(|b| b.len()).sum::<usize>();
+                assert!(offered <= self.write_batch);
+                self.largest = self.largest.max(offered);
                 if self.budget == 0 {
-                    break;
+                    return Err(io::ErrorKind::WouldBlock.into());
                 }
+                self.vectored += usize::from(buffers.len() > 1);
+                let mut written = 0;
+                for buffer in buffers {
+                    let len = buffer.len().min(self.budget);
+                    self.bytes.extend_from_slice(&buffer[..len]);
+                    self.budget -= len;
+                    written += len;
+                    if self.budget == 0 {
+                        break;
+                    }
+                }
+                Ok(written)
             }
-            Ok(written)
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
         }
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
+        let mut queue = SendQueue::new(write_batch);
+        queue.grow();
+        let mut expected = Vec::new();
+        for index in 0..200u8 {
+            let packet = vec![index; 1200];
+            assert!(queue.push(&packet));
+            expected.push(packet);
         }
+        let mut writer = Limited {
+            bytes: Vec::new(),
+            budget: 70001,
+            vectored: 0,
+            write_batch,
+            largest: 0,
+        };
+        queue.flush(&mut writer).unwrap();
+        assert_eq!(writer.bytes.len(), 70001);
+        for index in 200..250u8 {
+            assert!(queue
+                .push_in_place(1200, |buffer| {
+                    buffer[..1200].fill(index);
+                    Ok(Some(1200))
+                })
+                .unwrap());
+            expected.push(vec![index; 1200]);
+        }
+        writer.budget = 60100;
+        queue.flush(&mut writer).unwrap();
+        for index in 0..50u8 {
+            let packet = vec![index; 1200];
+            assert!(queue.push(&packet));
+            expected.push(packet);
+        }
+        assert!(queue.bytes() <= TX_LIMIT);
+        writer.budget = usize::MAX;
+        queue.flush(&mut writer).unwrap();
+        assert!(writer.vectored > 0);
+        assert_eq!(writer.largest, write_batch);
+        assert_eq!(queue.bytes(), 0);
+        let mut reader = Receive::new(1200);
+        let mut input = writer.bytes.as_slice();
+        for packet in expected {
+            assert!(reader.read(&mut input).unwrap());
+            assert_eq!(reader.payload(), packet);
+            reader.clear();
+        }
+        assert!(input.is_empty());
+        // Failed direct reads with changing maxima must not leave empty blocks before real data.
+        for max in [100, 2000, 65000] {
+            assert!(!queue.push_in_place(max, |_| Ok(None)).unwrap());
+        }
+        assert!(queue.push(b"last"));
+        let mut output = Vec::new();
+        queue.flush(&mut output).unwrap();
+        assert_eq!(output, b"\0\x04last");
     }
-    let mut queue = SendQueue::default();
-    queue.grow();
-    let mut expected = Vec::new();
-    for index in 0..200u8 {
-        let packet = vec![index; 1200];
-        assert!(queue.push(&packet));
-        expected.push(packet);
-    }
-    let mut writer = Limited {
-        bytes: Vec::new(),
-        budget: 70001,
-        vectored: 0,
-    };
-    queue.flush(&mut writer).unwrap();
-    assert_eq!(writer.bytes.len(), 70001);
-    for index in 200..250u8 {
-        assert!(queue
-            .push_in_place(1200, |buffer| {
-                buffer[..1200].fill(index);
-                Ok(Some(1200))
-            })
-            .unwrap());
-        expected.push(vec![index; 1200]);
-    }
-    writer.budget = 60100;
-    queue.flush(&mut writer).unwrap();
-    for index in 0..50u8 {
-        let packet = vec![index; 1200];
-        assert!(queue.push(&packet));
-        expected.push(packet);
-    }
-    assert!(queue.bytes() <= TX_LIMIT);
-    writer.budget = usize::MAX;
-    queue.flush(&mut writer).unwrap();
-    assert!(writer.vectored > 0);
-    assert_eq!(queue.bytes(), 0);
-    let mut reader = Receive::new(1200);
-    let mut input = writer.bytes.as_slice();
-    for packet in expected {
-        assert!(reader.read(&mut input).unwrap());
-        assert_eq!(reader.payload(), packet);
-        reader.clear();
-    }
-    assert!(input.is_empty());
-    // Failed direct reads with changing maxima must not leave empty blocks before real data.
-    for max in [100, 2000, 65000] {
-        assert!(!queue.push_in_place(max, |_| Ok(None)).unwrap());
-    }
-    assert!(queue.push(b"last"));
-    let mut output = Vec::new();
-    queue.flush(&mut output).unwrap();
-    assert_eq!(output, b"\0\x04last");
 }
 
 #[test]
@@ -496,7 +503,7 @@ fn blocked_tun_retains_one_frame_then_delivers_in_order_after_resume() {
     while tun.send(&filler).is_ok() {}
     let tun = OwnedFd::from(tun);
     let packets = [packet(10), packet(20)];
-    let mut tx = SendQueue::default();
+    let mut tx = SendQueue::new(crate::budget::TCP_NOTSENT as usize);
     for p in &packets {
         tx.push(p);
     }
@@ -612,96 +619,97 @@ fn partial_bytes_do_not_refresh_end_to_end_liveness() {
 
 #[test]
 fn slow_tcp_receiver_backpressures_tun_at_the_transmit_bound_then_delivers_exact_data() {
-    let (mut peer, receiver) = pair();
-    // A large send buffer leaves the unsent watermark responsible for applying backpressure.
-    let send_buffer = 1024 * 1024i32;
-    // SAFETY: valid socket and option pointer with matching c_int size.
-    assert_eq!(
-        unsafe {
-            libc::setsockopt(
-                receiver.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_SNDBUF,
-                (&send_buffer as *const i32).cast(),
-                4,
-            )
-        },
-        0
-    );
-    let mut c = conn(receiver, Instant::now());
-    let mut lowat = 0u32;
-    let mut size = std::mem::size_of_val(&lowat) as libc::socklen_t;
-    // SAFETY: writable u32 option storage with the matching socket option length.
-    assert_eq!(
-        unsafe {
-            libc::getsockopt(
-                c.socket.as_raw_fd(),
-                libc::IPPROTO_TCP,
-                libc::TCP_NOTSENT_LOWAT,
-                (&mut lowat as *mut u32).cast(),
-                &mut size,
-            )
-        },
-        0
-    );
-    assert_eq!(lowat, crate::budget::TCP_NOTSENT);
-    c.establish(1380);
-    let (tun, producer) = UnixDatagram::pair().unwrap();
-    tun.set_nonblocking(true).unwrap();
-    producer.set_nonblocking(true).unwrap();
-    let tun = OwnedFd::from(tun);
-    let p = packet(23);
-    let mut sent = 0;
-    for _ in 0..1000 {
-        for _ in 0..128 {
-            if producer.send(&p).is_ok() {
-                sent += 1;
-            } else {
+    for tcp_notsent in [64 * 1024, 128 * 1024] {
+        let (mut peer, receiver) = pair();
+        // A large send buffer leaves the unsent watermark responsible for applying backpressure.
+        let send_buffer = 1024 * 1024i32;
+        // SAFETY: valid socket and option pointer with matching c_int size.
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(
+                    receiver.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    (&send_buffer as *const i32).cast(),
+                    4,
+                )
+            },
+            0
+        );
+        let peer_addr = receiver.peer_addr().unwrap();
+        let mut c = Connection::new(receiver, peer_addr, Instant::now(), tcp_notsent).unwrap();
+        let mut lowat = 0u32;
+        let mut size = std::mem::size_of_val(&lowat) as libc::socklen_t;
+        // SAFETY: writable u32 option storage with the matching socket option length.
+        assert_eq!(
+            unsafe {
+                libc::getsockopt(
+                    c.socket.as_raw_fd(),
+                    libc::IPPROTO_TCP,
+                    libc::TCP_NOTSENT_LOWAT,
+                    (&mut lowat as *mut u32).cast(),
+                    &mut size,
+                )
+            },
+            0
+        );
+        assert_eq!(lowat, tcp_notsent);
+        c.establish(1380);
+        let (tun, producer) = UnixDatagram::pair().unwrap();
+        tun.set_nonblocking(true).unwrap();
+        producer.set_nonblocking(true).unwrap();
+        let tun = OwnedFd::from(tun);
+        let p = packet(23);
+        let mut sent = 0;
+        for _ in 0..1000 {
+            for _ in 0..128 {
+                if producer.send(&p).is_ok() {
+                    sent += 1;
+                } else {
+                    break;
+                }
+            }
+            c.pump(&tun, 1380, Duration::from_secs(30), Duration::from_secs(60))
+                .unwrap();
+            assert!(c.tx.bytes() <= TX_LIMIT);
+            let mut unsent = 0i32;
+            // SAFETY: SIOCOUTQNSD returns unsent bytes into a writable int for this TCP socket.
+            assert_eq!(
+                unsafe { libc::ioctl(c.socket.as_raw_fd(), 0x894b, &mut unsent) },
+                0
+            );
+            assert!(unsent as usize <= 2 * tcp_notsent as usize);
+            if !c.tx.room(1380) {
                 break;
             }
         }
-        c.pump(&tun, 1380, Duration::from_secs(30), Duration::from_secs(60))
-            .unwrap();
-        assert!(c.tx.bytes() <= TX_LIMIT);
-        let mut unsent = 0i32;
-        // SAFETY: SIOCOUTQNSD returns unsent bytes into a writable int for this TCP socket.
-        assert_eq!(
-            unsafe { libc::ioctl(c.socket.as_raw_fd(), 0x894b, &mut unsent) },
-            0
-        );
         assert!(
-            unsent as usize <= crate::budget::TCP_NOTSENT as usize + crate::budget::TCP_WRITE_BATCH
+            !c.tx.room(1380),
+            "blocked TCP peer must fill the bounded queue and stop TUN reads"
         );
-        if !c.tx.room(1380) {
-            break;
+        let mut received = 0;
+        let mut rx = Receive::new(1380);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while received < sent && Instant::now() < deadline {
+            c.pump(&tun, 1380, Duration::from_secs(30), Duration::from_secs(60))
+                .unwrap();
+            while rx.read(&mut peer).unwrap() {
+                assert_eq!(rx.payload(), p);
+                received += 1;
+                rx.clear();
+            }
+            std::thread::sleep(Duration::from_millis(1));
         }
-    }
-    assert!(
-        !c.tx.room(1380),
-        "blocked TCP peer must fill the bounded queue and stop TUN reads"
-    );
-    let mut received = 0;
-    let mut rx = Receive::new(1380);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while received < sent && Instant::now() < deadline {
-        c.pump(&tun, 1380, Duration::from_secs(30), Duration::from_secs(60))
-            .unwrap();
-        while rx.read(&mut peer).unwrap() {
-            assert_eq!(rx.payload(), p);
-            received += 1;
-            rx.clear();
+        assert_eq!(
+            received, sent,
+            "all accepted packets retain order and payload after backpressure"
+        );
+        while c.tx.push(&[PING; 9]) {}
+        let tail = wire::TX_LIMIT - c.tx.bytes();
+        if tail >= 2 {
+            assert!(c.tx.push(&vec![0; tail - 2]));
         }
-        std::thread::sleep(Duration::from_millis(1));
+        assert!(!c.tx.room(9));
+        assert!(c.next_deadline(Duration::ZERO, Duration::from_secs(60)) > Instant::now());
     }
-    assert_eq!(
-        received, sent,
-        "all accepted packets retain order and payload after backpressure"
-    );
-    while c.tx.push(&[PING; 9]) {}
-    let tail = wire::TX_LIMIT - c.tx.bytes();
-    if tail >= 2 {
-        assert!(c.tx.push(&vec![0; tail - 2]));
-    }
-    assert!(!c.tx.room(9));
-    assert!(c.next_deadline(Duration::ZERO, Duration::from_secs(60)) > Instant::now());
 }

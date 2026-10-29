@@ -45,17 +45,22 @@ impl fmt::Display for Connection {
 }
 
 impl Connection {
-    fn new(socket: TcpStream, peer: SocketAddr, now: Instant) -> io::Result<Self> {
+    fn new(
+        socket: TcpStream,
+        peer: SocketAddr,
+        now: Instant,
+        tcp_notsent: u32,
+    ) -> io::Result<Self> {
         socket.set_nonblocking(true)?;
         socket.set_nodelay(true)?;
-        sys::tcp_notsent_lowat(&socket)?;
+        sys::tcp_notsent_lowat(&socket, tcp_notsent)?;
         let local = socket.local_addr()?;
         Ok(Self {
             socket,
             local,
             peer,
             rx: Receive::new(AUTH_MAX),
-            tx: SendQueue::default(),
+            tx: SendQueue::new(tcp_notsent as usize),
             auth: None,
             since: now,
             last_rx: now,
@@ -247,6 +252,7 @@ pub struct Listener {
     wake: OwnedFd,
     slots: Slots,
     mtu: u16,
+    tcp_notsent: u32,
 }
 
 impl Listener {
@@ -276,6 +282,7 @@ impl Listener {
             wake,
             slots,
             mtu,
+            tcp_notsent: cfg.tcp_notsent,
         })
     }
 
@@ -371,7 +378,7 @@ impl Listener {
                                 drop(socket);
                                 continue;
                             }
-                            match Connection::new(socket, peer, now) {
+                            match Connection::new(socket, peer, now, self.tcp_notsent) {
                                 Ok(conn) => candidates.push(Candidate {
                                     conn,
                                     identity: None,
@@ -562,7 +569,7 @@ impl Worker {
             if connection.is_none() && self.cfg.mode == Mode::Entry && now >= retry_at {
                 let remote = self.cfg.remote.unwrap();
                 let result = sys::tcp_connect(remote, self.cfg.iface.as_deref()).and_then(|s| {
-                    let mut c = Connection::new(s, remote, now)?;
+                    let mut c = Connection::new(s, remote, now, self.cfg.tcp_notsent)?;
                     let (auth, hello) = Handshake::entry(
                         &self.cfg.auth_key,
                         Params {
