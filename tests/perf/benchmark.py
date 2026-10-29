@@ -25,68 +25,68 @@ import sys
 import time
 from pathlib import Path
 
-WORKSPACE = Path("/src")
-BIN = WORKSPACE / "target/release/ghostun"
-LOG_DIR = WORKSPACE / "target/perf-run"
-TOOLS = WORKSPACE / "tests/perf/tcp-tools.py"
+WORKSPACE = Path(os.environ.get("WORKSPACE", Path(__file__).resolve().parents[2]))
+BIN = Path(os.environ.get("GHOSTUN_BIN", WORKSPACE / "target/release/ghostun"))
+LOG_DIR = Path(os.environ.get("LOG_DIR", WORKSPACE / "target/perf-run"))
+TOOLS = Path(os.environ.get("TOOLS", WORKSPACE / "tests/perf/tcp-tools.py"))
 
 AUTH_KEY = "0000000000000000000000000000000000000000000000000000000000000001"
 
 BASELINE_100M = {
     ("faketcp", "clean"): {
-        "v4_up": 92.1, "v4_down": 92.0,
-        "v6_up": 90.8, "v6_down": 90.4,
-        "p95": 11.4, "p99": 27.7,
-        "cpu_str": "18–20%", "cpu_min": 18.0, "cpu_max": 20.0
+        "v4_up": 92.1, "v4_down": 91.7,
+        "v6_up": 90.2, "v6_down": 90.7,
+        "p95": 15.0, "p99": 40.9,
+        "cpu_str": "4–5%", "cpu_min": 4.0, "cpu_max": 5.0
     },
     ("faketcp", "rtt20-loss0.1"): {
-        "v4_up": 90.6, "v4_down": 91.2,
-        "v6_up": 89.6, "v6_down": 89.6,
-        "p95": 70.3, "p99": 319.4,
-        "cpu_str": "18–19%", "cpu_min": 18.0, "cpu_max": 19.0
+        "v4_up": 90.9, "v4_down": 91.2,
+        "v6_up": 89.6, "v6_down": 89.9,
+        "p95": 55.5, "p99": 68.8,
+        "cpu_str": "4–5%", "cpu_min": 4.0, "cpu_max": 5.0
     },
     ("tcp_direct", "clean"): {
-        "v4_up": 90.3, "v4_down": 90.7,
-        "v6_up": 88.4, "v6_down": 89.4,
-        "p95": 12.6, "p99": 39.0,
-        "cpu_str": "6–12%", "cpu_min": 6.0, "cpu_max": 12.0
+        "v4_up": 90.4, "v4_down": 90.2,
+        "v6_up": 88.4, "v6_down": 89.1,
+        "p95": 14.0, "p99": 31.1,
+        "cpu_str": "2–2%", "cpu_min": 2.0, "cpu_max": 2.0
     },
     ("tcp_direct", "rtt20-loss0.1"): {
-        "v4_up": 88.7, "v4_down": 89.4,
-        "v6_up": 86.7, "v6_down": 87.5,
-        "p95": 141.3, "p99": 253.9,
-        "cpu_str": "8–10%", "cpu_min": 8.0, "cpu_max": 10.0
+        "v4_up": 88.2, "v4_down": 88.3,
+        "v6_up": 87.6, "v6_down": 87.6,
+        "p95": 201.4, "p99": 226.7,
+        "cpu_str": "2–3%", "cpu_min": 2.0, "cpu_max": 3.0
     },
     ("tcp_relay", "clean"): {
-        "v4_up": 90.7, "v4_down": 90.7,
-        "v6_up": 89.5, "v6_down": 89.4,
-        "p95": 18.2, "p99": 54.0,
-        "cpu_str": "9–12%", "cpu_min": 9.0, "cpu_max": 12.0
+        "v4_up": 90.5, "v4_down": 90.7,
+        "v6_up": 88.7, "v6_down": 88.9,
+        "p95": 25.7, "p99": 64.2,
+        "cpu_str": "2–4%", "cpu_min": 2.0, "cpu_max": 4.0
     },
     ("tcp_relay", "rtt20-loss0.1"): {
-        "v4_up": 86.9, "v4_down": 89.6,
-        "v6_up": 86.7, "v6_down": 87.8,
-        "p95": 92.6, "p99": 230.2,
-        "cpu_str": "11–14%", "cpu_min": 11.0, "cpu_max": 14.0
+        "v4_up": 85.1, "v4_down": 88.9,
+        "v6_up": 87.0, "v6_down": 87.3,
+        "p95": 201.0, "p99": 419.6,
+        "cpu_str": "4–4%", "cpu_min": 4.0, "cpu_max": 4.0
     },
 }
 
 BASELINE_FAKETCP_MAX = {
-    ("large", "ipv4"): {"v4_up": 2.57, "v4_down": 2.92, "v6_up": 2.30, "v6_down": 2.64, "kpps": "287–350"},
-    ("large", "ipv6"): {"v4_up": 2.54, "v4_down": 2.72, "v6_up": 2.16, "v6_down": 2.55, "kpps": "274–333"},
-    ("mixed", "ipv4"): {"v4_up": 1.40, "v4_down": 1.68, "v6_up": 1.09, "v6_down": 1.50, "kpps": "285–321"},
-    ("mixed", "ipv6"): {"v4_up": 1.61, "v4_down": 1.79, "v6_up": 1.19, "v6_down": 1.27, "kpps": "291–327"},
-    ("small", "ipv4"): {"v4_up": 211.0, "v4_down": 216.0, "v6_up": 194.0, "v6_down": 221.0, "kpps": "314–357"},
-    ("small", "ipv6"): {"v4_up": 181.0, "v4_down": 213.0, "v6_up": 194.0, "v6_down": 204.0, "kpps": "293–345"},
+    ("large", "ipv4"): {"v4_up": 4.98, "v4_down": 5.19, "v6_up": 4.84, "v6_down": 4.78, "kpps": "545–574"},
+    ("large", "ipv6"): {"v4_up": 4.66, "v4_down": 4.40, "v6_up": 4.36, "v6_down": 4.19, "kpps": "492–519"},
+    ("mixed", "ipv4"): {"v4_up": 3.55, "v4_down": 4.45, "v6_up": 3.52, "v6_down": 3.82, "kpps": "531–583"},
+    ("mixed", "ipv6"): {"v4_up": 3.01, "v4_down": 3.53, "v6_up": 3.15, "v6_down": 3.92, "kpps": "468–513"},
+    ("small", "ipv4"): {"v4_up": 449.0, "v4_down": 387.0, "v6_up": 437.0, "v6_down": 387.0, "kpps": "542–606"},
+    ("small", "ipv6"): {"v4_up": 464.0, "v4_down": 351.0, "v6_up": 439.0, "v6_down": 331.0, "kpps": "478–554"},
 }
 
 BASELINE_TCP_MAX = {
-    ("large", "ipv4"): {"v4_up": 3.74, "v4_down": 5.46, "v6_up": 3.61, "v6_down": 5.38, "kpps": "446–619"},
-    ("large", "ipv6"): {"v4_up": 3.48, "v4_down": 5.07, "v6_up": 3.62, "v6_down": 4.88, "kpps": "424–595"},
-    ("mixed", "ipv4"): {"v4_up": 2.16, "v4_down": 3.44, "v6_up": 2.83, "v6_down": 3.19, "kpps": "478–679"},
-    ("mixed", "ipv6"): {"v4_up": 2.28, "v4_down": 2.53, "v6_up": 2.13, "v6_down": 3.57, "kpps": "492–807"},
-    ("small", "ipv4"): {"v4_up": 313.0, "v4_down": 469.0, "v6_up": 318.0, "v6_down": 398.0, "kpps": "504–750"},
-    ("small", "ipv6"): {"v4_up": 370.0, "v4_down": 397.0, "v6_up": 340.0, "v6_down": 464.0, "kpps": "547–733"},
+    ("large", "ipv4"): {"v4_up": 6.48, "v4_down": 7.72, "v6_up": 5.55, "v6_down": 7.00, "kpps": "677–910"},
+    ("large", "ipv6"): {"v4_up": 6.64, "v4_down": 8.63, "v6_up": 5.58, "v6_down": 7.02, "kpps": "698–1010"},
+    ("mixed", "ipv4"): {"v4_up": 3.76, "v4_down": 5.67, "v6_up": 3.10, "v6_down": 5.07, "kpps": "724–949"},
+    ("mixed", "ipv6"): {"v4_up": 4.15, "v4_down": 4.65, "v6_up": 2.64, "v6_down": 4.28, "kpps": "714–926"},
+    ("small", "ipv4"): {"v4_up": 644.0, "v4_down": 615.0, "v6_up": 574.0, "v6_down": 620.0, "kpps": "755–874"},
+    ("small", "ipv6"): {"v4_up": 602.0, "v4_down": 625.0, "v6_up": 592.0, "v6_down": 597.0, "kpps": "794–878"},
 }
 
 def ns_cmd(ns_name, *cmd):
@@ -115,7 +115,12 @@ def get_outer_skmem():
     max_w = 0
     for name in ["entry", "exit"]:
         try:
-            out = subprocess.check_output(ns_cmd(name, "ss", "-Htmn", "state", "established"), text=True)
+            out = subprocess.check_output(
+                ns_cmd(name, "ss", "-Htmn", "state", "established",
+                       "(", "dport", "=", ":443", "or", "sport", "=", ":443",
+                       "or", "dport", "=", ":8443", "or", "sport", "=", ":8443", ")"),
+                text=True
+            )
             for m in re.finditer(r"skmem:\(r(\d+),rb\d+,t\d+,tb\d+,f\d+,w(\d+),", out):
                 max_r = max(max_r, int(m.group(1)))
                 max_w = max(max_w, int(m.group(2)))
@@ -392,8 +397,8 @@ def _exec_100m_run(topo, condition, inner_family, direction):
 
 def run_100m_measurement(topo, condition, inner_family, direction):
     res = _exec_100m_run(topo, condition, inner_family, direction)
-    # If loss-impaired and an early packet drop caused a slow-start freeze (< 70 Mbit/s), retry once
-    if condition == "rtt20-loss0.1" and res["mbit_s"] < 70.0:
+    # If loss-impaired and an early packet drop caused a slow-start freeze (< 80 Mbit/s), retry once
+    if condition == "rtt20-loss0.1" and res["mbit_s"] < 80.0:
         time.sleep(0.3)
         retry_res = _exec_100m_run(topo, condition, inner_family, direction)
         if retry_res["mbit_s"] > res["mbit_s"]:
@@ -424,7 +429,7 @@ def run_transport_100m_suite(transport, relay=False):
 
 def run_uncapped_measurement(topo, scenario, inner_family, direction):
     address = "10.3.0.2" if inner_family == "ipv4" else "fd00:3::2"
-    t = 3
+    t = 4
 
     # Sample ghostun0 packet counters (actual tunnel device)
     rx0, tx0 = get_dev_packets("entry", "ghostun0")

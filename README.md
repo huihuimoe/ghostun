@@ -197,7 +197,7 @@ on your link. This setting has no effect on FakeTCP and requires a restart.
 
 ### Transport comparison (100 Mbit/s)
 
-Local baseline: 4-vCPU EPYC-Genoa VM, Linux 7.2.6, isolated Docker namespaces.
+Local baseline: 4-vCPU AMD EPYC 9555P VM, Linux 7.2.11, isolated network namespaces.
 Entry uses CPUs 0–1 and Exit 2–3, with two workers each. Outer IPv4 MTU is 1420;
 TUN MTU is 1380. All three paths use the same **100 Mbit/s link cap**.
 Each direction runs four iperf3 streams for four seconds alongside 260-byte TCP
@@ -205,34 +205,34 @@ echo requests for three seconds, with a 10 ms pause between replies. Latency sho
 
 | Transport | Link | IPv4 up/down (Mbit/s) | IPv6 up/down (Mbit/s) | p95/p99 (ms) | System CPU |
 |---|---|---|---|---|---|
-| FakeTCP | Clean | 92.1 / 92.0 | 90.8 / 90.4 | 11.4 / 27.7 | 18–20% |
-| FakeTCP | +20 ms RTT, 0.1% loss/direction | 90.6 / 91.2 | 89.6 / 89.6 | 70.3 / 319.4 | 18–19% |
-| TCP direct | Clean | 90.3 / 90.7 | 88.4 / 89.4 | 12.6 / 39.0 | 6–12% |
-| TCP direct | +20 ms RTT, 0.1% loss/direction | 88.7 / 89.4 | 86.7 / 87.5 | 141.3 / 253.9 | 8–10% |
-| TCP relay | Clean | 90.7 / 90.7 | 89.5 / 89.4 | 18.2 / 54.0 | 9–12% |
-| TCP relay | +20 ms RTT, 0.1% loss/direction | 86.9 / 89.6 | 86.7 / 87.8 | 92.6 / 230.2 | 11–14% |
+| FakeTCP | Clean | 92.1 / 91.7 | 90.2 / 90.7 | 15.0 / 40.9 | 4–5% |
+| FakeTCP | +20 ms RTT, 0.1% loss/direction | 90.9 / 91.2 | 89.6 / 89.9 | 55.5 / 68.8 | 4–5% |
+| TCP direct | Clean | 90.4 / 90.2 | 88.4 / 89.1 | 14.0 / 31.1 | 2% |
+| TCP direct | +20 ms RTT, 0.1% loss/direction | 88.2 / 88.3 | 87.6 / 87.6 | 201.4 / 226.7 | 2–3% |
+| TCP relay | Clean | 90.5 / 90.7 | 88.7 / 88.9 | 25.7 / 64.2 | 2–4% |
+| TCP relay | +20 ms RTT, 0.1% loss/direction | 85.1 / 88.9 | 87.0 / 87.3 | 201.0 / 419.6 | 4% |
 
-System CPU includes kernel and other VM work. Entry/Exit RSS peaked at 3.1 MiB
-(FakeTCP) and 3.6 MiB (TCP) each. Sampled kernel receive/queued-send memory per
-outer socket peaked at 2.3/0 KiB (FakeTCP), 63/925 KiB (direct TCP), and
-63/791 KiB (relayed TCP), in addition to RSS. TCP recovered from Exit/relay
+System CPU includes kernel and other VM work. Entry/Exit RSS peaked at 4.2 MiB
+(FakeTCP) and 5.0 MiB (TCP) each. Sampled kernel receive/queued-send memory per
+outer socket peaked at 1.8/0 KiB (FakeTCP), 132/801 KiB (direct TCP), and
+14/824 KiB (relayed TCP), in addition to RSS. TCP recovered from Exit/relay
 restarts in 3–15 seconds; connection and process FD counts returned to baseline
 after each cycle.
 
 ### FakeTCP maximum throughput
 
-Earlier uncapped measurements: 4-vCPU EPYC-Genoa VM, Linux 7.2, isolated Docker
+Uncapped measurements: 4-vCPU AMD EPYC 9555P VM, Linux 7.2.11, isolated network
 namespaces with a stateful firewall, outer MTU 1420, and eight parallel iperf3
 streams. Entry uses CPUs 0–1 and Exit 2–3, with two workers each.
 
 | Scenario | Outer family | Inner IPv4 upload / download | Inner IPv6 upload / download | Tunnel packet rate |
 |---|---|---|---|---|
-| Large packets (full MTU) | IPv4 (TUN MTU 1380) | 2.57 / 2.92 Gbit/s | 2.30 / 2.64 Gbit/s | 287–350 kPPS |
-| Large packets (full MTU) | IPv6 (TUN MTU 1360) | 2.54 / 2.72 Gbit/s | 2.16 / 2.55 Gbit/s | 274–333 kPPS |
-| Mixed packets (IMIX: 4×MTU + 2×512B + 2×128B) | IPv4 (TUN MTU 1380) | 1.40 / 1.68 Gbit/s | 1.09 / 1.50 Gbit/s | 285–321 kPPS |
-| Mixed packets (IMIX: 4×MTU + 2×512B + 2×128B) | IPv6 (TUN MTU 1360) | 1.61 / 1.79 Gbit/s | 1.19 / 1.27 Gbit/s | 291–327 kPPS |
-| Small packets (128 B MSS/payload) | IPv4 (TUN MTU 1380) | 211 / 216 Mbit/s | 194 / 221 Mbit/s | 314–357 kPPS |
-| Small packets (128 B MSS/payload) | IPv6 (TUN MTU 1360) | 181 / 213 Mbit/s | 194 / 204 Mbit/s | 293–345 kPPS |
+| Large packets (full MTU) | IPv4 (TUN MTU 1380) | 4.98 / 5.19 Gbit/s | 4.84 / 4.78 Gbit/s | 545–574 kPPS |
+| Large packets (full MTU) | IPv6 (TUN MTU 1360) | 4.66 / 4.40 Gbit/s | 4.36 / 4.19 Gbit/s | 492–519 kPPS |
+| Mixed packets (IMIX: 4×MTU + 2×512B + 2×128B) | IPv4 (TUN MTU 1380) | 3.55 / 4.45 Gbit/s | 3.52 / 3.82 Gbit/s | 531–583 kPPS |
+| Mixed packets (IMIX: 4×MTU + 2×512B + 2×128B) | IPv6 (TUN MTU 1360) | 3.01 / 3.53 Gbit/s | 3.15 / 3.92 Gbit/s | 468–513 kPPS |
+| Small packets (128 B MSS/payload) | IPv4 (TUN MTU 1380) | 449 / 387 Mbit/s | 437 / 387 Mbit/s | 542–606 kPPS |
+| Small packets (128 B MSS/payload) | IPv6 (TUN MTU 1360) | 464 / 351 Mbit/s | 439 / 331 Mbit/s | 478–554 kPPS |
 
 ### TCP maximum throughput
 
@@ -241,12 +241,12 @@ stateful firewall, outer MTU 1420, eight parallel iperf3 streams, two workers pe
 
 | Scenario | Outer family | Inner IPv4 upload / download | Inner IPv6 upload / download | Tunnel packet rate |
 |---|---|---|---|---|
-| Large packets (full MTU) | IPv4 (TUN MTU 1380) | 3.74 / 5.46 Gbit/s | 3.61 / 5.38 Gbit/s | 446–619 kPPS |
-| Large packets (full MTU) | IPv6 (TUN MTU 1360) | 3.48 / 5.07 Gbit/s | 3.62 / 4.88 Gbit/s | 424–595 kPPS |
-| Mixed packets (IMIX: 4×MTU + 2×512B + 2×128B) | IPv4 (TUN MTU 1380) | 2.16 / 3.44 Gbit/s | 2.83 / 3.19 Gbit/s | 478–679 kPPS |
-| Mixed packets (IMIX: 4×MTU + 2×512B + 2×128B) | IPv6 (TUN MTU 1360) | 2.28 / 2.53 Gbit/s | 2.13 / 3.57 Gbit/s | 492–807 kPPS |
-| Small packets (128 B MSS/payload) | IPv4 (TUN MTU 1380) | 313 / 469 Mbit/s | 318 / 398 Mbit/s | 504–750 kPPS |
-| Small packets (128 B MSS/payload) | IPv6 (TUN MTU 1360) | 370 / 397 Mbit/s | 340 / 464 Mbit/s | 547–733 kPPS |
+| Large packets (full MTU) | IPv4 (TUN MTU 1380) | 6.48 / 7.72 Gbit/s | 5.55 / 7.00 Gbit/s | 677–910 kPPS |
+| Large packets (full MTU) | IPv6 (TUN MTU 1360) | 6.64 / 8.63 Gbit/s | 5.58 / 7.02 Gbit/s | 698–1010 kPPS |
+| Mixed packets (IMIX: 4×MTU + 2×512B + 2×128B) | IPv4 (TUN MTU 1380) | 3.76 / 5.67 Gbit/s | 3.10 / 5.07 Gbit/s | 724–949 kPPS |
+| Mixed packets (IMIX: 4×MTU + 2×512B + 2×128B) | IPv6 (TUN MTU 1360) | 4.15 / 4.65 Gbit/s | 2.64 / 4.28 Gbit/s | 714–926 kPPS |
+| Small packets (128 B MSS/payload) | IPv4 (TUN MTU 1380) | 644 / 615 Mbit/s | 574 / 620 Mbit/s | 755–874 kPPS |
+| Small packets (128 B MSS/payload) | IPv6 (TUN MTU 1360) | 602 / 625 Mbit/s | 592 / 597 Mbit/s | 794–878 kPPS |
 
 ## Operational notes
 
