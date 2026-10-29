@@ -605,7 +605,7 @@ impl RawReceiver {
             hdr.msg_hdr.msg_flags = 0;
             if self.family == OuterFamily::Ipv6 {
                 hdr.msg_hdr.msg_namelen = size_of::<libc::sockaddr_in6>() as _;
-                hdr.msg_hdr.msg_controllen = size_of::<CmsgBuf>();
+                hdr.msg_hdr.msg_controllen = size_of::<CmsgBuf>() as _;
             }
         }
     }

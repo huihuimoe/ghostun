@@ -27,12 +27,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+          targets: x86_64-unknown-linux-musl, aarch64-unknown-linux-musl
       - name: Check test scripts, formatting, lints, and unit tests
         run: |
           bash -n tests/e2e/*.sh
           python3 -c 'import ast, pathlib; [ast.parse(p.read_text()) for p in pathlib.Path("tests/e2e").glob("*.py")]'
           cargo fmt --check
           cargo clippy --locked --all-targets -- -D warnings
+          cargo clippy --locked --all-targets --target x86_64-unknown-linux-musl --target aarch64-unknown-linux-musl -- -D warnings
           cargo test --locked
       - name: Detect whether network E2E is needed
         id: filter
