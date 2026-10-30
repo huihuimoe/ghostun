@@ -4,7 +4,7 @@
   "image": "mcr.microsoft.com/devcontainers/rust:1-trixie",
   "features": {
     // Runs the disposable e2e containers from tests/README.md. Moby has no trixie packages.
-    "ghcr.io/devcontainers/features/docker-in-docker:2": {
+    "ghcr.io/devcontainers/features/docker-in-docker:4": {
       "moby": false
     }
   },
