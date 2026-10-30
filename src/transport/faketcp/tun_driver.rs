@@ -10,7 +10,7 @@ use super::queue::{Pending, BYTE_LIMIT};
 use crate::sys;
 use crate::sys::uring::{self, Cqe, Ring, Sqe};
 
-const BUFFERS: usize = sys::RAW_BATCH;
+const BUFFERS: usize = sys::raw::BATCH;
 const GROUP: u16 = 1;
 const READ: u64 = 1;
 const PROVIDE: u64 = 2;
@@ -373,7 +373,7 @@ impl<'a> TunDriver<'a> {
             return Ok(Some(packet.len()));
         }
         let Some(fast) = &mut self.fast else {
-            return sys::tun_read(self.fd, output);
+            return sys::tun::read(self.fd, output);
         };
         let Some((index, len)) = fast.ready.pop_front() else {
             return Ok(None);
@@ -409,7 +409,7 @@ impl<'a> TunDriver<'a> {
     }
 
     fn write_poll(&self, packet: &[u8]) -> bool {
-        match sys::tun_write(self.fd, packet) {
+        match sys::tun::write(self.fd, packet) {
             Ok(done) => done,
             Err(error) => {
                 log::debug!("TUN write: {error}; dropping packet");

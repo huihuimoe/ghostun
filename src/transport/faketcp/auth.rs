@@ -12,7 +12,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 type HmacSha256 = Hmac<Sha256>;
 
-use super::pkt::TcpMeta;
+use super::frame::TcpMeta;
 use crate::config::{AuthKey, Mode};
 use crate::sys;
 

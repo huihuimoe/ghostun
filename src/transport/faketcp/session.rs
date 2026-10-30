@@ -5,23 +5,18 @@ use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
-pub mod auth;
-pub mod pkt;
-mod queue;
 #[cfg(test)]
 mod tests;
-mod tun;
-pub mod worker;
 
-use crate::config::{AuthKey, Config, Mode, OuterFamily};
-pub use auth::{Auth, EntryStep, ExitStep, HELLO_LEN, PROOF_LEN};
-pub use pkt::{
-    entry_filter, exit_filter, flags, Keepalive, TcpMeta, CTRL_LEN, CTRL_PING, CTRL_PONG,
-    MAX_OVERHEAD,
-};
-pub use worker::run;
-#[cfg(test)]
-pub use worker::sync_reload;
+use super::auth::{self, Auth, EntryStep, ExitStep, HELLO_LEN, PROOF_LEN};
+use super::frame::{self, flags, TcpMeta, MAX_OVERHEAD};
+use crate::config::{AuthKey, Config, Mode};
+use crate::net::{ipv4, ipv6, OuterFamily};
+use crate::transport::keepalive::{self, Keepalive};
+
+/// Control frames use a first byte whose high nibble is 0, which no IPv4 (4) or IPv6 (6) packet can have.
+pub const CTRL_PING: u8 = 0x01;
+pub const CTRL_PONG: u8 = 0x02;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -59,7 +54,7 @@ impl SessionConfig {
     ) -> Self {
         Self {
             mode: cfg.mode,
-            auth_key: cfg.auth_key.clone(),
+            auth_key: cfg.tunables.auth_key.clone(),
             local_ip,
             remote: cfg.remote,
             listen_port,
@@ -67,8 +62,8 @@ impl SessionConfig {
             conns: cfg.conns,
             base_port: cfg.base_port,
             mss,
-            ping_interval: cfg.ping_interval,
-            dead_timeout: cfg.dead_timeout,
+            ping_interval: cfg.tunables.ping_interval,
+            dead_timeout: cfg.tunables.dead_timeout,
         }
     }
 }
@@ -89,7 +84,7 @@ const IDLE: Duration = Duration::from_secs(3600);
 fn emit(scratch: &mut [u8], meta: &TcpMeta, payload: &[u8], id: u16, out: &mut impl Sink) {
     let overhead = OuterFamily::of(meta.src.ip()).overhead();
     scratch[overhead..overhead + payload.len()].copy_from_slice(payload);
-    let len = pkt::write_headers(scratch, meta, payload.len(), id);
+    let len = frame::write_headers(scratch, meta, payload.len(), id);
     out.send(&scratch[..len], meta.dst.ip());
 }
 
@@ -220,7 +215,7 @@ impl Session {
         self.snd_nxt = self.snd_nxt.wrapping_add(len as u32);
         self.unacked = 0;
         Some((
-            pkt::write_headers(buf, &meta, len, self.next_ip_id()),
+            frame::write_headers(buf, &meta, len, self.next_ip_id()),
             peer.ip(),
         ))
     }
@@ -232,7 +227,7 @@ impl Session {
         frame: &'a [u8],
         out: &mut impl Sink,
     ) -> Option<&'a [u8]> {
-        let p = pkt::parse(frame)?;
+        let p = frame::parse(frame)?;
         match self.cfg.mode {
             Mode::Entry => self.on_entry_outer(now, &p.meta, p.payload, out),
             Mode::Exit => self.on_exit_outer(now, &p.meta, p.payload, out),
@@ -489,14 +484,14 @@ impl Session {
         }
         self.unacked = self.unacked.saturating_add(payload.len() as u32);
         match payload[0] >> 4 {
-            pkt::ipv4::VERSION | pkt::ipv6::VERSION => {
+            ipv4::VERSION | ipv6::VERSION => {
                 if self.unacked >= ACK_THRESHOLD {
                     self.send_ctrl(flags::ACK, &[], out);
                 }
                 Some(payload)
             }
-            0 if payload[0] == CTRL_PING && payload.len() >= CTRL_LEN => {
-                if let Some(ping) = Keepalive::decode(&payload[..CTRL_LEN]) {
+            0 if payload[0] == CTRL_PING && payload.len() >= keepalive::LEN => {
+                if let Some(ping) = Keepalive::decode(&payload[..keepalive::LEN]) {
                     let pong = Keepalive::new(CTRL_PONG, ping.nonce).encode();
                     self.send_ctrl(flags::PSH | flags::ACK, &pong, out);
                 }
@@ -524,7 +519,7 @@ impl Session {
             window: WINDOW,
         };
         let id = self.next_ip_id();
-        let len = pkt::write_syn(&mut self.scratch, &meta, self.cfg.mss, id);
+        let len = frame::write_syn(&mut self.scratch, &meta, self.cfg.mss, id);
         out.send(&self.scratch[..len], meta.dst.ip());
     }
 
@@ -687,7 +682,7 @@ impl Session {
             ..self.meta(peer, flags::SYN)
         };
         let id = self.next_ip_id();
-        let len = pkt::write_syn(&mut self.scratch, &meta, self.cfg.mss, id);
+        let len = frame::write_syn(&mut self.scratch, &meta, self.cfg.mss, id);
         out.send(&self.scratch[..len], peer.ip());
     }
 
@@ -711,7 +706,7 @@ impl Session {
             window: 0,
         };
         let id = self.next_ip_id();
-        let len = pkt::write_headers(&mut self.scratch, &meta, 0, id);
+        let len = frame::write_headers(&mut self.scratch, &meta, 0, id);
         out.send(&self.scratch[..len], to.ip());
     }
 

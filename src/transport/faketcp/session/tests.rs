@@ -1,5 +1,7 @@
-use super::pkt::Parsed;
 use super::*;
+use crate::net::{ipv4_header_checksum_ok, tcp_checksum_ok};
+use crate::transport::faketcp::frame::{Parsed, SYN_FRAME_LEN};
+use crate::transport::faketcp::queue::Pending;
 use std::net::Ipv4Addr;
 
 const ENTRY_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
@@ -14,10 +16,7 @@ impl Sink for Wire {
         self.1 += 1;
     }
     fn send(&mut self, frame: &[u8], _dst: IpAddr) {
-        assert!(
-            (frame[0] >> 4 == 6 || pkt::ipv4_header_checksum_ok(frame))
-                && pkt::tcp_checksum_ok(frame)
-        );
+        assert!((frame[0] >> 4 == 6 || ipv4_header_checksum_ok(frame)) && tcp_checksum_ok(frame));
         self.0.push(frame.to_vec());
     }
 }
@@ -29,7 +28,7 @@ impl Wire {
 }
 
 fn parsed(f: &[u8]) -> Parsed<'_> {
-    pkt::parse(f).unwrap()
+    frame::parse(f).unwrap()
 }
 
 fn cfg(mode: Mode, worker: u16, conns: u16) -> SessionConfig {
@@ -140,7 +139,7 @@ fn frame(meta: TcpMeta, payload: &[u8]) -> Vec<u8> {
     let overhead = OuterFamily::of(meta.src.ip()).overhead();
     let mut buf = vec![0; overhead + payload.len()];
     buf[overhead..].copy_from_slice(payload);
-    pkt::write_headers(&mut buf, &meta, payload.len(), 0);
+    frame::write_headers(&mut buf, &meta, payload.len(), 0);
     buf
 }
 
@@ -566,7 +565,7 @@ fn handshake_options_are_preserved_but_forwarding_requires_mutual_authentication
     let s = parsed(&syn[0]);
     assert_eq!(s.meta.flags, flags::SYN);
     assert_eq!(s.meta.dst, EXIT);
-    assert_eq!(syn[0].len(), pkt::SYN_FRAME_LEN);
+    assert_eq!(syn[0].len(), SYN_FRAME_LEN);
     assert_eq!(p.entry.state(), State::SynSent);
 
     let mut w = Wire::default();
@@ -655,7 +654,7 @@ fn ping_is_answered_with_pong_echoing_nonce() {
     let ping = w.take();
     assert_eq!(ping.len(), 1);
     let payload = parsed(&ping[0]).payload.to_vec();
-    assert_eq!((payload[0], payload.len()), (CTRL_PING, CTRL_LEN));
+    assert_eq!((payload[0], payload.len()), (CTRL_PING, keepalive::LEN));
 
     let mut w = Wire::default();
     assert!(p.exit.on_outer(p.t, &ping[0], &mut w).is_none());
@@ -1096,7 +1095,7 @@ fn exit_bound_ip_ignores_other_local_addresses_while_wildcard_accepts_any() {
 
 #[test]
 fn shutdown_discards_old_backlog_before_queueing_closing_controls() {
-    struct Queued(super::queue::Pending<IpAddr>);
+    struct Queued(Pending<IpAddr>);
     impl Sink for Queued {
         fn send(&mut self, frame: &[u8], dst: IpAddr) {
             assert!(self.0.push(frame, dst, true));

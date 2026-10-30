@@ -1,8 +1,17 @@
-use super::*;
 use std::io::{Read, Write};
-use std::net::Shutdown;
+use std::net::{Shutdown, TcpListener, TcpStream};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::UnixDatagram;
-use wire::TX_LIMIT;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use super::auth::{Handshake, Params};
+use super::frame::{Receive, PING, TX_LIMIT};
+use super::listener::{Candidate, Slot, Slots};
+use super::queue::SendQueue;
+use super::worker::Backoff;
+use super::*;
+use crate::config::AuthKey;
 
 fn params() -> Params {
     Params {
@@ -21,7 +30,7 @@ fn pair() -> (TcpStream, TcpStream) {
 }
 fn conn(socket: TcpStream, now: Instant) -> Connection {
     let peer = socket.peer_addr().unwrap();
-    Connection::new(socket, peer, now, crate::budget::TCP_NOTSENT).unwrap()
+    Connection::new(socket, peer, now, crate::transport::budget::TCP_NOTSENT).unwrap()
 }
 fn packet(tag: u8) -> Vec<u8> {
     let mut p = vec![tag; 64];
@@ -36,20 +45,20 @@ fn mutual_authentication_rejects_wrong_keys_reflection_replay_and_parameters() {
     let (mut entry, hello) = Handshake::entry(&key, params()).unwrap();
     assert_eq!(&hello[..12], b"\x01GTCP\x01\x00\x01\x00\x02\x05\x64");
     for len in 0..hello.len() {
-        assert!(wire::hello_params(&hello[..len]).is_err());
+        assert!(auth::hello_params(&hello[..len]).is_err());
     }
     let mut padded = vec![0xff];
     padded.extend_from_slice(&hello);
-    let decoded = wire::hello_params(&padded[1..]).unwrap();
+    let decoded = auth::hello_params(&padded[1..]).unwrap();
     assert_eq!((decoded.worker, decoded.conns, decoded.mtu), (1, 2, 1380));
     padded.push(0);
-    assert!(wire::hello_params(&padded[1..]).is_err());
+    assert!(auth::hello_params(&padded[1..]).is_err());
     let mut bad_magic = hello;
     bad_magic[1] ^= 1;
-    assert!(wire::hello_params(&bad_magic).is_err());
+    assert!(auth::hello_params(&bad_magic).is_err());
     let mut bad_kind = hello;
     bad_kind[0] = 2;
-    assert!(wire::hello_params(&bad_kind).is_err());
+    assert!(auth::hello_params(&bad_kind).is_err());
     let (mut exit, challenge) = Handshake::exit(&key, params(), &hello).unwrap();
     assert!(!entry.done());
     assert!(!exit.done());
@@ -94,7 +103,7 @@ fn mutual_authentication_rejects_wrong_keys_reflection_replay_and_parameters() {
     }
     let mut unsupported = hello;
     unsupported[5] = 2;
-    assert!(wire::hello_params(&unsupported).is_err());
+    assert!(auth::hello_params(&unsupported).is_err());
 }
 
 /// A deterministic short-I/O peer: each successful byte is followed by WouldBlock.
@@ -133,7 +142,7 @@ impl Write for SplitIo {
 #[test]
 fn split_prefix_payload_coalescing_and_partial_writes_preserve_packets_and_cap() {
     let packets = [packet(10), packet(20), vec![PING; 9]];
-    let mut tx = SendQueue::new(crate::budget::TCP_NOTSENT as usize);
+    let mut tx = SendQueue::new(crate::transport::budget::TCP_NOTSENT as usize);
     for p in &packets {
         assert!(tx.push(p));
     }
@@ -186,7 +195,7 @@ fn split_prefix_payload_coalescing_and_partial_writes_preserve_packets_and_cap()
         reader.clear();
     }
     assert!(batched.inner.is_empty());
-    assert!(batched.calls <= (sink.len() / wire::RX_LIMIT) + 3);
+    assert!(batched.calls <= (sink.len() / frame::RX_LIMIT) + 3);
 }
 
 #[test]
@@ -211,7 +220,7 @@ fn writes_preserve_frames_across_partial_prefixes_and_would_block() {
         }
     }
     let mut packets = vec![packet(1), packet(2), vec![PING; 9]];
-    let mut tx = SendQueue::new(crate::budget::TCP_NOTSENT as usize);
+    let mut tx = SendQueue::new(crate::transport::budget::TCP_NOTSENT as usize);
     for p in &packets {
         assert!(tx.push(p));
     }
@@ -239,7 +248,7 @@ fn writes_preserve_frames_across_partial_prefixes_and_would_block() {
     assert!(tx
         .push_in_place(1380, |dst| {
             dst[..4].copy_from_slice(&[0xff; 4]);
-            Err(wire::invalid("bad"))
+            Err(invalid("bad"))
         })
         .is_err());
     tx.flush(&mut writer).unwrap();
@@ -357,14 +366,14 @@ fn malformed_lengths_and_packets_fail_without_resynchronizing() {
         assert!(Receive::new(1380).read(&mut input).is_err());
     }
     let mut p = packet(1);
-    wire::validate_packet(&p, 1380).unwrap();
-    assert!(wire::validate_packet(&p, 63).is_err());
+    frame::validate_packet(&p, 1380).unwrap();
+    assert!(frame::validate_packet(&p, 63).is_err());
     p[2..4].copy_from_slice(&63u16.to_be_bytes());
-    assert!(wire::validate_packet(&p, 1380).is_err());
+    assert!(frame::validate_packet(&p, 1380).is_err());
     p[0] = 0x44;
-    assert!(wire::validate_packet(&p, 1380).is_err());
+    assert!(frame::validate_packet(&p, 1380).is_err());
     for p in [vec![], vec![1; 9], vec![3; 33], vec![0x60; 39]] {
-        assert!(wire::validate_packet(&p, 1380).is_err());
+        assert!(frame::validate_packet(&p, 1380).is_err());
     }
 }
 
@@ -503,7 +512,7 @@ fn blocked_tun_retains_one_frame_then_delivers_in_order_after_resume() {
     while tun.send(&filler).is_ok() {}
     let tun = OwnedFd::from(tun);
     let packets = [packet(10), packet(20)];
-    let mut tx = SendQueue::new(crate::budget::TCP_NOTSENT as usize);
+    let mut tx = SendQueue::new(crate::transport::budget::TCP_NOTSENT as usize);
     for p in &packets {
         tx.push(p);
     }
@@ -705,7 +714,7 @@ fn slow_tcp_receiver_backpressures_tun_at_the_transmit_bound_then_delivers_exact
             "all accepted packets retain order and payload after backpressure"
         );
         while c.tx.push(&[PING; 9]) {}
-        let tail = wire::TX_LIMIT - c.tx.bytes();
+        let tail = TX_LIMIT - c.tx.bytes();
         if tail >= 2 {
             assert!(c.tx.push(&vec![0; tail - 2]));
         }

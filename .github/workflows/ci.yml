@@ -91,7 +91,7 @@ jobs:
             'faketcp-ipv6'      'LOG=/src/target/e2e-poll-ipv6 EXPECT_TUN_DRIVER=poll OUTER_FAMILY=ipv6 bash tests/e2e/netns.sh' \
             'uring-ipv4'        'LOG=/src/target/e2e-uring-ipv4 EXPECT_TUN_DRIVER=uring OUTER_FAMILY=ipv4 bash tests/e2e/netns.sh' \
             'uring-ipv6'        'LOG=/src/target/e2e-uring-ipv6 EXPECT_TUN_DRIVER=uring OUTER_FAMILY=ipv6 bash tests/e2e/netns.sh' \
-            'uring-kernel'      'set -e; for binary in target/debug/deps/ghostun-*; do if [[ -f "$binary" && -x "$binary" ]]; then "$binary" --ignored --exact sys::batch_tests::entry_raw_socket_binds_and_connects_both_families; "$binary" --ignored --exact faketcp::tun::tests::uring_recycles_buffers_and_preserves_backlog_across_runtime_fallback; fi; done' \
+            'uring-kernel'      'set -e; for binary in target/debug/deps/ghostun-*; do if [[ -f "$binary" && -x "$binary" ]]; then "$binary" --ignored --exact sys::raw::tests::entry_raw_socket_binds_and_connects_both_families; "$binary" --ignored --exact transport::faketcp::tun_driver::tests::uring_recycles_buffers_and_preserves_backlog_across_runtime_fallback; fi; done' \
             'tcp-ipv4-direct'   'LOG=/tmp/e2e OUTER_FAMILY=ipv4 RELAY=0 bash tests/e2e/tcp.sh' \
             'tcp-ipv6-direct'   'LOG=/tmp/e2e OUTER_FAMILY=ipv6 RELAY=0 bash tests/e2e/tcp.sh' \
             'noipv6-faketcp'    'LOG=/tmp/e2e TRANSPORT=faketcp bash tests/e2e/ipv6-disabled.sh' \

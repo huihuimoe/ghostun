@@ -1,7 +1,7 @@
 # Testing
 
-Run unit tests on the host. Run privileged network tests
-inside a disposable Docker container.
+Run unit tests on a Linux host, or in the dev container on other hosts. Run privileged
+network tests inside a disposable Docker container; the dev container provides Docker for this.
 Build outputs and logs below stay in the checkout's ignored `target/` directory.
 
 ```sh
@@ -51,8 +51,8 @@ with `EXPECT_TUN_DRIVER=poll` to check policy fallback. For that container, repl
 --security-opt apparmor=unconfined --security-opt systempaths=unconfined
 --security-opt seccomp="$PWD/tests/deny-io-uring.json"`;
 Docker bypasses seccomp in privileged containers.
-Run the ignored `sys::batch_tests::entry_raw_socket_binds_and_connects_both_families`
-and `faketcp::tun::tests::uring_recycles_buffers_and_preserves_backlog_across_runtime_fallback`
+Run the ignored `sys::raw::tests::entry_raw_socket_binds_and_connects_both_families`
+and `transport::faketcp::tun_driver::tests::uring_recycles_buffers_and_preserves_backlog_across_runtime_fallback`
 tests inside the privileged container too.
 
 To run the performance scenarios from `README.md`, run:

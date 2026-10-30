@@ -43,7 +43,7 @@ fn nft(args: &[&str]) -> Output {
         .expect("nft observer required")
 }
 
-fn malformed_replacement(spec: &NftSpec, table: &str) -> netlink::Batch {
+fn malformed_replacement(spec: &NftSpec, table: &str) -> batch::Batch {
     let mut batch = rules::build(spec, table).unwrap();
     // A real kernel validation error after all preceding table/chain/rule mutations.
     batch.push(
@@ -79,7 +79,7 @@ fn atomic_table_replacement() {
         "failed first install leaked a table"
     );
 
-    let mut original = netlink::Batch::new();
+    let mut original = batch::Batch::new();
     original.push(
         NfTablesMessage::NewTable(rules::table(&table)),
         NLM_F_CREATE,

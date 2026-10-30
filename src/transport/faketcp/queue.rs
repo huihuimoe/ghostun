@@ -1,8 +1,8 @@
 //! Backpressure storage; the normal writable path does not allocate packet buffers.
 use std::collections::VecDeque;
 
-pub const BYTE_LIMIT: usize = crate::budget::BYTES;
-pub const PACKET_LIMIT: usize = crate::budget::PACKETS;
+pub const BYTE_LIMIT: usize = crate::transport::budget::BYTES;
+pub const PACKET_LIMIT: usize = crate::transport::budget::PACKETS;
 const CONTROL_LIMIT: usize = 16;
 
 pub struct Packet<T> {

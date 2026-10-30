@@ -3,15 +3,12 @@
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
-use crate::config::{AuthKey, Config};
+use crate::config::{Config, Tunables};
 use crate::sys;
 
 pub struct Reload {
-    pub auth_key: AuthKey,
-    pub ping_interval: Duration,
-    pub dead_timeout: Duration,
+    pub tunables: Tunables,
     pub cpu: Option<usize>,
 }
 
@@ -100,15 +97,13 @@ impl Control {
 }
 
 pub fn cpu_for(cfg: &Config, default_cpus: &[usize], id: usize) -> Option<usize> {
-    let list = cfg.cpus.as_deref().unwrap_or(default_cpus);
+    let list = cfg.tunables.cpus.as_deref().unwrap_or(default_cpus);
     (!list.is_empty()).then(|| list[id % list.len()])
 }
 
 pub fn reload_for(cfg: &Config, default_cpus: &[usize], id: usize) -> Reload {
     Reload {
-        auth_key: cfg.auth_key.clone(),
-        ping_interval: cfg.ping_interval,
-        dead_timeout: cfg.dead_timeout,
+        tunables: cfg.tunables.clone(),
         cpu: cpu_for(cfg, default_cpus, id),
     }
 }
@@ -168,7 +163,7 @@ pub fn pin(id: usize, cpu: Option<usize>) {
 #[inline]
 pub fn sync_tun_queue(id: usize, tun: BorrowedFd<'_>, attached: &mut bool, established: bool) {
     if *attached != established {
-        match sys::set_tun_queue(tun, established) {
+        match sys::tun::set_queue(tun, established) {
             Ok(()) => *attached = established,
             Err(e) => log::warn!("worker {id}: TUN queue attach={established}: {e}"),
         }

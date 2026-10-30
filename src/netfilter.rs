@@ -1,6 +1,6 @@
 //! Dedicated per-instance nftables table: conntrack/TCP-input bypass, RST suppression, MSS clamping, exit masquerade.
 
-mod netlink;
+mod batch;
 mod rules;
 
 #[cfg(test)]
@@ -11,7 +11,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use netlink_packet_netfilter::nftables::NfTablesMessage;
 
-use crate::config::{Cidr, Config, Mode, OuterFamily, Transport};
+use crate::config::{Config, Mode, Transport};
+use crate::net::{Cidr, OuterFamily};
 use crate::sys;
 
 #[derive(Clone, Debug)]
@@ -90,7 +91,7 @@ impl Drop for Guard {
 }
 
 fn delete_table(table: &str) -> io::Result<()> {
-    let mut batch = netlink::Batch::new();
+    let mut batch = batch::Batch::new();
     batch.push(NfTablesMessage::DeleteTable(rules::table(table)), 0);
     batch.commit()
 }

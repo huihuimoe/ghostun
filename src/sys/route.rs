@@ -19,7 +19,7 @@ use netlink_packet_route::{AddressFamily, RouteNetlinkMessage};
 use netlink_sys::protocols::NETLINK_ROUTE;
 use netlink_sys::{Socket, SocketAddr};
 
-use crate::config::{Cidr, OuterFamily};
+use crate::net::{Cidr, OuterFamily};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Route {
@@ -296,6 +296,7 @@ fn add_address(index: u32, address: IpAddr, prefix: u8) -> io::Result<()> {
 pub fn configure_tun(
     name: &str,
     mtu: u32,
+    txqueuelen: u32,
     v4: Cidr<Ipv4Addr>,
     v6: Option<Cidr<Ipv6Addr>>,
 ) -> io::Result<bool> {
@@ -306,7 +307,7 @@ pub fn configure_tun(
     message.header.change_mask = LinkFlags::Up;
     message.attributes = vec![
         LinkAttribute::Mtu(mtu),
-        LinkAttribute::TxQueueLen(crate::budget::tun_packets(mtu)),
+        LinkAttribute::TxQueueLen(txqueuelen),
     ];
     request(RouteNetlinkMessage::NewLink(message), NLM_F_ACK, |_| Ok(()))?;
     add_address(index, v4.addr.into(), v4.prefix)?;

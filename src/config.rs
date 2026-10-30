@@ -7,9 +7,10 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
-use crate::faketcp::pkt::{ipv4, ipv6, tcp};
 use argh::{FromArgValue, FromArgs};
 use serde::Deserialize;
+
+use crate::net::{ipv4, ipv6, Cidr, OuterFamily};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, FromArgValue)]
 #[serde(rename_all = "lowercase")]
@@ -24,112 +25,6 @@ pub enum Transport {
     #[default]
     Faketcp,
     Tcp,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, FromArgValue)]
-#[serde(rename_all = "lowercase")]
-pub enum OuterFamily {
-    #[default]
-    Ipv4,
-    Ipv6,
-}
-
-impl OuterFamily {
-    #[inline(always)]
-    pub const fn of(ip: IpAddr) -> Self {
-        if ip.is_ipv4() {
-            Self::Ipv4
-        } else {
-            Self::Ipv6
-        }
-    }
-
-    #[inline(always)]
-    pub const fn overhead(self) -> usize {
-        match self {
-            Self::Ipv4 => ipv4::HDR_LEN + tcp::HDR_LEN,
-            Self::Ipv6 => ipv6::HDR_LEN + tcp::HDR_LEN,
-        }
-    }
-
-    #[inline(always)]
-    pub const fn min_mtu(self) -> u32 {
-        match self {
-            Self::Ipv4 => ipv4::MIN_MTU,
-            Self::Ipv6 => ipv6::MIN_MTU,
-        }
-    }
-
-    pub fn unspecified(self) -> IpAddr {
-        match self {
-            Self::Ipv4 => Ipv4Addr::UNSPECIFIED.into(),
-            Self::Ipv6 => Ipv6Addr::UNSPECIFIED.into(),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Cidr<A> {
-    pub addr: A,
-    pub prefix: u8,
-}
-
-impl<A: fmt::Display> fmt::Display for Cidr<A> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}/{}", self.addr, self.prefix)
-    }
-}
-
-trait CidrAddr: FromStr + Copy {
-    const BITS: u8;
-    fn mask(self, prefix: u8) -> Self;
-}
-
-impl CidrAddr for Ipv4Addr {
-    const BITS: u8 = 32;
-    fn mask(self, prefix: u8) -> Self {
-        let m = u32::MAX.checked_shl(u32::from(32 - prefix)).unwrap_or(0);
-        Ipv4Addr::from(u32::from(self) & m)
-    }
-}
-
-impl CidrAddr for Ipv6Addr {
-    const BITS: u8 = 128;
-    fn mask(self, prefix: u8) -> Self {
-        let m = u128::MAX.checked_shl(u32::from(128 - prefix)).unwrap_or(0);
-        Ipv6Addr::from(u128::from(self) & m)
-    }
-}
-
-#[allow(private_bounds)]
-impl<A: CidrAddr> Cidr<A> {
-    /// Same prefix with host bits cleared.
-    pub fn network(&self) -> Cidr<A> {
-        Cidr {
-            addr: self.addr.mask(self.prefix),
-            prefix: self.prefix,
-        }
-    }
-}
-
-impl<A: CidrAddr> FromStr for Cidr<A> {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, String> {
-        let (addr, prefix) = s
-            .split_once('/')
-            .ok_or_else(|| format!("invalid CIDR {s:?}: missing /prefix"))?;
-        let addr = addr
-            .parse()
-            .map_err(|_| format!("invalid CIDR {s:?}: bad address"))?;
-        let prefix: u8 = prefix
-            .parse()
-            .map_err(|_| format!("invalid CIDR {s:?}: bad prefix"))?;
-        if prefix > A::BITS {
-            return Err(format!("invalid CIDR {s:?}: prefix exceeds {}", A::BITS));
-        }
-        Ok(Cidr { addr, prefix })
-    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -222,6 +117,15 @@ impl<'de> Deserialize<'de> for ListenSpec {
     }
 }
 
+/// Settings that running workers apply on reload; changing any other `Config` field requires a restart.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Tunables {
+    pub auth_key: AuthKey,
+    pub cpus: Option<Vec<usize>>,
+    pub ping_interval: Duration,
+    pub dead_timeout: Duration,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
     pub transport: Transport,
@@ -229,18 +133,15 @@ pub struct Config {
     pub tcp_notsent: u32,
     pub base_port_explicit: bool,
     pub mode: Mode,
-    pub auth_key: AuthKey,
+    pub tunables: Tunables,
     pub tun_name: String,
     pub tun_ipv4: Cidr<Ipv4Addr>,
     pub tun_ipv6: Option<Cidr<Ipv6Addr>>,
     pub conns: u16,
-    pub cpus: Option<Vec<usize>>,
     pub outer_mtu: Option<u32>,
     pub tun_mtu: Option<u32>,
     pub iface: Option<String>,
     pub base_port: u16,
-    pub ping_interval: Duration,
-    pub dead_timeout: Duration,
     pub netfilter: bool,
     pub masq: bool,
     /// Exit node outer address; `Some` exactly in entry mode.
@@ -531,17 +432,24 @@ fn build_config(cli: Cli, running_conns: Option<u16>) -> Result<Config, String> 
         tcp_notsent: cli
             .tcp_notsent
             .or(file.tcp_notsent)
-            .unwrap_or(crate::budget::TCP_NOTSENT / 1024)
+            .unwrap_or(crate::transport::budget::TCP_NOTSENT / 1024)
             .checked_mul(1024)
             .filter(|&bytes| bytes != 0)
             .ok_or("`tcp_notsent` must be within 1..=4194303 KiB")?,
         base_port_explicit: cli.base_port.is_some() || file.base_port.is_some(),
         mode,
-        auth_key: file
-            .auth_key
-            .as_deref()
-            .ok_or("missing TOML `auth_key`")?
-            .parse()?,
+        tunables: Tunables {
+            auth_key: file
+                .auth_key
+                .as_deref()
+                .ok_or("missing TOML `auth_key`")?
+                .parse()?,
+            cpus,
+            ping_interval: Duration::from_secs(
+                cli.ping_interval.or(file.ping_interval).unwrap_or(5),
+            ),
+            dead_timeout: Duration::from_secs(cli.dead_timeout.or(file.dead_timeout).unwrap_or(15)),
+        },
         tun_name: cli
             .tun_name
             .clone()
@@ -550,13 +458,10 @@ fn build_config(cli: Cli, running_conns: Option<u16>) -> Result<Config, String> 
         tun_ipv4,
         tun_ipv6,
         conns: cli.conns.or(file.conns).unwrap_or(default_conns),
-        cpus,
         outer_mtu: cli.outer_mtu.or(file.outer_mtu),
         tun_mtu: cli.tun_mtu.or(file.tun_mtu),
         iface: cli.iface.clone().or(file.iface),
         base_port: cli.base_port.or(file.base_port).unwrap_or(32768),
-        ping_interval: Duration::from_secs(cli.ping_interval.or(file.ping_interval).unwrap_or(5)),
-        dead_timeout: Duration::from_secs(cli.dead_timeout.or(file.dead_timeout).unwrap_or(15)),
         netfilter: !(cli.no_netfilter || file.no_netfilter),
         masq: !no_masq,
         remote,
@@ -594,6 +499,13 @@ fn ensure_reload_compatible(old: &Config, new: &Config) -> Result<(), String> {
         if changed {
             return Err(format!("cannot reload `{field}` without restarting"));
         }
+    }
+    // The list above only names fields for errors; this keeps unlisted fields restart-only.
+    let mut pinned = new.clone();
+    pinned.tunables = old.tunables.clone();
+    pinned.base_port_explicit = old.base_port_explicit;
+    if pinned != *old {
+        return Err("cannot reload this change without restarting".into());
     }
     Ok(())
 }
@@ -653,10 +565,11 @@ fn validate(c: &Config) -> Result<(), String> {
             return Err(format!("`tun_mtu` must be within {min}..={max}"));
         }
     }
-    if c.ping_interval.is_zero() {
+    let t = &c.tunables;
+    if t.ping_interval.is_zero() {
         return Err("`ping_interval` must be positive".into());
     }
-    if c.dead_timeout <= c.ping_interval {
+    if t.dead_timeout <= t.ping_interval {
         return Err("`dead_timeout` must be greater than `ping_interval`".into());
     }
     match c.mode {
@@ -684,575 +597,4 @@ fn validate(c: &Config) -> Result<(), String> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn parse(args: &[&str]) -> Result<Config, String> {
-        with_file(&format!("cli-{:?}", std::thread::current().id()), "", args)
-    }
-
-    fn entry(extra: &[&str]) -> Result<Config, String> {
-        let mut args = vec!["entry", "--remote", "203.0.113.9:443"];
-        args.extend_from_slice(extra);
-        parse(&args)
-    }
-
-    fn with_file(name: &str, toml: &str, args: &[&str]) -> Result<Config, String> {
-        with_raw_file(
-            name,
-            &format!("auth_key = '{}'\n{toml}", "a7".repeat(32)),
-            args,
-        )
-    }
-
-    fn with_raw_file(name: &str, toml: &str, args: &[&str]) -> Result<Config, String> {
-        let path =
-            std::env::temp_dir().join(format!("ghostun-test-{}-{name}.toml", std::process::id()));
-        std::fs::write(&path, toml).unwrap();
-        let mut all = vec!["--config", path.to_str().unwrap()];
-        all.extend_from_slice(args);
-        let r = parse_from(std::iter::once("ghostun").chain(all.iter().copied()));
-        std::fs::remove_file(&path).unwrap();
-        r
-    }
-
-    #[test]
-    fn transport_defaults_precedence_and_validation() {
-        assert_eq!(entry(&[]).unwrap().transport, Transport::Faketcp);
-        let tcp = with_file(
-            "tcp",
-            "transport = 'tcp'\nbase_port = 1",
-            &["entry", "--remote", "192.0.2.1:443"],
-        )
-        .unwrap();
-        assert_eq!(tcp.transport, Transport::Tcp);
-        assert!(tcp.base_port_explicit);
-        assert_eq!(
-            with_file(
-                "override-transport",
-                "transport = 'tcp'",
-                &[
-                    "entry",
-                    "--remote",
-                    "192.0.2.1:443",
-                    "--transport",
-                    "faketcp"
-                ]
-            )
-            .unwrap()
-            .transport,
-            Transport::Faketcp
-        );
-        assert!(with_file(
-            "bad-transport",
-            "transport = 'udp'",
-            &["entry", "--remote", "192.0.2.1:443"]
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn tcp_notsent_defaults_precedence_validation_and_reload() {
-        assert_eq!(entry(&[]).unwrap().tcp_notsent, 64 * 1024);
-        for (role, address) in [("entry", "--remote"), ("exit", "--listen")] {
-            let endpoint = if role == "entry" {
-                "192.0.2.1:443"
-            } else {
-                "443"
-            };
-            let args = [role, address, endpoint, "--transport", "tcp"];
-            let cfg = with_file("notsent-file", "tcp_notsent = 128", &args).unwrap();
-            assert_eq!(cfg.tcp_notsent, 128 * 1024);
-            let mut override_args = args.to_vec();
-            override_args.extend(["--tcp-notsent", "32"]);
-            let overridden = with_file("notsent-cli", "tcp_notsent = 128", &override_args).unwrap();
-            assert_eq!(overridden.tcp_notsent, 32 * 1024);
-            assert!(ensure_reload_compatible(&cfg, &overridden)
-                .unwrap_err()
-                .contains("tcp_notsent"));
-            assert!(ensure_reload_compatible(&cfg, &cfg).is_ok());
-            for value in ["0", "-1", "4194304", "4294967295"] {
-                assert!(
-                    with_file("notsent-invalid", &format!("tcp_notsent = {value}"), &args).is_err()
-                );
-            }
-            assert!(Cli::from_args(&["ghostun"], &["--tcp-notsent", "-1"]).is_err());
-            for value in ["0", "4194304", "4294967295"] {
-                let mut invalid_args = args.to_vec();
-                invalid_args.extend(["--tcp-notsent", value]);
-                assert!(with_file("notsent-invalid-cli", "", &invalid_args).is_err());
-            }
-        }
-        assert_eq!(entry(&["--tcp-notsent", "1"]).unwrap().tcp_notsent, 1024);
-        assert_eq!(
-            entry(&["--tcp-notsent", "4194303"]).unwrap().tcp_notsent,
-            4194303 * 1024
-        );
-    }
-
-    #[test]
-    fn both_roles_require_an_auth_key() {
-        for args in [
-            vec!["ghostun", "entry", "--remote", "203.0.113.9:443"],
-            vec!["ghostun", "exit", "--listen", "443"],
-        ] {
-            assert!(parse_from(args).is_err(), "a missing key must fail closed");
-        }
-    }
-
-    #[test]
-    fn key_validation_never_discloses_secret_material() {
-        let key = "a7B9".repeat(16);
-        for role in [
-            "mode = 'entry'\nremote = '192.0.2.1:443'",
-            "mode = 'exit'\nlisten = 443",
-        ] {
-            let config =
-                with_raw_file("valid-key", &format!("auth_key = '{key}'\n{role}"), &[]).unwrap();
-            assert!(!format!("{config:?}").contains(&key));
-            for bad in [
-                String::new(),
-                "password".into(),
-                "a".repeat(63),
-                "a".repeat(65),
-                "g".repeat(64),
-                "é".repeat(32),
-            ] {
-                let error =
-                    with_raw_file("invalid-key", &format!("auth_key = '{bad}'\n{role}"), &[])
-                        .unwrap_err();
-                if !bad.is_empty() {
-                    assert!(!error.contains(&bad));
-                }
-            }
-            for invalid in [
-                format!("auth_key = '{key}'\n{role}\nbroken = ["),
-                format!("auth_key = ['{key}']\n{role}"),
-            ] {
-                let error = with_raw_file("invalid-toml", &invalid, &[]).unwrap_err();
-                assert!(!error.contains(&key));
-            }
-        }
-    }
-
-    #[test]
-    fn entry_defaults() {
-        let c = entry(&[]).unwrap();
-        assert_eq!(c.mode, Mode::Entry);
-        assert_eq!(c.tun_name, "ghostun0");
-        assert_eq!(c.tun_ipv4.to_string(), "10.200.0.1/30");
-        assert_eq!(c.tun_ipv6.unwrap().to_string(), "fd00:200::1/126");
-        assert_eq!(
-            usize::from(c.conns),
-            std::thread::available_parallelism().unwrap().get().min(256)
-        );
-        assert_eq!(c.cpus, None);
-        assert_eq!(
-            (c.outer_mtu, c.tun_mtu, c.iface.as_deref()),
-            (None, None, None)
-        );
-        assert_eq!(c.base_port, 32768);
-        assert_eq!(
-            (c.ping_interval, c.dead_timeout),
-            (Duration::from_secs(5), Duration::from_secs(15))
-        );
-        assert!(c.netfilter);
-        assert_eq!(c.remote, Some("203.0.113.9:443".parse().unwrap()));
-        assert_eq!(c.listen, None);
-    }
-
-    #[test]
-    fn exit_defaults() {
-        let c = parse(&["exit", "--listen", "443"]).unwrap();
-        assert_eq!(c.mode, Mode::Exit);
-        assert_eq!(c.tun_ipv4.to_string(), "10.200.0.2/30");
-        assert_eq!(c.tun_ipv6.unwrap().to_string(), "fd00:200::2/126");
-        assert!(c.netfilter && c.masq);
-        assert_eq!((c.listen, c.remote), (Some(443), None));
-        let c = with_file(
-            "exit-no-masq",
-            "mode = 'exit'\nlisten = 443\nno_masq = true\n",
-            &["--no-netfilter", "--iface", "eth0"],
-        )
-        .unwrap();
-        assert!(!c.netfilter && !c.masq);
-        assert_eq!(c.iface.as_deref(), Some("eth0"));
-        assert!(
-            !parse(&["exit", "--listen", "443", "--no-masq"])
-                .unwrap()
-                .masq
-        );
-    }
-
-    #[test]
-    fn all_flags_apply() {
-        let c = entry(&[
-            "--tun",
-            "wan7",
-            "--tun-ipv4",
-            "10.9.0.1/24",
-            "--tun-ipv6",
-            "fd00:9::1/64",
-            "--conns",
-            "3",
-            "--cpus",
-            "2-3,0",
-            "--outer-mtu",
-            "1492",
-            "--tun-mtu",
-            "1400",
-            "--iface",
-            "eth1",
-            "--base-port",
-            "40000",
-            "--ping-interval",
-            "2",
-            "--dead-timeout",
-            "7",
-            "--no-netfilter",
-        ])
-        .unwrap();
-        assert_eq!(c.tun_name, "wan7");
-        assert_eq!(c.tun_ipv4.to_string(), "10.9.0.1/24");
-        assert_eq!(c.tun_ipv6.unwrap().to_string(), "fd00:9::1/64");
-        assert_eq!(
-            (c.conns, c.outer_mtu, c.tun_mtu),
-            (3, Some(1492), Some(1400))
-        );
-        assert_eq!(c.cpus.as_deref(), Some(&[2, 3, 0][..]));
-        assert_eq!(c.iface.as_deref(), Some("eth1"));
-        assert_eq!(c.base_port, 40000);
-        assert_eq!(
-            (c.ping_interval, c.dead_timeout),
-            (Duration::from_secs(2), Duration::from_secs(7))
-        );
-        assert!(!c.netfilter);
-    }
-
-    #[test]
-    fn no_ipv6_disables_inner_v6() {
-        assert_eq!(entry(&["--no-ipv6"]).unwrap().tun_ipv6, None);
-        // 1280 floor only applies with IPv6.
-        assert_eq!(
-            entry(&["--no-ipv6", "--tun-mtu", "1000"]).unwrap().tun_mtu,
-            Some(1000)
-        );
-        assert!(entry(&["--tun-mtu", "1000"]).is_err());
-    }
-
-    #[test]
-    fn toml_alone_selects_role() {
-        let c = with_file(
-            "role",
-            "mode = \"exit\"\nlisten = 8443\nconns = 2\ntun_name = \"gx\"\nno_ipv6 = true\n",
-            &[],
-        )
-        .unwrap();
-        assert_eq!(
-            (c.mode, c.listen, c.conns, c.tun_name.as_str(), c.tun_ipv6),
-            (Mode::Exit, Some(8443), 2, "gx", None)
-        );
-    }
-
-    #[test]
-    fn cli_overrides_toml() {
-        let toml =
-            "remote = \"203.0.113.1:80\"\nconns = 2\ndead_timeout = 30\ntun_name = \"fromfile\"\n";
-        let c = with_file(
-            "override",
-            toml,
-            &["entry", "--conns", "5", "--tun", "fromcli"],
-        )
-        .unwrap();
-        assert_eq!(c.conns, 5);
-        assert_eq!(c.tun_name, "fromcli");
-        assert_eq!(c.dead_timeout, Duration::from_secs(30));
-        assert_eq!(c.remote, Some("203.0.113.1:80".parse().unwrap()));
-        let c = with_file(
-            "override-file-mode",
-            &format!("mode = \"entry\"\n{toml}"),
-            &["--conns", "7"],
-        )
-        .unwrap();
-        assert_eq!(
-            (c.mode, c.conns, c.tun_name.as_str()),
-            (Mode::Entry, 7, "fromfile")
-        );
-    }
-
-    #[test]
-    fn file_errors() {
-        assert!(with_file(
-            "conflict",
-            "mode = \"exit\"\nlisten = 1\n",
-            &["entry", "--remote", "1.2.3.4:5"]
-        )
-        .unwrap_err()
-        .contains("conflicts"));
-        assert!(with_file("unknown", "mode = \"exit\"\nlisten = 1\nbogus = 1\n", &[]).is_err());
-        assert!(with_file("norole", "conns = 1\n", &[])
-            .unwrap_err()
-            .contains("missing role"));
-        assert!(with_file(
-            "wrongrole",
-            "mode = \"exit\"\nlisten = 1\nremote = \"1.2.3.4:5\"\n",
-            &[]
-        )
-        .unwrap_err()
-        .contains("entry mode"));
-        assert!(with_file(
-            "entry-no-masq",
-            "mode = \"entry\"\nremote = \"1.2.3.4:5\"\nno_masq = true\n",
-            &[]
-        )
-        .unwrap_err()
-        .contains("exit mode"));
-    }
-
-    #[test]
-    fn validation_errors() {
-        assert!(parse(&["entry"]).unwrap_err().contains("remote"));
-        assert!(parse(&["exit"]).unwrap_err().contains("listen"));
-        assert!(parse(&["exit", "--listen", "0"]).is_err());
-        assert!(entry(&["--no-masq"]).unwrap_err().contains("exit mode"));
-        assert!(entry(&["--ping-interval", "5", "--dead-timeout", "5"])
-            .unwrap_err()
-            .contains("dead_timeout"));
-        assert!(entry(&["--ping-interval", "0"]).is_err());
-        assert!(entry(&["--base-port", "65530", "--conns", "8"]).is_err());
-        assert!(entry(&["--base-port", "80"]).is_err());
-        assert!(entry(&["--conns", "0"]).is_err());
-        assert!(entry(&["--conns", "257"]).is_err());
-        assert!(entry(&["--outer-mtu", "100"]).is_err());
-        assert!(entry(&["--tun", "a-very-long-name0"])
-            .unwrap_err()
-            .contains("TUN name"));
-        assert!(entry(&["--tun", "a/b"]).is_err());
-        assert!(entry(&["--tun", "a\"b"]).is_err());
-        assert!(entry(&["--tun", ""]).is_err());
-        assert!(entry(&["--tun-ipv4", "10.0.0.1/33"])
-            .unwrap_err()
-            .contains("prefix"));
-        assert!(entry(&["--tun-ipv4", "10.0.0.1"]).is_err());
-        assert!(entry(&["--tun-ipv6", "fd00::1/129"]).is_err());
-        assert!(entry(&["--cpus", ""]).is_err());
-        assert!(entry(&["--cpus", "3-1"]).is_err());
-        assert!(entry(&["--cpus", "1024"]).is_err());
-    }
-
-    #[test]
-    fn cidr_network_clears_host_bits() {
-        let v4: Cidr<Ipv4Addr> = "10.200.0.2/30".parse().unwrap();
-        assert_eq!(v4.network().to_string(), "10.200.0.0/30");
-        assert_eq!(
-            "1.2.3.4/0"
-                .parse::<Cidr<Ipv4Addr>>()
-                .unwrap()
-                .network()
-                .to_string(),
-            "0.0.0.0/0"
-        );
-        let v6: Cidr<Ipv6Addr> = "fd00:200::2/126".parse().unwrap();
-        assert_eq!(v6.network().to_string(), "fd00:200::/126");
-        assert_eq!(
-            "fd00::5/128"
-                .parse::<Cidr<Ipv6Addr>>()
-                .unwrap()
-                .network()
-                .to_string(),
-            "fd00::5/128"
-        );
-    }
-
-    #[test]
-    fn outer_family_is_independent_of_inner_ipv6() {
-        let c = parse(&["entry", "--remote", "[2001:db8::1]:443", "--no-ipv6"]).unwrap();
-        assert_eq!(c.outer_family, OuterFamily::Ipv6);
-        assert_eq!(c.tun_ipv6, None);
-        let c = with_file(
-            "v6-family",
-            "mode = 'exit'\nlisten = 443\nouter_family = 'ipv6'\n",
-            &[],
-        )
-        .unwrap();
-        assert_eq!(c.outer_family, OuterFamily::Ipv6);
-        let c = with_file(
-            "v6-override",
-            "mode = 'exit'\nlisten = 443\nouter_family = 'ipv6'\n",
-            &["exit", "--outer-family", "ipv4"],
-        )
-        .unwrap();
-        assert_eq!(c.outer_family, OuterFamily::Ipv4);
-        assert!(with_file(
-            "entry-family",
-            "mode = 'entry'\nremote = '[2001:db8::1]:443'\nouter_family = 'ipv6'\n",
-            &[]
-        )
-        .is_err());
-        let v6_listen = parse(&["exit", "--listen", "[2001:db8::1]:443"]).unwrap();
-        assert_eq!(v6_listen.outer_family, OuterFamily::Ipv6);
-        assert_eq!(v6_listen.listen, Some(443));
-        assert_eq!(v6_listen.listen_ip, Some("2001:db8::1".parse().unwrap()));
-        let v6_wild = with_file("v6-wild", "mode = 'exit'\nlisten = '[::]:8443'\n", &[]).unwrap();
-        assert_eq!(v6_wild.outer_family, OuterFamily::Ipv6);
-        assert_eq!(v6_wild.listen, Some(8443));
-        assert_eq!(v6_wild.listen_ip, None);
-        let v4_wild = parse(&["exit", "--listen", "0.0.0.0:443"]).unwrap();
-        assert_eq!(v4_wild.outer_family, OuterFamily::Ipv4);
-        assert_eq!(v4_wild.listen_ip, None);
-        assert!(parse(&[
-            "exit",
-            "--listen",
-            "192.0.2.1:443",
-            "--outer-family",
-            "ipv6"
-        ])
-        .unwrap_err()
-        .contains("conflicts"));
-    }
-
-    #[test]
-    fn mtu_validation_uses_outer_family_and_detected_mtu() {
-        for (family, overhead) in [("ipv4", 40), ("ipv6", 60)] {
-            let mut c = parse(&["exit", "--listen", "443", "--outer-family", family]).unwrap();
-            assert_eq!(c.resolve_tun_mtu(1500).unwrap(), 1500 - overhead);
-            assert_eq!(c.resolve_tun_mtu(1280 + overhead).unwrap(), 1280);
-            assert!(c.resolve_tun_mtu(1279 + overhead).is_err());
-            c.tun_mtu = Some(1441);
-            assert!(c.resolve_tun_mtu(1440 + overhead).is_err());
-        }
-        assert!(parse(&[
-            "exit",
-            "--listen",
-            "443",
-            "--outer-family",
-            "ipv6",
-            "--outer-mtu",
-            "1280"
-        ])
-        .is_err());
-        let c = parse(&[
-            "exit",
-            "--listen",
-            "443",
-            "--outer-family",
-            "ipv6",
-            "--outer-mtu",
-            "1280",
-            "--no-ipv6",
-        ])
-        .unwrap();
-        assert_eq!(c.resolve_tun_mtu(1280).unwrap(), 1220);
-        assert!(c.resolve_tun_mtu(1279).is_err());
-    }
-
-    #[test]
-    fn reload_updates_mutable_fields_and_rejects_immutable_or_invalid_changes() {
-        let path = std::env::temp_dir().join(format!("ghostun-reload-{}.toml", std::process::id()));
-        let key1 = "a7".repeat(32);
-        let key2 = "b8".repeat(32);
-        std::fs::write(
-            &path,
-            format!(
-                "mode = 'entry'\nremote = '203.0.113.9:443'\nauth_key = '{key1}'\nconns = 2\nping_interval = 5\ndead_timeout = 15\n"
-            ),
-        )
-        .unwrap();
-        let cfg = parse_from([
-            "ghostun",
-            "--config",
-            path.to_str().unwrap(),
-            "--base-port",
-            "40000",
-        ])
-        .unwrap();
-
-        // Updating all four mutable fields (auth_key, ping_interval, dead_timeout, cpus) succeeds
-        // while preserving startup CLI overrides (--base-port 40000).
-        std::fs::write(
-            &path,
-            format!(
-                "mode = 'entry'\nremote = '203.0.113.9:443'\nauth_key = '{key2}'\nconns = 2\ncpus = '0,1'\nping_interval = 3\ndead_timeout = 12\n"
-            ),
-        )
-        .unwrap();
-        let reloaded = cfg.reload().unwrap();
-        assert_eq!(reloaded.auth_key, key2.parse().unwrap());
-        assert_eq!(reloaded.ping_interval, Duration::from_secs(3));
-        assert_eq!(reloaded.dead_timeout, Duration::from_secs(12));
-        assert_eq!(reloaded.cpus, Some(vec![0, 1]));
-        assert_eq!(reloaded.base_port, 40000);
-
-        // Changing cpus when conns was omitted in TOML/CLI keeps the running conns.
-        std::fs::write(
-            &path,
-            format!(
-                "mode = 'entry'\nremote = '203.0.113.9:443'\nauth_key = '{key2}'\ncpus = '0,1,2,3'\nping_interval = 3\ndead_timeout = 12\n"
-            ),
-        )
-        .unwrap();
-        let reloaded_cpus = reloaded.reload().unwrap();
-        assert_eq!(reloaded_cpus.conns, 2);
-        assert_eq!(reloaded_cpus.cpus, Some(vec![0, 1, 2, 3]));
-
-        // Invalid TOML syntax or invalid key is rejected without disclosing secret material.
-        let secret = "c9D0".repeat(16);
-        std::fs::write(&path, format!("auth_key = ['{secret}']\n")).unwrap();
-        let err = reloaded.reload().unwrap_err();
-        assert!(!err.contains(&secret));
-
-        // Changing any immutable field is rejected.
-        for bad_toml in [
-            format!("mode = 'entry'\ntransport = 'tcp'\nremote = '203.0.113.9:443'\nauth_key = '{key2}'\nconns = 2\n"),
-            format!("mode = 'exit'\nlisten = 443\nauth_key = '{key2}'\nconns = 2\n"),
-            format!("mode = 'entry'\nremote = '203.0.113.10:443'\nauth_key = '{key2}'\nconns = 2\n"),
-            format!("mode = 'entry'\nremote = '[2001:db8::1]:443'\nauth_key = '{key2}'\nconns = 2\n"),
-            format!("mode = 'entry'\nremote = '203.0.113.9:443'\nauth_key = '{key2}'\nconns = 4\n"),
-            format!("mode = 'entry'\nremote = '203.0.113.9:443'\nauth_key = '{key2}'\nconns = 2\ntun_name = 'gtun1'\n"),
-            format!("mode = 'entry'\nremote = '203.0.113.9:443'\nauth_key = '{key2}'\nconns = 2\ntun_ipv4 = '10.200.1.1/30'\n"),
-            format!("mode = 'entry'\nremote = '203.0.113.9:443'\nauth_key = '{key2}'\nconns = 2\ntun_ipv6 = 'fd00:201::1/126'\n"),
-            format!("mode = 'entry'\nremote = '203.0.113.9:443'\nauth_key = '{key2}'\nconns = 2\nouter_mtu = 1420\n"),
-            format!("mode = 'entry'\nremote = '203.0.113.9:443'\nauth_key = '{key2}'\nconns = 2\ntun_mtu = 1360\n"),
-            format!("mode = 'entry'\nremote = '203.0.113.9:443'\nauth_key = '{key2}'\nconns = 2\niface = 'eth9'\n"),
-            format!("mode = 'entry'\nremote = '203.0.113.9:443'\nauth_key = '{key2}'\nconns = 2\nno_netfilter = true\n"),
-        ] {
-            std::fs::write(&path, &bad_toml).unwrap();
-            assert!(reloaded.reload().is_err(), "expected immutable change to fail: {bad_toml}");
-        }
-
-        std::fs::write(
-            &path,
-            format!("mode = 'exit'\nlisten = 443\nauth_key = '{key1}'\nconns = 2\n"),
-        )
-        .unwrap();
-        let exit_cfg = parse_from(["ghostun", "--config", path.to_str().unwrap()]).unwrap();
-        std::fs::write(
-            &path,
-            format!(
-                "mode = 'exit'\nlisten = 443\nauth_key = '{key1}'\nconns = 2\nno_masq = true\n"
-            ),
-        )
-        .unwrap();
-        assert!(exit_cfg.reload().unwrap_err().contains("no_masq"));
-        std::fs::write(
-            &path,
-            format!("mode = 'exit'\nlisten = '192.0.2.1:443'\nauth_key = '{key1}'\nconns = 2\n"),
-        )
-        .unwrap();
-        assert!(exit_cfg.reload().unwrap_err().contains("listen"));
-
-        // When inner IPv6 was disabled at startup, reload remains compatible without false mismatch.
-        std::fs::write(
-            &path,
-            format!("mode = 'entry'\nremote = '203.0.113.9:443'\nauth_key = '{key1}'\nconns = 2\n"),
-        )
-        .unwrap();
-        let mut no_v6_cfg = reloaded.clone();
-        no_v6_cfg.disable_inner_ipv6();
-        let after_no_v6 = no_v6_cfg.reload().unwrap();
-        assert_eq!(after_no_v6.tun_ipv6, None);
-        assert_eq!(after_no_v6.auth_key, key1.parse().unwrap());
-
-        std::fs::remove_file(&path).unwrap();
-    }
-}
+mod tests;
