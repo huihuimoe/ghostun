@@ -1,7 +1,7 @@
 {
   "name": "ghostun",
   // Matches the release builder (Rust 1.99, Debian trixie); clippy and rustfmt are preinstalled.
-  "image": "mcr.microsoft.com/devcontainers/rust:1-trixie",
+  "image": "mcr.microsoft.com/devcontainers/rust:2-trixie",
   "features": {
     // Runs the disposable e2e containers from tests/README.md. Moby has no trixie packages.
     "ghcr.io/devcontainers/features/docker-in-docker:4": {
