@@ -9,7 +9,9 @@
     }
   },
   // Apple container (socktainer) defaults to 1 GiB, too little for rust-analyzer plus LTO builds.
-  "runArgs": ["--memory=8g"],
+  "runArgs": [
+    "--memory=4g"
+  ],
   "containerEnv": {
     "RUST_BACKTRACE": "1"
   },
@@ -33,7 +35,10 @@
         "vadimcn.vscode-lldb",
         "tamasfe.even-better-toml",
         "timonwong.shellcheck",
-        "ms-python.python"
+        "ms-python.python",
+        "eamodio.gitlens",
+        "fill-labs.dependi",
+        "EditorConfig.EditorConfig"
       ]
     }
   }
