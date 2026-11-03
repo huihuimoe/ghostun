@@ -12,7 +12,11 @@ use serde::Deserialize;
 
 use crate::net::{ipv4, ipv6, Cidr, OuterFamily};
 
-pub const MAX_CONNS: usize = 256;
+/// Linux `IFF_MULTI_QUEUE` TUN devices allow at most `MAX_TAP_QUEUES` (256) open queue
+/// descriptors, and Exit reserves one detached anchor descriptor to keep the interface alive;
+/// this also bounds Exit's per-worker slot/replay tables and TCP candidate pool.
+pub const MAX_CONNS: usize = 255;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, FromArgValue)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {

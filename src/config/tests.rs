@@ -164,7 +164,10 @@ fn entry_defaults() {
     assert_eq!(c.tun_ipv6.unwrap().to_string(), "fd00:200::1/126");
     assert_eq!(
         usize::from(c.conns),
-        std::thread::available_parallelism().unwrap().get().min(256)
+        std::thread::available_parallelism()
+            .unwrap()
+            .get()
+            .min(MAX_CONNS)
     );
     assert_eq!(c.tunables.cpus, None);
     assert_eq!(
@@ -456,7 +459,8 @@ fn validation_errors() {
     assert!(entry(&["--base-port", "65530", "--conns", "8"]).is_err());
     assert!(entry(&["--base-port", "80"]).is_err());
     assert!(entry(&["--conns", "0"]).is_err());
-    assert!(entry(&["--conns", "257"]).is_err());
+    assert!(entry(&["--conns", "255"]).is_ok());
+    assert!(entry(&["--conns", "256"]).is_err());
     assert!(entry(&["--outer-mtu", "100"]).is_err());
     assert!(entry(&["--tun", "a-very-long-name0"])
         .unwrap_err()

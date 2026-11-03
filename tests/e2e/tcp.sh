@@ -176,7 +176,7 @@ while pending and time.monotonic()<deadline:
   except ConnectionResetError: data=b''
   assert data==b''
   pending.remove(s)
-assert len(pending)==256, f'expected 256 candidates before auth deadline, got {len(pending)}'
+assert len(pending)==255, f'expected 255 candidates before auth deadline, got {len(pending)}'
 # The initial candidates must time out and make capacity available again.
 time.sleep(4)
 for s in pending:

@@ -127,7 +127,7 @@ ghostun [options] [entry|exit]
 | `--remote IP:PORT` | — | Entry only: Exit outer address (IP literal) |
 | `--listen [IP:]PORT` | — | Exit only: outer listen port or `IP:PORT` |
 | `--outer-family ipv4\|ipv6\|mixed` | Exit: `ipv4`; Entry: remote family | Exit listener family; Entry can select `mixed` to reserve IPv6 overhead |
-| `--conns N` | CPU count | Entry only: outer connections and worker threads (`1..=256`) |
+| `--conns N` | CPU count | Entry only: outer connections and worker threads (`1..=255`) |
 | `--cpus LIST` | all usable CPUs | Worker CPU list or ranges (e.g. `0,1` or `2-3`) |
 | `--tun NAME` | `ghostun0` | Inner TUN device name (`[A-Za-z0-9_.-]`, up to 15 chars) |
 | `--tun-ipv4 CIDR` | `10.200.0.1/30` / `.2/30` | Inner IPv4 address (Entry / Exit) |
