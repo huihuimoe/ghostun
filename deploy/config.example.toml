@@ -35,13 +35,14 @@ tun_name = "ghostun0"
 # no_netfilter = false
 
 [entry]
-# Exit outer address (required in entry mode). IPv6 example: "[2001:db8::10]:443".
-remote = "203.0.113.10:443"
+# Exit outer endpoints and connection count for each endpoint (required in entry mode).
+# Failed connections retry with bounded exponential backoff.
+remote = [
+  { address = "203.0.113.10:443", conns = 4 },
+  # { address = "[2001:db8::10]:443", conns = 4 },
+]
 
-# Number of outer connections and worker threads (default: CPU count).
-# conns = 4
-
-# Set to "mixed" when connecting to an Exit with outer_family = "mixed".
+# Set to "mixed" when connecting only over IPv4 to an Exit with outer_family = "mixed".
 # outer_family = "mixed"
 
 # FakeTCP only: starting source port when restricting outer ports in firewall rules.

@@ -201,6 +201,10 @@ fn finished_received_at_or_after_the_attempt_deadline_cannot_authorize() {
                 data.is_none(),
                 "receive processing must enforce the deadline before on_tick"
             );
+            assert_eq!(pair.entry.state(), State::Closed);
+            assert!(pair.entry.next_deadline() >= pair.t + delay + Duration::from_millis(500));
+            wire.take();
+            pair.entry.on_tick(pair.entry.next_deadline(), &mut wire);
             let outgoing = wire.take();
             let syn = outgoing
                 .iter()
@@ -227,6 +231,9 @@ fn authentication_timeout_rotates_the_port_and_expired_cookies_cannot_admit() {
     assert!(wire.take().is_empty());
     pair.entry
         .on_tick(pair.t + Duration::from_secs(15), &mut wire);
+    assert_eq!(pair.entry.state(), State::Closed);
+    wire.take();
+    pair.entry.on_tick(pair.entry.next_deadline(), &mut wire);
     let retry = wire.take();
     let syn = retry
         .iter()
@@ -537,6 +544,9 @@ fn mismatched_keys_deny_forwarding_in_both_directions() {
     assert!(encap(&mut pair.exit, &[0x60; 40], 40).is_none());
     pair.entry
         .on_tick(pair.t + Duration::from_secs(15), &mut wire);
+    assert_eq!(pair.entry.state(), State::Closed);
+    wire.take();
+    pair.entry.on_tick(pair.entry.next_deadline(), &mut wire);
     assert!(wire
         .take()
         .iter()
@@ -754,6 +764,8 @@ fn source_port_rotation_wraps_to_start_of_pool() {
     s.start(t, &mut w);
     assert_eq!(parsed(&w.take()[0]).meta.src.port(), 65535);
     s.on_tick(t + Duration::from_secs(15), &mut w);
+    w.take();
+    s.on_tick(s.next_deadline(), &mut w);
     let frames = w.take();
     assert_eq!(parsed(frames.last().unwrap()).meta.src.port(), 65531);
 }
@@ -782,19 +794,41 @@ fn syn_is_retried_then_port_rotates_after_dead_timeout() {
         w.take().is_empty(),
         "SynSent RST must not spin immediate reconnect"
     );
-    s.on_tick(t + SYN_RETRY, &mut w);
-    let retry = parsed(&w.take()[0]).meta;
-    assert_eq!(
-        (retry.flags, retry.seq, retry.src),
-        (flags::SYN, first.seq, first.src)
-    );
-    s.on_tick(t + Duration::from_secs(15), &mut w);
-    let reconnect = w.take();
-    assert_ne!(
-        parsed(reconnect.last().unwrap()).meta.src.port(),
-        first.src.port()
-    );
-    assert_eq!(s.state(), State::SynSent);
+    let mut now = t;
+    for step_secs in [1, 2, 4, 8] {
+        assert_eq!(s.next_deadline(), now + Duration::from_secs(step_secs));
+        now += Duration::from_secs(step_secs);
+        if now < t + Duration::from_secs(15) {
+            s.on_tick(now, &mut w);
+            let retry = parsed(&w.take()[0]).meta;
+            assert_eq!(
+                (retry.flags, retry.seq, retry.src),
+                (flags::SYN, first.seq, first.src)
+            );
+        }
+    }
+    for base in [1u64, 2, 4, 8, 15, 30, 30] {
+        s.on_tick(now, &mut w);
+        assert_eq!(s.state(), State::Closed);
+        let rsts = w.take();
+        assert!(rsts.iter().all(|f| parsed(f).meta.flags & flags::RST != 0));
+        let retry_at = s.next_deadline();
+        let delay = retry_at.duration_since(now);
+        assert!(
+            delay >= Duration::from_millis(base * 500) && delay <= Duration::from_secs(base),
+            "backoff delay {delay:?} outside {}..={}ms",
+            base * 500,
+            base * 1000
+        );
+        s.on_tick(retry_at, &mut w);
+        let reconnect = w.take();
+        assert_ne!(
+            parsed(reconnect.last().unwrap()).meta.src.port(),
+            first.src.port()
+        );
+        assert_eq!(s.state(), State::SynSent);
+        now = retry_at + Duration::from_secs(15);
+    }
 }
 
 #[test]

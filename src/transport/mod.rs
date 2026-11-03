@@ -18,10 +18,17 @@ use control::{
     candidate_cpus, Control, CoreTable, ExitWorkerGuard, Reload, RollingReload, StopOnDrop,
 };
 
+/// Per-remote outer route and connection count on Entry.
+pub struct EntryRoute {
+    pub remote: SocketAddr,
+    pub local_ip: IpAddr,
+    pub dev: String,
+    pub conns: u16,
+}
+
 /// Outer addressing derived from config plus the routing table.
 pub struct Outer {
-    /// Entry source address. The exit learns its address from each incoming packet/stream instead.
-    pub local_ip: IpAddr,
+    pub entry: Vec<EntryRoute>,
     pub dev: Option<String>,
     pub mtu: u32,
 }
@@ -95,24 +102,24 @@ pub fn start(
         .map_or(0, |d| d.as_nanos() as u64);
     if cfg.mode == Mode::Entry {
         let mut starts = Vec::with_capacity(tuns.len());
-        for (i, tun) in tuns.into_iter().enumerate() {
-            starts.push(match cfg.transport {
-                Transport::Tcp => Start::Tcp(Box::new(tcp::Worker::new_entry(
-                    i,
-                    cfg.clone(),
-                    tun_mtu as u16,
-                    tun,
-                ))),
-                Transport::Faketcp => Start::Fake(Box::new(faketcp::Worker::new_entry(
-                    i,
-                    cfg,
-                    outer.local_ip,
-                    outer.dev.as_deref(),
-                    outer.mtu,
-                    tun,
-                    seed,
-                )?)),
-            });
+        let mut tuns = tuns.into_iter();
+        for route in &outer.entry {
+            for _ in 0..route.conns {
+                let i = starts.len();
+                let tun = tuns.next().expect("TUN queue per entry connection");
+                starts.push(match cfg.transport {
+                    Transport::Tcp => Start::Tcp(Box::new(tcp::Worker::new_entry(
+                        i,
+                        cfg.clone(),
+                        route.remote,
+                        tun_mtu as u16,
+                        tun,
+                    ))),
+                    Transport::Faketcp => Start::Fake(Box::new(faketcp::Worker::new_entry(
+                        i, cfg, route, outer.mtu, tun, seed,
+                    )?)),
+                });
+            }
         }
         let mut entry_controls = Vec::with_capacity(starts.len());
         let mut entry_cpus = Vec::with_capacity(starts.len());

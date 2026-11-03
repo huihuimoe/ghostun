@@ -13,7 +13,7 @@ fn spec() -> NftSpec {
         transport: Transport::Tcp,
         outer_family: Some(OuterFamily::Ipv4),
         tun_name: "nft_atomic".into(),
-        remote: None,
+        remotes: Vec::new(),
         base_port: 30000,
         listen_ip: None,
         listen_port: 443,

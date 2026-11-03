@@ -187,23 +187,29 @@ fn u32_attribute(kind: u16, value: u32) -> DefaultNla {
     DefaultNla::new(kind, value.to_be_bytes().to_vec())
 }
 
-fn outer(spec: &NftSpec, incoming: bool) -> Rule {
-    let mut rule = Rule::default();
-    if let Some(family) = spec.outer_family {
-        rule.family(family);
-    }
+fn outer_rules(spec: &NftSpec, incoming: bool) -> Vec<Rule> {
     match spec.mode {
-        Mode::Entry => {
-            let remote = spec.remote.expect("entry netfilter spec requires remote");
-            rule.address(remote.ip(), incoming);
-            rule.tcp();
-            rule.port(incoming, Operator::Equal, remote.port());
-            rule.port(!incoming, Operator::GreatherThanEqual, spec.base_port);
-            if incoming {
-                rule.interface(MetaKey::Iifname, Operator::NotEqual, &spec.tun_name);
-            }
-        }
+        Mode::Entry => spec
+            .remotes
+            .iter()
+            .map(|remote| {
+                let mut rule = Rule::default();
+                rule.family(OuterFamily::of(remote.ip()));
+                rule.address(remote.ip(), incoming);
+                rule.tcp();
+                rule.port(incoming, Operator::Equal, remote.port());
+                rule.port(!incoming, Operator::GreatherThanEqual, spec.base_port);
+                if incoming {
+                    rule.interface(MetaKey::Iifname, Operator::NotEqual, &spec.tun_name);
+                }
+                rule
+            })
+            .collect(),
         Mode::Exit => {
+            let mut rule = Rule::default();
+            if let Some(family) = spec.outer_family {
+                rule.family(family);
+            }
             if let Some(ip) = spec.listen_ip {
                 rule.address(ip, !incoming);
             }
@@ -217,9 +223,9 @@ fn outer(spec: &NftSpec, incoming: bool) -> Rule {
             } else if let Some(iface) = &spec.iface {
                 rule.interface(MetaKey::Oifname, Operator::Equal, iface);
             }
+            vec![rule]
         }
     }
-    rule
 }
 
 fn clamp(batch: &mut Batch, table: &str, chain: &str, key: MetaKey, tun: &str) {
@@ -309,17 +315,18 @@ pub(super) fn build(spec: &NftSpec, table_name: &str) -> io::Result<Batch> {
             -300,
             "filter",
         );
-        let mut incoming = outer(spec, true);
-        incoming.untyped_expression("notrack", vec![]);
-        incoming.expression(Expressions::Immediate(vec![
-            Immediate::DestinationRegister(REGISTER),
-            Immediate::Data(DataAttribute::Value(vec![libc::PACKET_OTHERHOST])),
-        ]));
-        incoming.expression(Expressions::Meta(vec![
-            Meta::Key(MetaKey::PacketType),
-            Meta::SourceRegister(REGISTER),
-        ]));
-        incoming.append(&mut batch, table_name, "prerouting");
+        for mut incoming in outer_rules(spec, true) {
+            incoming.untyped_expression("notrack", vec![]);
+            incoming.expression(Expressions::Immediate(vec![
+                Immediate::DestinationRegister(REGISTER),
+                Immediate::Data(DataAttribute::Value(vec![libc::PACKET_OTHERHOST])),
+            ]));
+            incoming.expression(Expressions::Meta(vec![
+                Meta::Key(MetaKey::PacketType),
+                Meta::SourceRegister(REGISTER),
+            ]));
+            incoming.append(&mut batch, table_name, "prerouting");
+        }
         chain(
             &mut batch,
             table_name,
@@ -328,19 +335,21 @@ pub(super) fn build(spec: &NftSpec, table_name: &str) -> io::Result<Batch> {
             -300,
             "filter",
         );
-        let mut rst = outer(spec, false);
-        rst.flags(0x04);
-        rst.meta(
-            MetaKey::Mark,
-            Operator::NotEqual,
-            SOCKET_MARK.to_ne_bytes().to_vec(),
-        );
-        rst.verdict(libc::NF_DROP as u32);
-        rst.append(&mut batch, table_name, "output");
-        let mut outgoing = outer(spec, false);
-        outgoing.untyped_expression("notrack", vec![]);
-        outgoing.verdict(libc::NF_ACCEPT as u32);
-        outgoing.append(&mut batch, table_name, "output");
+        for mut rst in outer_rules(spec, false) {
+            rst.flags(0x04);
+            rst.meta(
+                MetaKey::Mark,
+                Operator::NotEqual,
+                SOCKET_MARK.to_ne_bytes().to_vec(),
+            );
+            rst.verdict(libc::NF_DROP as u32);
+            rst.append(&mut batch, table_name, "output");
+        }
+        for mut outgoing in outer_rules(spec, false) {
+            outgoing.untyped_expression("notrack", vec![]);
+            outgoing.verdict(libc::NF_ACCEPT as u32);
+            outgoing.append(&mut batch, table_name, "output");
+        }
     } else {
         chain(
             &mut batch,

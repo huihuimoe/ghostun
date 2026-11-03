@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use crate::config::{Config, Mode};
 use crate::netfilter;
 use crate::sys::{self, route};
-use crate::transport::{self, budget, Outer};
+use crate::transport::{self, budget, EntryRoute, Outer};
 
 static STOP: AtomicBool = AtomicBool::new(false);
 static RELOAD: AtomicBool = AtomicBool::new(false);
@@ -30,25 +30,32 @@ fn interface_mtu(dev: &str) -> u32 {
 }
 
 fn resolve_outer(cfg: &Config) -> Result<Outer, String> {
-    if let Some(remote) = cfg.remote {
-        let route = route::route_to(remote.ip(), cfg.iface.as_deref())
-            .map_err(|e| format!("route to {remote}: {e}"))?;
-        let mtu = cfg.outer_mtu.unwrap_or_else(|| interface_mtu(&route.dev));
-        return Ok(Outer {
-            local_ip: route.src,
-            dev: Some(route.dev),
-            mtu,
-        });
-    }
+    let mut entry = Vec::with_capacity(cfg.remote.len());
     let mut devs = Vec::new();
-    for &family in cfg.socket_families() {
-        if let Some(dev) = cfg
-            .iface
-            .clone()
-            .or_else(|| route::default_route_dev(family).ok())
-        {
-            if !devs.contains(&dev) {
-                devs.push(dev);
+    if cfg.mode == Mode::Entry {
+        for r in &cfg.remote {
+            let route = route::route_to(r.address.ip(), cfg.iface.as_deref())
+                .map_err(|e| format!("route to {}: {e}", r.address))?;
+            if !devs.contains(&route.dev) {
+                devs.push(route.dev.clone());
+            }
+            entry.push(EntryRoute {
+                remote: r.address,
+                local_ip: route.src,
+                dev: route.dev,
+                conns: r.conns,
+            });
+        }
+    } else {
+        for &family in cfg.socket_families() {
+            if let Some(dev) = cfg
+                .iface
+                .clone()
+                .or_else(|| route::default_route_dev(family).ok())
+            {
+                if !devs.contains(&dev) {
+                    devs.push(dev);
+                }
             }
         }
     }
@@ -62,8 +69,8 @@ fn resolve_outer(cfg: &Config) -> Result<Outer, String> {
             })
     });
     Ok(Outer {
-        local_ip: cfg.exit_ip(),
-        dev: (devs.len() == 1).then(|| devs.pop().expect("single egress device")),
+        entry,
+        dev: (!devs.is_empty()).then(|| devs.join(",")),
         mtu,
     })
 }
@@ -95,9 +102,13 @@ pub fn run(mut cfg: Config) -> Result<(), String> {
     }
     let outer_endpoint = match cfg.mode {
         Mode::Entry => format!(
-            "outer {} -> {}",
-            outer.local_ip,
-            cfg.remote.expect("validated")
+            "outer {}",
+            outer
+                .entry
+                .iter()
+                .map(|e| format!("{} -> {} ({})", e.local_ip, e.remote, e.conns))
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
         Mode::Exit => format!(
             "listen {}",

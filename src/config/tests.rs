@@ -117,7 +117,7 @@ fn both_roles_require_an_auth_key() {
 fn key_validation_never_discloses_secret_material() {
     let key = "a7B9".repeat(16);
     for role in [
-        "mode = 'entry'\n[entry]\nremote = '192.0.2.1:443'",
+        "mode = 'entry'\n[entry]\nremote = [{ address = '192.0.2.1:443', conns = 1 }]",
         "mode = 'exit'\n[exit]\nlisten = 443",
     ] {
         let config = with_raw_file(
@@ -180,7 +180,13 @@ fn entry_defaults() {
         (Duration::from_secs(5), Duration::from_secs(15))
     );
     assert!(c.netfilter);
-    assert_eq!(c.remote, Some("203.0.113.9:443".parse().unwrap()));
+    assert_eq!(
+        c.remote,
+        vec![RemoteConfig {
+            address: "203.0.113.9:443".parse().unwrap(),
+            conns: c.conns,
+        }]
+    );
     assert_eq!(c.listen, None);
 }
 
@@ -191,7 +197,7 @@ fn exit_defaults() {
     assert_eq!(c.tun_ipv4.to_string(), "10.200.0.2/30");
     assert_eq!(c.tun_ipv6.unwrap().to_string(), "fd00:200::2/126");
     assert!(c.netfilter && c.masq);
-    assert_eq!((c.listen, c.remote), (Some(443), None));
+    assert_eq!((c.listen, c.remote.as_slice()), (Some(443), &[][..]));
     let c = with_file(
         "exit-no-masq",
         "mode = 'exit'\n[exit]\nlisten = 443\nno_masq = true\n",
@@ -279,28 +285,47 @@ fn toml_alone_selects_role() {
 
 #[test]
 fn cli_overrides_toml() {
-    let toml =
-        "dead_timeout = 30\ntun_name = \"fromfile\"\n[entry]\nremote = \"203.0.113.1:80\"\nconns = 2\n";
+    let toml = "dead_timeout = 30\ntun_name = \"fromfile\"\n[entry]\nremote = [{ address = \"203.0.113.1:80\", conns = 2 }]\n";
     let c = with_file(
         "override",
         toml,
-        &["entry", "--conns", "5", "--tun", "fromcli"],
+        &[
+            "entry",
+            "--remote",
+            "203.0.113.2:80",
+            "--conns",
+            "5",
+            "--tun",
+            "fromcli",
+        ],
     )
     .unwrap();
     assert_eq!(c.conns, 5);
     assert_eq!(c.tun_name, "fromcli");
     assert_eq!(c.tunables.dead_timeout, Duration::from_secs(30));
-    assert_eq!(c.remote, Some("203.0.113.1:80".parse().unwrap()));
+    assert_eq!(
+        c.remote,
+        vec![RemoteConfig {
+            address: "203.0.113.2:80".parse().unwrap(),
+            conns: 5,
+        }]
+    );
     let c = with_file(
         "override-file-mode",
         &format!("mode = \"entry\"\n{toml}"),
-        &["--conns", "7"],
+        &["--remote", "203.0.113.3:80", "--conns", "7"],
     )
     .unwrap();
     assert_eq!(
         (c.mode, c.conns, c.tun_name.as_str()),
         (Mode::Entry, 7, "fromfile")
     );
+    assert!(with_file(
+        "conns-without-cli-remote",
+        &format!("mode = \"entry\"\n{toml}"),
+        &["--conns", "7"]
+    )
+    .is_err());
 }
 
 #[test]
@@ -327,9 +352,13 @@ fn file_errors() {
         &[]
     )
     .is_err());
-    assert!(with_file("norole", "[entry]\nconns = 1\n", &[])
-        .unwrap_err()
-        .contains("missing role"));
+    assert!(with_file(
+        "norole",
+        "[entry]\nremote = [{ address = '1.2.3.4:5', conns = 1 }]\n",
+        &[]
+    )
+    .unwrap_err()
+    .contains("missing role"));
     assert!(with_file(
         "wrong-section-remote",
         "mode = \"exit\"\n[exit]\nlisten = 1\nremote = \"1.2.3.4:5\"\n",
@@ -343,21 +372,33 @@ fn file_errors() {
     )
     .is_err());
     assert!(with_file(
+        "entry-top-level-conns-rejected",
+        "mode = \"entry\"\n[entry]\nremote = [{ address = \"1.2.3.4:5\", conns = 1 }]\nconns = 2\n",
+        &[]
+    )
+    .is_err());
+    assert!(with_file(
+        "entry-scalar-remote-rejected",
+        "mode = \"entry\"\n[entry]\nremote = \"1.2.3.4:5\"\n",
+        &[]
+    )
+    .is_err());
+    assert!(with_file(
         "wrong-section-no-masq",
-        "mode = \"entry\"\n[entry]\nremote = \"1.2.3.4:5\"\nno_masq = true\n",
+        "mode = \"entry\"\n[entry]\nremote = [{ address = \"1.2.3.4:5\", conns = 1 }]\nno_masq = true\n",
         &[]
     )
     .is_err());
     // Inactive section still validates field names and types so typos fail closed.
     assert!(with_file(
         "inactive-exit-typo",
-        "[entry]\nremote = \"1.2.3.4:5\"\n[exit]\nlitsen = 443\n",
+        "[entry]\nremote = [{ address = \"1.2.3.4:5\", conns = 1 }]\n[exit]\nlitsen = 443\n",
         &["entry"]
     )
     .is_err());
     assert!(with_file(
         "inactive-exit-bad-type",
-        "[entry]\nremote = \"1.2.3.4:5\"\n[exit]\nlisten = \"not-a-port\"\n",
+        "[entry]\nremote = [{ address = \"1.2.3.4:5\", conns = 1 }]\n[exit]\nlisten = \"not-a-port\"\n",
         &["entry"]
     )
     .is_err());
@@ -375,8 +416,10 @@ fn shared_file_reads_only_global_and_active_role_section() {
 transport = 'tcp'
 tun_name = 'shared0'
 [entry]
-remote = '198.51.100.10:443'
-conns = 3
+remote = [
+    { address = '198.51.100.10:443', conns = 1 },
+    { address = '198.51.100.11:443', conns = 2 },
+]
 base_port = 41000
 tun_ipv4 = '10.210.0.1/30'
 tun_ipv6 = 'fd00:210::1/126'
@@ -397,7 +440,19 @@ cpus = '2,3'
     assert_eq!(entry_cfg.mode, Mode::Entry);
     assert_eq!(entry_cfg.transport, Transport::Tcp);
     assert_eq!(entry_cfg.tun_name, "shared0");
-    assert_eq!(entry_cfg.remote, Some("198.51.100.10:443".parse().unwrap()));
+    assert_eq!(
+        entry_cfg.remote,
+        vec![
+            RemoteConfig {
+                address: "198.51.100.10:443".parse().unwrap(),
+                conns: 1,
+            },
+            RemoteConfig {
+                address: "198.51.100.11:443".parse().unwrap(),
+                conns: 2,
+            },
+        ]
+    );
     assert_eq!(entry_cfg.listen, None);
     assert_eq!(entry_cfg.conns, 3);
     assert_eq!(entry_cfg.base_port, 41000);
@@ -414,7 +469,7 @@ cpus = '2,3'
     assert_eq!(exit_cfg.transport, Transport::Tcp);
     assert_eq!(exit_cfg.tun_name, "shared0");
     assert_eq!(exit_cfg.listen, Some(8443));
-    assert_eq!(exit_cfg.remote, None);
+    assert!(exit_cfg.remote.is_empty());
     assert_eq!(exit_cfg.conns, 0);
     assert_eq!(exit_cfg.outer_family, OuterMode::Ipv6);
     assert!(!exit_cfg.masq);
@@ -461,6 +516,30 @@ fn validation_errors() {
     assert!(entry(&["--conns", "0"]).is_err());
     assert!(entry(&["--conns", "255"]).is_ok());
     assert!(entry(&["--conns", "256"]).is_err());
+    assert!(with_file(
+        "empty-remote",
+        "mode = 'entry'\n[entry]\nremote = []\n",
+        &[]
+    )
+    .is_err());
+    assert!(with_file(
+        "zero-remote-conns",
+        "mode = 'entry'\n[entry]\nremote = [{ address = '1.2.3.4:443', conns = 0 }]\n",
+        &[]
+    )
+    .is_err());
+    assert!(with_file(
+        "duplicate-remote-address",
+        "mode = 'entry'\n[entry]\nremote = [{ address = '1.2.3.4:443', conns = 1 }, { address = '1.2.3.4:443', conns = 1 }]\n",
+        &[]
+    )
+    .is_err());
+    assert!(with_file(
+        "sum-conns-overflow",
+        "mode = 'entry'\n[entry]\nremote = [{ address = '1.2.3.4:443', conns = 200 }, { address = '1.2.3.5:443', conns = 56 }]\n",
+        &[]
+    )
+    .is_err());
     assert!(entry(&["--outer-mtu", "100"]).is_err());
     assert!(entry(&["--tun", "a-very-long-name0"])
         .unwrap_err()
@@ -499,7 +578,7 @@ fn outer_family_is_independent_of_inner_ipv6() {
     assert_eq!(c.outer_family, OuterMode::Ipv4);
     assert!(with_file(
         "entry-family",
-        "mode = 'entry'\n[entry]\nremote = '[2001:db8::1]:443'\nouter_family = 'ipv6'\n",
+        "mode = 'entry'\n[entry]\nremote = [{ address = '[2001:db8::1]:443', conns = 1 }]\nouter_family = 'ipv6'\n",
         &[]
     )
     .is_err());
@@ -542,8 +621,20 @@ fn mixed_preserves_policy_but_entry_opens_only_the_remote_family() {
         assert_eq!(c.resolve_tun_mtu(1500).unwrap(), 1440);
         assert_eq!(c.resolve_tun_mtu(1420).unwrap(), 1360);
         let spec = crate::netfilter::NftSpec::from_config(&c, 0);
-        assert_eq!(spec.outer_family, Some(family));
+        assert_eq!(spec.remotes, vec![remote.parse().unwrap()]);
     }
+    let dual = with_file(
+        "mixed-entry-remotes",
+        "mode = 'entry'\n[entry]\nremote = [{ address = '192.0.2.1:443', conns = 2 }, { address = '[2001:db8::1]:443', conns = 2 }]\n",
+        &[],
+    )
+    .unwrap();
+    assert_eq!(dual.outer_family, OuterMode::Mixed);
+    assert_eq!(
+        dual.socket_families(),
+        &[OuterFamily::Ipv4, OuterFamily::Ipv6]
+    );
+    assert_eq!(dual.resolve_tun_mtu(1500).unwrap(), 1440);
     let c = with_file(
         "mixed-exit",
         "mode = 'exit'\n[exit]\nlisten = 443\nouter_family = 'mixed'\n",
@@ -620,7 +711,7 @@ fn reload_updates_mutable_fields_and_rejects_immutable_or_invalid_changes() {
     std::fs::write(
         &path,
         format!(
-            "[global]\nmode = 'entry'\nauth_key = '{key1}'\nping_interval = 5\ndead_timeout = 15\n[entry]\nremote = '203.0.113.9:443'\nconns = 2\n"
+            "[global]\nmode = 'entry'\nauth_key = '{key1}'\nping_interval = 5\ndead_timeout = 15\n[entry]\nremote = [{{ address = '203.0.113.9:443', conns = 2 }}]\n"
         ),
     )
     .unwrap();
@@ -638,7 +729,7 @@ fn reload_updates_mutable_fields_and_rejects_immutable_or_invalid_changes() {
     std::fs::write(
         &path,
         format!(
-            "[global]\nmode = 'entry'\nauth_key = '{key2}'\nping_interval = 3\ndead_timeout = 12\n[entry]\nremote = '203.0.113.9:443'\nconns = 2\ncpus = '0,1'\n[exit]\nlisten = 8443\nno_masq = true\n"
+            "[global]\nmode = 'entry'\nauth_key = '{key2}'\nping_interval = 3\ndead_timeout = 12\n[entry]\nremote = [{{ address = '203.0.113.9:443', conns = 2 }}]\ncpus = '0,1'\n[exit]\nlisten = 8443\nno_masq = true\n"
         ),
     )
     .unwrap();
@@ -649,15 +740,24 @@ fn reload_updates_mutable_fields_and_rejects_immutable_or_invalid_changes() {
     assert_eq!(reloaded.tunables.cpus, Some(vec![0, 1]));
     assert_eq!(reloaded.base_port, 40000);
 
-    // Changing cpus when conns was omitted in TOML/CLI keeps the running conns.
+    // Changing cpus when --remote was given on the CLI without --conns keeps the running conns.
+    let cli_cfg = parse_from([
+        "ghostun",
+        "--config",
+        path.to_str().unwrap(),
+        "--remote",
+        "203.0.113.9:443",
+    ])
+    .unwrap();
+    assert_eq!(cli_cfg.conns, 2);
     std::fs::write(
         &path,
         format!(
-            "[global]\nmode = 'entry'\nauth_key = '{key2}'\nping_interval = 3\ndead_timeout = 12\n[entry]\nremote = '203.0.113.9:443'\ncpus = '0,1,2,3'\n"
+            "[global]\nmode = 'entry'\nauth_key = '{key2}'\nping_interval = 3\ndead_timeout = 12\n[entry]\nremote = [{{ address = '203.0.113.9:443', conns = 2 }}]\ncpus = '0,1,2,3'\n"
         ),
     )
     .unwrap();
-    let reloaded_cpus = reloaded.reload().unwrap();
+    let reloaded_cpus = cli_cfg.reload().unwrap();
     assert_eq!(reloaded_cpus.conns, 2);
     assert_eq!(reloaded_cpus.tunables.cpus, Some(vec![0, 1, 2, 3]));
 
@@ -669,18 +769,18 @@ fn reload_updates_mutable_fields_and_rejects_immutable_or_invalid_changes() {
 
     // Changing any immutable field is rejected.
     for bad_toml in [
-        format!("[global]\nmode = 'entry'\ntransport = 'tcp'\nauth_key = '{key2}'\n[entry]\nremote = '203.0.113.9:443'\nconns = 2\n"),
+        format!("[global]\nmode = 'entry'\ntransport = 'tcp'\nauth_key = '{key2}'\n[entry]\nremote = [{{ address = '203.0.113.9:443', conns = 2 }}]\n"),
         format!("[global]\nmode = 'exit'\nauth_key = '{key2}'\n[exit]\nlisten = 443\n"),
-        format!("[global]\nmode = 'entry'\nauth_key = '{key2}'\n[entry]\nremote = '203.0.113.10:443'\nconns = 2\n"),
-        format!("[global]\nmode = 'entry'\nauth_key = '{key2}'\n[entry]\nremote = '[2001:db8::1]:443'\nconns = 2\n"),
-        format!("[global]\nmode = 'entry'\nauth_key = '{key2}'\n[entry]\nremote = '203.0.113.9:443'\nconns = 4\n"),
-        format!("[global]\nmode = 'entry'\nauth_key = '{key2}'\ntun_name = 'gtun1'\n[entry]\nremote = '203.0.113.9:443'\nconns = 2\n"),
-        format!("[global]\nmode = 'entry'\nauth_key = '{key2}'\n[entry]\nremote = '203.0.113.9:443'\nconns = 2\ntun_ipv4 = '10.200.1.1/30'\n"),
-        format!("[global]\nmode = 'entry'\nauth_key = '{key2}'\n[entry]\nremote = '203.0.113.9:443'\nconns = 2\ntun_ipv6 = 'fd00:201::1/126'\n"),
-        format!("[global]\nmode = 'entry'\nauth_key = '{key2}'\n[entry]\nremote = '203.0.113.9:443'\nconns = 2\nouter_mtu = 1420\n"),
-        format!("[global]\nmode = 'entry'\nauth_key = '{key2}'\ntun_mtu = 1360\n[entry]\nremote = '203.0.113.9:443'\nconns = 2\n"),
-        format!("[global]\nmode = 'entry'\nauth_key = '{key2}'\n[entry]\nremote = '203.0.113.9:443'\nconns = 2\niface = 'eth9'\n"),
-        format!("[global]\nmode = 'entry'\nauth_key = '{key2}'\nno_netfilter = true\n[entry]\nremote = '203.0.113.9:443'\nconns = 2\n"),
+        format!("[global]\nmode = 'entry'\nauth_key = '{key2}'\n[entry]\nremote = [{{ address = '203.0.113.10:443', conns = 2 }}]\n"),
+        format!("[global]\nmode = 'entry'\nauth_key = '{key2}'\n[entry]\nremote = [{{ address = '[2001:db8::1]:443', conns = 2 }}]\n"),
+        format!("[global]\nmode = 'entry'\nauth_key = '{key2}'\n[entry]\nremote = [{{ address = '203.0.113.9:443', conns = 4 }}]\n"),
+        format!("[global]\nmode = 'entry'\nauth_key = '{key2}'\ntun_name = 'gtun1'\n[entry]\nremote = [{{ address = '203.0.113.9:443', conns = 2 }}]\n"),
+        format!("[global]\nmode = 'entry'\nauth_key = '{key2}'\n[entry]\nremote = [{{ address = '203.0.113.9:443', conns = 2 }}]\ntun_ipv4 = '10.200.1.1/30'\n"),
+        format!("[global]\nmode = 'entry'\nauth_key = '{key2}'\n[entry]\nremote = [{{ address = '203.0.113.9:443', conns = 2 }}]\ntun_ipv6 = 'fd00:201::1/126'\n"),
+        format!("[global]\nmode = 'entry'\nauth_key = '{key2}'\n[entry]\nremote = [{{ address = '203.0.113.9:443', conns = 2 }}]\nouter_mtu = 1420\n"),
+        format!("[global]\nmode = 'entry'\nauth_key = '{key2}'\ntun_mtu = 1360\n[entry]\nremote = [{{ address = '203.0.113.9:443', conns = 2 }}]\n"),
+        format!("[global]\nmode = 'entry'\nauth_key = '{key2}'\n[entry]\nremote = [{{ address = '203.0.113.9:443', conns = 2 }}]\niface = 'eth9'\n"),
+        format!("[global]\nmode = 'entry'\nauth_key = '{key2}'\nno_netfilter = true\n[entry]\nremote = [{{ address = '203.0.113.9:443', conns = 2 }}]\n"),
     ] {
         std::fs::write(&path, &bad_toml).unwrap();
         assert!(reloaded.reload().is_err(), "expected immutable change to fail: {bad_toml}");
@@ -718,7 +818,7 @@ fn reload_updates_mutable_fields_and_rejects_immutable_or_invalid_changes() {
     // When inner IPv6 was disabled at startup, reload remains compatible without false mismatch.
     std::fs::write(
         &path,
-        format!("[global]\nmode = 'entry'\nauth_key = '{key1}'\n[entry]\nremote = '203.0.113.9:443'\nconns = 2\n"),
+        format!("[global]\nmode = 'entry'\nauth_key = '{key1}'\n[entry]\nremote = [{{ address = '203.0.113.9:443', conns = 2 }}]\n"),
     )
     .unwrap();
     let mut no_v6_cfg = reloaded.clone();

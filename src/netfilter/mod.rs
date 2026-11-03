@@ -22,8 +22,8 @@ pub struct NftSpec {
     /// None matches both IP families in the inet table.
     pub outer_family: Option<OuterFamily>,
     pub tun_name: String,
-    /// Entry: exit node outer address.
-    pub remote: Option<SocketAddr>,
+    /// Entry: exit node outer addresses.
+    pub remotes: Vec<SocketAddr>,
     pub base_port: u16,
     pub listen_ip: Option<IpAddr>,
     pub listen_port: u16,
@@ -40,13 +40,10 @@ impl NftSpec {
         Self {
             mode: cfg.mode,
             transport: cfg.transport,
-            outer_family: if cfg.mode == Mode::Exit && cfg.outer_family == OuterMode::Mixed {
-                None
-            } else {
-                Some(cfg.socket_families()[0])
-            },
+            outer_family: (cfg.outer_family != OuterMode::Mixed)
+                .then(|| cfg.outer_family.families()[0]),
             tun_name: cfg.tun_name.clone(),
-            remote: cfg.remote,
+            remotes: cfg.remote.iter().map(|r| r.address).collect(),
             base_port: cfg.base_port,
             listen_ip: cfg.listen_ip,
             listen_port,

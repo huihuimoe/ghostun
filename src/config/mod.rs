@@ -165,6 +165,14 @@ impl<'de> Deserialize<'de> for ListenSpec {
     }
 }
 
+/// Entry remote endpoint and its worker connection count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteConfig {
+    pub address: SocketAddr,
+    pub conns: u16,
+}
+
 /// Settings that running workers apply on reload; changing any other `Config` field requires a restart.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Tunables {
@@ -192,8 +200,8 @@ pub struct Config {
     pub base_port: u16,
     pub netfilter: bool,
     pub masq: bool,
-    /// Exit node outer address; `Some` exactly in entry mode.
-    pub remote: Option<SocketAddr>,
+    /// Exit node outer endpoints and per-endpoint connection counts; non-empty in entry mode.
+    pub remote: Vec<RemoteConfig>,
     /// Outer listen port; `Some` exactly in exit mode.
     pub listen: Option<u16>,
     /// Optional specific outer listen IP in exit mode (`None` means wildcard).
@@ -213,19 +221,11 @@ impl Config {
         }
     }
 
-    /// Initial exit address; mixed sessions learn the concrete local address at admission.
-    pub fn exit_ip(&self) -> IpAddr {
-        self.listen_ip
-            .unwrap_or_else(|| self.outer_family.families()[0].unspecified())
-    }
-
-    /// Entry opens only its remote's family, even when mixed reserves IPv6 overhead.
+    /// Entry opens only the families present in `remote`, even when `mixed` reserves IPv6 overhead.
     pub fn socket_families(&self) -> &[OuterFamily] {
-        match self.remote {
-            Some(remote) if remote.is_ipv4() => &[OuterFamily::Ipv4],
-            Some(_) => &[OuterFamily::Ipv6],
-            None => self.outer_family.families(),
-        }
+        remote_mode(&self.remote)
+            .unwrap_or(self.outer_family)
+            .families()
     }
 
     pub fn resolve_tun_mtu(&self, outer_mtu: u32) -> Result<u32, String> {
@@ -367,8 +367,7 @@ struct GlobalFile {
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct EntryFile {
-    remote: Option<SocketAddr>,
-    conns: Option<u16>,
+    remote: Option<Vec<RemoteConfig>>,
     outer_family: Option<OuterMode>,
     base_port: Option<u16>,
     tun_ipv4: Option<String>,
@@ -454,34 +453,26 @@ fn build_config(cli: Cli, running_conns: Option<u16>) -> Result<Config, String> 
         Mode::Entry => (file.entry, ExitFile::default()),
         Mode::Exit => (EntryFile::default(), file.exit),
     };
-    let remote = cli.remote.or(entry.remote);
     let listen_spec = cli.listen.or(exit.listen);
     let listen = listen_spec.map(|l| l.port);
     let listen_ip = listen_spec.and_then(|l| l.ip);
     let listen_family = listen_spec.and_then(|l| l.family);
-    let outer_family = cli
-        .outer_family
-        .or(entry.outer_family)
-        .or(exit.outer_family);
-    if mode == Mode::Entry && outer_family.is_some_and(|f| f != OuterMode::Mixed) {
-        return Err("entry accepts only explicit `outer_family = mixed`; otherwise it uses the remote address family".into());
-    }
-    if let (Some(explicit), Some(inferred)) = (outer_family, listen_family) {
-        if explicit != OuterMode::from(inferred) {
-            return Err("`outer_family` conflicts with `listen` address family; mixed requires a bare listen port".into());
-        }
-    }
-    let outer_family = outer_family
-        .or_else(|| remote.map(|r| OuterFamily::of(r.ip()).into()))
-        .or_else(|| listen_family.map(Into::into))
-        .unwrap_or_default();
     let no_masq = cli.no_masq || exit.no_masq;
-    let conns = cli.conns.or(entry.conns);
     match mode {
         Mode::Entry if listen.is_some() => return Err("`listen` is only valid in exit mode".into()),
         Mode::Entry if no_masq => return Err("`no_masq` is only valid in exit mode".into()),
-        Mode::Exit if remote.is_some() => return Err("`remote` is only valid in entry mode".into()),
-        Mode::Exit if conns.is_some() => return Err("`conns` is only valid in entry mode".into()),
+        Mode::Entry if cli.remote.is_none() && cli.conns.is_some() => {
+            return Err(
+                "`--conns` requires `--remote` on the CLI; configure `conns` per `entry.remote` item in TOML"
+                    .into(),
+            )
+        }
+        Mode::Exit if cli.remote.is_some() => {
+            return Err("`remote` is only valid in entry mode".into())
+        }
+        Mode::Exit if cli.conns.is_some() => {
+            return Err("`conns` is only valid in entry mode".into())
+        }
         _ => {}
     }
     let (v4_default, v6_default) = match mode {
@@ -520,6 +511,30 @@ fn build_config(cli: Cli, running_conns: Option<u16>) -> Result<Config, String> 
             |c| c.len().min(MAX_CONNS) as u16,
         )
     });
+    let remote = match cli.remote {
+        Some(address) => vec![RemoteConfig {
+            address,
+            conns: cli.conns.unwrap_or(default_conns),
+        }],
+        None => entry.remote.unwrap_or_default(),
+    };
+    let total_conns: u32 = remote.iter().map(|r| u32::from(r.conns)).sum();
+    let outer_family = cli
+        .outer_family
+        .or(entry.outer_family)
+        .or(exit.outer_family);
+    if mode == Mode::Entry && outer_family.is_some_and(|f| f != OuterMode::Mixed) {
+        return Err("entry accepts only explicit `outer_family = mixed`; otherwise it uses the remote address family".into());
+    }
+    if let (Some(explicit), Some(inferred)) = (outer_family, listen_family) {
+        if explicit != OuterMode::from(inferred) {
+            return Err("`outer_family` conflicts with `listen` address family; mixed requires a bare listen port".into());
+        }
+    }
+    let outer_family = outer_family
+        .or_else(|| remote_mode(&remote))
+        .or_else(|| listen_family.map(Into::into))
+        .unwrap_or_default();
     let cfg = Config {
         transport: cli.transport.or(global.transport).unwrap_or_default(),
         tcp_notsent: cli
@@ -553,7 +568,7 @@ fn build_config(cli: Cli, running_conns: Option<u16>) -> Result<Config, String> 
         tun_ipv4,
         tun_ipv6,
         conns: if mode == Mode::Entry {
-            conns.unwrap_or(default_conns)
+            total_conns.min(u32::from(u16::MAX)) as u16
         } else {
             0
         },
@@ -571,6 +586,18 @@ fn build_config(cli: Cli, running_conns: Option<u16>) -> Result<Config, String> 
     };
     validate(&cfg)?;
     Ok(cfg)
+}
+
+fn remote_mode(remote: &[RemoteConfig]) -> Option<OuterMode> {
+    match (
+        remote.iter().any(|r| r.address.is_ipv4()),
+        remote.iter().any(|r| r.address.is_ipv6()),
+    ) {
+        (true, true) => Some(OuterMode::Mixed),
+        (true, false) => Some(OuterMode::Ipv4),
+        (false, true) => Some(OuterMode::Ipv6),
+        (false, false) => None,
+    }
 }
 
 fn ensure_reload_compatible(old: &Config, new: &Config) -> Result<(), String> {
@@ -670,12 +697,22 @@ fn validate(c: &Config) -> Result<(), String> {
     }
     match c.mode {
         Mode::Entry => {
+            if c.remote.is_empty() {
+                return Err("entry mode requires `remote`".into());
+            }
+            for (i, r) in c.remote.iter().enumerate() {
+                if r.address.port() == 0 {
+                    return Err("`remote` port must not be 0".into());
+                }
+                if r.conns == 0 {
+                    return Err("each `remote` entry requires `conns >= 1`".into());
+                }
+                if c.remote[..i].iter().any(|prev| prev.address == r.address) {
+                    return Err(format!("duplicate `remote` address {}", r.address));
+                }
+            }
             if !(1..=MAX_CONNS as u16).contains(&c.conns) {
                 return Err(format!("`conns` must be within 1..={MAX_CONNS}"));
-            }
-            let remote = c.remote.ok_or("entry mode requires `remote` (IP:PORT)")?;
-            if remote.port() == 0 {
-                return Err("`remote` port must not be 0".into());
             }
             if c.transport == Transport::Faketcp
                 && (c.base_port < 1024 || u32::from(c.base_port) + u32::from(c.conns) > 65535)

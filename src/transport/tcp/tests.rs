@@ -9,9 +9,9 @@ use super::auth::{Handshake, Params};
 use super::frame::{Receive, PING, TX_LIMIT};
 use super::listener::{Candidate, ExitState, SharedExitState};
 use super::queue::SendQueue;
-use super::worker::Backoff;
 use super::*;
 use crate::config::{AuthKey, MAX_CONNS};
+use crate::transport::control::Backoff;
 
 fn params() -> Params {
     Params {
@@ -382,12 +382,12 @@ fn attempt_deadline_is_absolute_and_jitter_backoff_resets_only_after_stability()
     assert!(c
         .authenticate(start + Duration::from_secs(4), Duration::from_secs(4))
         .is_err());
-    let mut b = Backoff { failures: 0 };
-    for base in [1, 2, 4, 8, 15, 15, 15] {
+    let mut b = Backoff::default();
+    for base in [1, 2, 4, 8, 15, 30, 30, 30] {
         let d = b.delay(0, false);
         assert_eq!(d, Duration::from_millis(base * 500));
     }
-    assert!(b.delay(u32::MAX, false).as_millis() <= 15000);
+    assert!(b.delay(u32::MAX, false).as_millis() <= 30000);
     assert_eq!(b.delay(0, true), Duration::from_millis(500));
     assert_eq!(b.delay(0, false), Duration::from_secs(1));
 }

@@ -1,5 +1,6 @@
 //! Per-core TCP worker: connects (entry) or adopts dispatched connections (exit) and pumps its TUN queue.
 
+use std::net::SocketAddr;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -8,35 +9,23 @@ use super::auth::{Handshake, Params};
 use super::{can_io, Connection, BATCH, ROUNDS};
 use crate::config::{Config, Mode};
 use crate::sys::{self, poll, poll_ms, pollfd, READ_READY};
-use crate::transport::control;
-
-pub(super) struct Backoff {
-    pub(super) failures: u32,
-}
-impl Backoff {
-    pub(super) fn delay(&mut self, sample: u32, stable: bool) -> Duration {
-        if stable {
-            self.failures = 0;
-        }
-        let base = [1, 2, 4, 8, 15][self.failures.min(4) as usize];
-        self.failures = self.failures.saturating_add(1);
-        Duration::from_millis(base * 500 + u64::from(sample) % (base * 500 + 1))
-    }
-}
+use crate::transport::control::{self, Backoff};
 
 pub struct Worker {
     id: usize,
     cfg: Config,
+    remote: Option<SocketAddr>,
     mtu: u16,
     tun: OwnedFd,
     initial: Option<Connection>,
 }
 
 impl Worker {
-    pub fn new_entry(id: usize, cfg: Config, mtu: u16, tun: OwnedFd) -> Self {
+    pub fn new_entry(id: usize, cfg: Config, remote: SocketAddr, mtu: u16, tun: OwnedFd) -> Self {
         Self {
             id,
             cfg,
+            remote: Some(remote),
             mtu,
             tun,
             initial: None,
@@ -47,6 +36,7 @@ impl Worker {
         Self {
             id,
             cfg,
+            remote: None,
             mtu,
             tun,
             initial: Some(conn),
@@ -66,7 +56,7 @@ impl Worker {
             control::sync_tun_queue(id, self.tun.as_fd(), &mut attached, true);
         }
         let mut retry_at = Instant::now();
-        let mut backoff = Backoff { failures: 0 };
+        let mut backoff = Backoff::default();
         let mut packet = vec![0; self.mtu as usize + 1];
         let mut fds = [
             pollfd(-1, 0),
@@ -98,7 +88,7 @@ impl Worker {
             }
             let mut now = Instant::now();
             if connection.is_none() && self.cfg.mode == Mode::Entry && now >= retry_at {
-                let remote = self.cfg.remote.unwrap();
+                let remote = self.remote.expect("entry worker has remote");
                 let result = sys::tcp::connect(remote, self.cfg.iface.as_deref()).and_then(|s| {
                     let mut c = Connection::new(s, remote, now, self.cfg.tcp_notsent)?;
                     let (auth, hello) = Handshake::entry(
@@ -134,6 +124,7 @@ impl Worker {
                             .map(|ready| {
                                 if ready {
                                     c.establish(self.mtu);
+                                    backoff.reset();
                                     log::info!("worker {id}: established {c}");
                                 }
                             })
@@ -152,20 +143,24 @@ impl Worker {
                     .map(|more| busy = more)
                 };
                 if let Err(e) = result {
-                    let stable =
-                        c.auth.is_none() && c.since.elapsed() >= self.cfg.tunables.dead_timeout;
+                    let was_established = c.auth.is_none();
                     log::warn!(
                         "worker {id}: {} ({c}): {e}",
-                        if c.auth.is_some() {
-                            "connection/authentication failure"
-                        } else {
+                        if was_established {
                             "connection closed"
+                        } else {
+                            "connection/authentication failure"
                         }
                     );
                     connection = None;
                     fds[1] = pollfd(-1, 0);
                     if self.cfg.mode == Mode::Entry {
-                        retry_at = self.retry(&mut backoff, stable);
+                        retry_at = if was_established {
+                            backoff.reset();
+                            Instant::now()
+                        } else {
+                            self.retry(&mut backoff, false)
+                        };
                     } else {
                         break;
                     }

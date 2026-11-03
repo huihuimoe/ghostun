@@ -440,20 +440,24 @@ impl Worker {
     pub fn new_entry(
         id: usize,
         cfg: &Config,
-        local_ip: IpAddr,
-        outer_dev: Option<&str>,
+        route: &crate::transport::EntryRoute,
         outer_mtu: u32,
         tun: OwnedFd,
         seed: u64,
     ) -> Result<Self, String> {
         let worker = id as u16;
-        let remote = cfg.remote.expect("validated");
-        let family = OuterFamily::of(remote.ip());
-        let filter = entry_filter(remote, cfg.base_port, cfg.conns, worker);
-        let fd = raw::socket(family, outer_dev, &filter, Some((local_ip, remote.ip())))
-            .map_err(|e| format!("{family:?} raw socket: {e}"))?;
+        let family = OuterFamily::of(route.remote.ip());
+        let filter = entry_filter(route.remote, cfg.base_port, cfg.conns, worker);
+        let fd = raw::socket(
+            family,
+            Some(&route.dev),
+            &filter,
+            Some((route.local_ip, route.remote.ip())),
+        )
+        .map_err(|e| format!("{family:?} raw socket: {e}"))?;
         let mss = (outer_mtu - cfg.outer_family.overhead() as u32) as u16;
-        let scfg = SessionConfig::from_config(cfg, local_ip, 0, worker, mss);
+        let scfg =
+            SessionConfig::from_config(cfg, route.local_ip, Some(route.remote), 0, worker, mss);
         let session = Session::new(scfg, Instant::now(), seed ^ (u64::from(worker) << 48))
             .map_err(|e| format!("initializing worker {worker} authentication: {e}"))?;
         Ok(Self {
@@ -483,8 +487,14 @@ impl Worker {
             .map_err(|e| format!("{family:?} raw socket: {e}"))?;
         let socket = (family, fd);
         let mss = (outer_mtu - cfg.outer_family.overhead() as u32) as u16;
-        let scfg =
-            SessionConfig::from_config(cfg, promo.local.ip(), promo.local.port(), worker, mss);
+        let scfg = SessionConfig::from_config(
+            cfg,
+            promo.local.ip(),
+            None,
+            promo.local.port(),
+            worker,
+            mss,
+        );
         state.lock().unwrap().active[id] = Some(ActivePeer {
             local: promo.local,
             peer: promo.peer,

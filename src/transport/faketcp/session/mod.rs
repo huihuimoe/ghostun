@@ -12,6 +12,7 @@ use super::auth::{self, Auth, EntryStep, ExitStep, FINISHED_LEN, HELLO_LEN, PROO
 use super::frame::{self, flags, TcpMeta, MAX_OVERHEAD};
 use crate::config::{AuthKey, Config, Mode};
 use crate::net::{ipv4, ipv6, OuterFamily};
+use crate::transport::control::Backoff;
 use crate::transport::keepalive::{self, Keepalive};
 
 /// Control frames use a first byte whose high nibble is 0, which no IPv4 (4) or IPv6 (6) packet can have.
@@ -63,6 +64,7 @@ impl SessionConfig {
     pub fn from_config(
         cfg: &Config,
         local_ip: IpAddr,
+        remote: Option<SocketAddr>,
         listen_port: u16,
         worker: u16,
         mss: u16,
@@ -71,7 +73,7 @@ impl SessionConfig {
             mode: cfg.mode,
             auth_key: cfg.tunables.auth_key.clone(),
             local_ip,
-            remote: cfg.remote,
+            remote,
             listen_port,
             worker,
             conns: cfg.conns,
@@ -125,6 +127,8 @@ pub struct Session {
     last_rx: Instant,
     next_ping: Instant,
     next_syn: Instant,
+    retransmits: u32,
+    backoff: Backoff,
     ip_id: u16,
     rng: u64,
     nonce: u64,
@@ -164,6 +168,8 @@ impl Session {
             last_rx: now,
             next_ping: now,
             next_syn: now,
+            retransmits: 0,
+            backoff: Backoff::default(),
             ip_id: seed as u16,
             rng: seed ^ 0x9e37_79b9_7f4a_7c15,
             nonce: 0,
@@ -195,6 +201,8 @@ impl Session {
             last_rx: now,
             next_ping: now,
             next_syn: now,
+            retransmits: 0,
+            backoff: Backoff::default(),
             ip_id: seed as u16,
             rng: seed ^ 0x9e37_79b9_7f4a_7c15,
             nonce: 0,
@@ -258,12 +266,10 @@ impl Session {
             return false;
         }
         self.cfg.auth_key = auth_key;
+        self.backoff.reset();
         match self.cfg.mode {
-            Mode::Entry => {
-                if self.state != State::Closed {
-                    self.reconnect(now, true, out);
-                }
-            }
+            Mode::Entry if self.state == State::Closed => self.connect(now, out),
+            Mode::Entry => self.reconnect(now, true, out),
             Mode::Exit => self.shutdown(out),
         }
         was_established
@@ -326,14 +332,7 @@ impl Session {
         if matches!(self.state, State::SynSent | State::Authenticating)
             && now.duration_since(self.last_rx) >= self.cfg.dead_timeout
         {
-            log::warn!(
-                "worker {}: handshake timed out after {:?} ({} <-> {}), reconnecting",
-                self.cfg.worker,
-                self.cfg.dead_timeout,
-                self.local,
-                m.src
-            );
-            self.reconnect(now, true, out);
+            self.fail_attempt(now, out);
             return None;
         }
         if m.flags & flags::RST != 0 {
@@ -360,7 +359,7 @@ impl Session {
                 self.state = State::Authenticating;
                 self.send_ctrl(flags::ACK, &[], out);
                 self.snd_nxt = self.snd_nxt.wrapping_add(HELLO_LEN as u32);
-                self.next_syn = now + SYN_RETRY;
+                self.reset_retransmit(now);
                 self.send_pending(out);
             }
             return None;
@@ -447,22 +446,18 @@ impl Session {
         match (self.cfg.mode, self.state) {
             (Mode::Entry, State::Closed) if now >= self.next_syn => self.connect(now, out),
             (_, State::Closed) => {}
-            (Mode::Entry, _) if dead => {
+            (Mode::Entry, State::Established) if dead => {
                 let peer = self.peer.expect("entry has remote");
                 log::warn!(
-                    "worker {}: {} {:?} ({} <-> {}), reconnecting",
+                    "worker {}: peer silent for {:?} ({} <-> {}), reconnecting",
                     self.cfg.worker,
-                    if self.state == State::Established {
-                        "peer silent for"
-                    } else {
-                        "handshake timed out after"
-                    },
                     self.cfg.dead_timeout,
                     self.local,
                     peer
                 );
                 self.reconnect(now, true, out);
             }
+            (Mode::Entry, _) if dead => self.fail_attempt(now, out),
             (Mode::Exit, _) if dead => {
                 if let Some(peer) = self.peer {
                     log::warn!(
@@ -476,11 +471,11 @@ impl Session {
                 self.close(out);
             }
             (Mode::Entry, State::SynSent) if now >= self.next_syn => {
-                self.next_syn = now + SYN_RETRY;
+                self.advance_retransmit(now);
                 self.send_syn(out);
             }
             (Mode::Entry, State::Authenticating) if now >= self.next_syn => {
-                self.next_syn = now + SYN_RETRY;
+                self.advance_retransmit(now);
                 self.send_pending(out);
             }
             (_, State::Established) if now >= self.next_ping => {
@@ -529,6 +524,8 @@ impl Session {
         self.state = State::Established;
         self.last_rx = now;
         self.unacked = 0;
+        self.retransmits = 0;
+        self.backoff.reset();
         self.next_ping = now + self.cfg.ping_interval;
         log::info!(
             "worker {}: established {} <-> {}",
@@ -606,7 +603,7 @@ impl Session {
             Some(EntryStep::SendProof { rcv_nxt, snd_nxt }) => {
                 self.rcv_nxt = rcv_nxt;
                 self.snd_nxt = snd_nxt;
-                self.next_syn = now + SYN_RETRY;
+                self.reset_retransmit(now);
                 self.send_pending(out);
             }
             Some(EntryStep::Established { rcv_nxt }) => {
@@ -698,6 +695,18 @@ impl Session {
         self.generation = self.generation.wrapping_add(1);
         out.reset();
     }
+    #[inline]
+    fn reset_retransmit(&mut self, now: Instant) {
+        self.retransmits = 0;
+        self.next_syn = now + SYN_RETRY;
+    }
+
+    #[inline]
+    fn advance_retransmit(&mut self, now: Instant) {
+        self.retransmits = self.retransmits.saturating_add(1);
+        let secs = 1u64 << self.retransmits.min(3);
+        self.next_syn = now + Duration::from_secs(secs);
+    }
 
     fn connect(&mut self, now: Instant, out: &mut impl Sink) {
         self.generation = self.generation.wrapping_add(1);
@@ -706,7 +715,8 @@ impl Session {
         if let Err(e) = self.auth.begin_entry(self.cfg.worker, snd_nxt) {
             log::error!("worker {}: authentication randomness: {e}", self.cfg.worker);
             self.close(out);
-            self.next_syn = now + SYN_RETRY;
+            let sample = self.next_isn();
+            self.next_syn = now + self.backoff.delay(sample, false);
             return;
         }
         self.iss = iss;
@@ -714,15 +724,11 @@ impl Session {
         self.rcv_nxt = 0;
         self.state = State::SynSent;
         self.last_rx = now;
-        self.next_syn = now + SYN_RETRY;
+        self.reset_retransmit(now);
         self.send_syn(out);
     }
 
-    fn reconnect(&mut self, now: Instant, send_rst: bool, out: &mut impl Sink) {
-        self.reset_output(out);
-        if send_rst {
-            self.send_rsts(out);
-        }
+    fn rotate_port(&mut self) {
         let (first, count) = port_pool(&self.cfg);
         let last = first + (count - 1) * self.cfg.conns;
         let port = self.local.port();
@@ -736,6 +742,36 @@ impl Session {
             "worker {}: rotating source port {port} -> {next}",
             self.cfg.worker
         );
+    }
+
+    fn fail_attempt(&mut self, now: Instant, out: &mut impl Sink) {
+        let peer = self.peer.expect("entry has remote");
+        log::warn!(
+            "worker {}: handshake timed out after {:?} ({} <-> {}), backing off",
+            self.cfg.worker,
+            self.cfg.dead_timeout,
+            self.local,
+            peer
+        );
+        self.reset_output(out);
+        self.send_rsts(out);
+        self.rotate_port();
+        self.close_state();
+        let sample = self.next_isn();
+        let delay = self.backoff.delay(sample, false);
+        self.next_syn = now + delay;
+        log::info!(
+            "worker {}: retry in {:.3}s",
+            self.cfg.worker,
+            delay.as_secs_f64()
+        );
+    }
+    fn reconnect(&mut self, now: Instant, send_rst: bool, out: &mut impl Sink) {
+        self.reset_output(out);
+        if send_rst {
+            self.send_rsts(out);
+        }
+        self.rotate_port();
         self.connect(now, out);
     }
 

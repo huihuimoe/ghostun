@@ -12,6 +12,27 @@ pub struct Reload {
     pub cpu: Option<usize>,
 }
 
+/// Bounded exponential retry backoff with uniform `[base / 2, base]` jitter (`0.5s..=30s`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Backoff {
+    pub failures: u32,
+}
+
+impl Backoff {
+    pub fn reset(&mut self) {
+        self.failures = 0;
+    }
+
+    pub fn delay(&mut self, sample: u32, reset: bool) -> std::time::Duration {
+        if reset {
+            self.failures = 0;
+        }
+        let base = [1, 2, 4, 8, 15, 30][self.failures.min(5) as usize];
+        self.failures = self.failures.saturating_add(1);
+        std::time::Duration::from_millis(base * 500 + u64::from(sample) % (base * 500 + 1))
+    }
+}
+
 pub struct CoreTable {
     cores: Vec<(usize, usize)>,
 }
