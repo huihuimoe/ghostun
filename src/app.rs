@@ -118,31 +118,18 @@ pub fn run(mut cfg: Config) -> Result<(), String> {
         Some(v6) => format!("{}, {v6}", cfg.tun_ipv4),
         None => cfg.tun_ipv4.to_string(),
     };
-    match cfg.mode {
-        Mode::Entry => log::info!(
-            "{:?} {:?} mode: {} via {} (mtu {}), tun {} {} (mtu {}), {} conns",
-            cfg.transport,
-            cfg.mode,
-            outer_endpoint,
-            outer.dev.as_deref().unwrap_or("?"),
-            outer.mtu,
-            cfg.tun_name,
-            tun_addrs,
-            tun_mtu,
-            cfg.conns
-        ),
-        Mode::Exit => log::info!(
-            "{:?} {:?} mode: {} via {} (mtu {}), tun {} {} (mtu {})",
-            cfg.transport,
-            cfg.mode,
-            outer_endpoint,
-            outer.dev.as_deref().unwrap_or("?"),
-            outer.mtu,
-            cfg.tun_name,
-            tun_addrs,
-            tun_mtu
-        ),
-    }
+    let conns_suffix = match cfg.mode {
+        Mode::Entry => format!(", {} conns", cfg.conns),
+        Mode::Exit => String::new(),
+    };
+    log::info!(
+        "{:?} {:?} mode: {outer_endpoint} via {} (mtu {}), tun {} {tun_addrs} (mtu {tun_mtu}){conns_suffix}",
+        cfg.transport,
+        cfg.mode,
+        outer.dev.as_deref().unwrap_or("?"),
+        outer.mtu,
+        cfg.tun_name,
+    );
     // Rules go in before sockets exist so the kernel never RSTs our first handshake.
     let guard = if cfg.netfilter {
         let spec = netfilter::NftSpec::from_config(&cfg, listen_port);

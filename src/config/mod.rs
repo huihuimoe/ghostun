@@ -335,30 +335,57 @@ struct Cli {
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct File {
-    transport: Option<Transport>,
-    tcp_notsent: Option<u32>,
+    #[serde(default)]
+    global: GlobalFile,
+    #[serde(default)]
+    entry: EntryFile,
+    #[serde(default)]
+    exit: ExitFile,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct GlobalFile {
     mode: Option<Mode>,
     auth_key: Option<String>,
+    transport: Option<Transport>,
+    tcp_notsent: Option<u32>,
     tun_name: Option<String>,
-    tun_ipv4: Option<String>,
-    tun_ipv6: Option<String>,
-    conns: Option<u16>,
-    cpus: Option<String>,
-    outer_mtu: Option<u32>,
+    #[serde(default)]
+    no_ipv6: bool,
     tun_mtu: Option<u32>,
-    iface: Option<String>,
-    base_port: Option<u16>,
     ping_interval: Option<u64>,
     dead_timeout: Option<u64>,
     #[serde(default)]
-    no_ipv6: bool,
-    #[serde(default)]
     no_netfilter: bool,
-    #[serde(default)]
-    no_masq: bool,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct EntryFile {
     remote: Option<SocketAddr>,
+    conns: Option<u16>,
+    outer_family: Option<OuterMode>,
+    base_port: Option<u16>,
+    tun_ipv4: Option<String>,
+    tun_ipv6: Option<String>,
+    outer_mtu: Option<u32>,
+    iface: Option<String>,
+    cpus: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct ExitFile {
     listen: Option<ListenSpec>,
     outer_family: Option<OuterMode>,
+    #[serde(default)]
+    no_masq: bool,
+    tun_ipv4: Option<String>,
+    tun_ipv6: Option<String>,
+    outer_mtu: Option<u32>,
+    iface: Option<String>,
+    cpus: Option<String>,
 }
 
 pub fn load() -> Result<Config, String> {
@@ -409,21 +436,29 @@ fn build_config(cli: Cli, running_conns: Option<u16>) -> Result<Config, String> 
         }
         None => File::default(),
     };
+    let global = file.global;
     let mode = cli
         .role
-        .or(file.mode)
-        .ok_or("missing role: use `entry`/`exit` or set `mode` in the config file")?;
-    if cli.role.is_some() && file.mode.is_some_and(|m| m != mode) {
+        .or(global.mode)
+        .ok_or("missing role: use `entry`/`exit` or set `global.mode` in the config file")?;
+    if cli.role.is_some() && global.mode.is_some_and(|m| m != mode) {
         return Err(format!(
-            "role {mode:?} conflicts with `mode` in the config file"
+            "role {mode:?} conflicts with `global.mode` in the config file"
         ));
     }
-    let remote = cli.remote.or(file.remote);
-    let listen_spec = cli.listen.or(file.listen);
+    let (entry, exit) = match mode {
+        Mode::Entry => (file.entry, ExitFile::default()),
+        Mode::Exit => (EntryFile::default(), file.exit),
+    };
+    let remote = cli.remote.or(entry.remote);
+    let listen_spec = cli.listen.or(exit.listen);
     let listen = listen_spec.map(|l| l.port);
     let listen_ip = listen_spec.and_then(|l| l.ip);
     let listen_family = listen_spec.and_then(|l| l.family);
-    let outer_family = cli.outer_family.or(file.outer_family);
+    let outer_family = cli
+        .outer_family
+        .or(entry.outer_family)
+        .or(exit.outer_family);
     if mode == Mode::Entry && outer_family.is_some_and(|f| f != OuterMode::Mixed) {
         return Err("entry accepts only explicit `outer_family = mixed`; otherwise it uses the remote address family".into());
     }
@@ -436,8 +471,8 @@ fn build_config(cli: Cli, running_conns: Option<u16>) -> Result<Config, String> 
         .or_else(|| remote.map(|r| OuterFamily::of(r.ip()).into()))
         .or_else(|| listen_family.map(Into::into))
         .unwrap_or_default();
-    let no_masq = cli.no_masq || file.no_masq;
-    let conns = cli.conns.or(file.conns);
+    let no_masq = cli.no_masq || exit.no_masq;
+    let conns = cli.conns.or(entry.conns);
     match mode {
         Mode::Entry if listen.is_some() => return Err("`listen` is only valid in exit mode".into()),
         Mode::Entry if no_masq => return Err("`no_masq` is only valid in exit mode".into()),
@@ -452,16 +487,18 @@ fn build_config(cli: Cli, running_conns: Option<u16>) -> Result<Config, String> 
     let tun_ipv4 = cli
         .tun_ipv4
         .as_deref()
-        .or(file.tun_ipv4.as_deref())
+        .or(entry.tun_ipv4.as_deref())
+        .or(exit.tun_ipv4.as_deref())
         .unwrap_or(v4_default)
         .parse()?;
-    let tun_ipv6 = if cli.no_ipv6 || file.no_ipv6 {
+    let tun_ipv6 = if cli.no_ipv6 || global.no_ipv6 {
         None
     } else {
         Some(
             cli.tun_ipv6
                 .as_deref()
-                .or(file.tun_ipv6.as_deref())
+                .or(entry.tun_ipv6.as_deref())
+                .or(exit.tun_ipv6.as_deref())
                 .unwrap_or(v6_default)
                 .parse()?,
         )
@@ -469,7 +506,8 @@ fn build_config(cli: Cli, running_conns: Option<u16>) -> Result<Config, String> 
     let cpus = cli
         .cpus
         .as_deref()
-        .or(file.cpus.as_deref())
+        .or(entry.cpus.as_deref())
+        .or(exit.cpus.as_deref())
         .map(parse_cpus)
         .transpose()?;
     let default_conns = running_conns.unwrap_or_else(|| {
@@ -479,32 +517,34 @@ fn build_config(cli: Cli, running_conns: Option<u16>) -> Result<Config, String> 
         )
     });
     let cfg = Config {
-        transport: cli.transport.or(file.transport).unwrap_or_default(),
+        transport: cli.transport.or(global.transport).unwrap_or_default(),
         tcp_notsent: cli
             .tcp_notsent
-            .or(file.tcp_notsent)
+            .or(global.tcp_notsent)
             .unwrap_or(crate::transport::budget::TCP_NOTSENT / 1024)
             .checked_mul(1024)
             .filter(|&bytes| bytes != 0)
             .ok_or("`tcp_notsent` must be within 1..=4194303 KiB")?,
-        base_port_explicit: cli.base_port.is_some() || file.base_port.is_some(),
+        base_port_explicit: cli.base_port.is_some() || entry.base_port.is_some(),
         mode,
         tunables: Tunables {
-            auth_key: file
+            auth_key: global
                 .auth_key
                 .as_deref()
-                .ok_or("missing TOML `auth_key`")?
+                .ok_or("missing TOML `global.auth_key`")?
                 .parse()?,
             cpus,
             ping_interval: Duration::from_secs(
-                cli.ping_interval.or(file.ping_interval).unwrap_or(5),
+                cli.ping_interval.or(global.ping_interval).unwrap_or(5),
             ),
-            dead_timeout: Duration::from_secs(cli.dead_timeout.or(file.dead_timeout).unwrap_or(15)),
+            dead_timeout: Duration::from_secs(
+                cli.dead_timeout.or(global.dead_timeout).unwrap_or(15),
+            ),
         },
         tun_name: cli
             .tun_name
             .clone()
-            .or(file.tun_name)
+            .or(global.tun_name)
             .unwrap_or_else(|| "ghostun0".into()),
         tun_ipv4,
         tun_ipv6,
@@ -513,11 +553,11 @@ fn build_config(cli: Cli, running_conns: Option<u16>) -> Result<Config, String> 
         } else {
             0
         },
-        outer_mtu: cli.outer_mtu.or(file.outer_mtu),
-        tun_mtu: cli.tun_mtu.or(file.tun_mtu),
-        iface: cli.iface.clone().or(file.iface),
-        base_port: cli.base_port.or(file.base_port).unwrap_or(32768),
-        netfilter: !(cli.no_netfilter || file.no_netfilter),
+        outer_mtu: cli.outer_mtu.or(entry.outer_mtu).or(exit.outer_mtu),
+        tun_mtu: cli.tun_mtu.or(global.tun_mtu),
+        iface: cli.iface.clone().or(entry.iface).or(exit.iface),
+        base_port: cli.base_port.or(entry.base_port).unwrap_or(32768),
+        netfilter: !(cli.no_netfilter || global.no_netfilter),
         masq: !no_masq,
         remote,
         listen,

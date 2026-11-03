@@ -11,7 +11,7 @@ EXIT=ghostun-v4-exit
 mkdir -p "$LOG"
 umask 077
 # Public fixture key, never a deployment credential.
-printf "auth_key = '%064d'\n" 1 >"$LOG/auth.toml"
+printf "[global]\nauth_key = '%064d'\n" 1 >"$LOG/auth.toml"
 PIDS=()
 
 cleanup() {

@@ -1,65 +1,84 @@
-# ghostun configuration. CLI flags override file values; auth_key is file-only and mandatory.
-# Durations are integer seconds.
+# ghostun configuration. CLI flags override file values.
+# Only [global] and the active role section ([entry] or [exit]) are read,
+# so one file can be shared across both hosts when passing `entry` or `exit` on the CLI.
+# Durations are integer seconds. Store this file with mode 0600.
 
-# Generate a secret once, then copy it to both peers through a secure channel:
-#   od -An -N32 -tx1 /dev/urandom | tr -d ' \n'
-# Uncomment and fill this field; no public example key is safe for deployment.
-# auth_key = "<64 hexadecimal characters from the command above>"
-# Store this file with mode 0600. Coordinate key changes and SIGHUP on both peers.
-
-# Role (required unless given as the `entry` / `exit` subcommand).
+[global]
+# Role when `entry` or `exit` is not passed on the CLI.
 mode = "entry"
 
-# Exactly one outer transport per instance. Both peers must match; change requires restart.
-transport = "faketcp"  # or "tcp", which also supports terminating TCP relays
+# Required shared key (64 hex characters). Generate once and copy to both peers:
+#   od -An -N32 -tx1 /dev/urandom | tr -d ' \n'
+# auth_key = "<64 hexadecimal characters>"
 
-# TCP only: unsent low watermark and per-write batch limit in KiB; restart to change.
-# Default 64 favors short queues. Consider 128 for sustained >1 Gbit/s LAN/IDC traffic;
-# larger values allow more unsent data to queue. CLI: --tcp-notsent 128.
+# Outer transport; both peers must use the same value.
+# Use "faketcp" for direct paths, or "tcp" when going through a terminating TCP relay.
+transport = "faketcp"
+
+# TCP only: unsent write limit in KiB. Consider 128 on >1 Gbit/s links.
 # tcp_notsent = 64
 
-# --- entry only ---
-# Outer address of the exit node (required). IPv6 example: "[2001:db8::10]:443".
-remote = "203.0.113.10:443"
-# Outer connections = worker threads (default: number of CPUs).
-# conns = 4
-
-# --- exit only (required) ---
-# Outer listen port or IP:PORT (e.g. 443, "192.0.2.10:443", or "[2001:db8::10]:443").
-# listen = 443
-# Outer listen family: "ipv4" (listen only IPv4), "ipv6" (listen only IPv6), or "mixed" (listen both).
-# outer_family = "ipv4"
-
-# Inner TUN interface; bind your proxy outbound to it (SO_BINDTODEVICE).
+# Inner TUN interface name; bind your proxy outbound to this interface.
 tun_name = "ghostun0"
 
-# Inner addresses. Defaults: entry 10.200.0.1/30 + fd00:200::1/126, exit 10.200.0.2/30 + fd00:200::2/126.
-# tun_ipv4 = "10.200.0.1/30"
-# tun_ipv6 = "fd00:200::1/126"
-# no_ipv6 = false  # inner IPv6 only; independent of the outer family
+# Disable inner IPv6 on the TUN interface.
+# no_ipv6 = false
 
-# Optional worker CPU affinity list or ranges (e.g. "0,1" or "2-3").
-# cpus = "0-3"
-
-# Outer path MTU (default: MTU of the egress interface, else 1500) and inner TUN MTU
-# (default: outer_mtu - 40 for outer IPv4, outer_mtu - 60 for outer IPv6 or mixed).
-# Inner IPv6 requires tun_mtu >= 1280, hence outer_mtu >= 1320 (IPv4) or 1340 (IPv6/mixed).
-# outer_mtu = 1500
-# TCP peers must have equal effective MTUs; set a common value if detected defaults differ.
+# Inner TUN MTU. Set the same value on both peers when their path MTUs differ.
 # tun_mtu = 1460
 
-# Outer interface (entry egress or exit bind/masquerade interface). Default: from the routing table.
-# iface = "eth0"
-
-# FakeTCP Entry: first source port of the outer port pool. Worker i uses ports p >= base_port with p % conns == i.
-# TCP uses kernel-assigned ports; an explicit base_port is warned about and ignored.
-# base_port = 32768
-
-# End-to-end health ping period and silence timeout. TCP reconnects with bounded jittered backoff.
+# Health probe interval and silence timeout before reconnecting.
 # ping_interval = 5
 # dead_timeout = 15
 
-# Skip nftables/sysctl management (you then provide the rules yourself, see README).
+# Skip automatic nftables and sysctl setup when managing firewall rules yourself.
 # no_netfilter = false
-# Exit only: omit nftables masquerade (for routed L3 networks without NAT).
+
+[entry]
+# Exit outer address (required in entry mode). IPv6 example: "[2001:db8::10]:443".
+remote = "203.0.113.10:443"
+
+# Number of outer connections and worker threads (default: CPU count).
+# conns = 4
+
+# Set to "mixed" when connecting to an Exit with outer_family = "mixed".
+# outer_family = "mixed"
+
+# FakeTCP only: starting source port when restricting outer ports in firewall rules.
+# base_port = 32768
+
+# Inner TUN addresses on Entry.
+# tun_ipv4 = "10.200.0.1/30"
+# tun_ipv6 = "fd00:200::1/126"
+
+# Outer path MTU when lower than the NIC MTU (e.g. 1492 on PPPoE, 1420 on cloud VPCs).
+# outer_mtu = 1500
+
+# Outer egress network interface (default: from routing table).
+# iface = "eth0"
+
+# CPU cores to pin Entry workers to (e.g. "0,1" or "0-3").
+# cpus = "0-3"
+
+[exit]
+# Outer listen port or IP:PORT (required in exit mode, e.g. 443, "192.0.2.10:443", "[2001:db8::10]:443").
+listen = 443
+
+# Outer listen family: "ipv4" (listen only IPv4), "ipv6" (listen only IPv6), or "mixed" (listen both).
+# outer_family = "ipv4"
+
+# Omit NAT masquerade when routing inner subnets directly without NAT.
 # no_masq = false
+
+# Inner TUN addresses on Exit.
+# tun_ipv4 = "10.200.0.2/30"
+# tun_ipv6 = "fd00:200::2/126"
+
+# Outer path MTU when lower than the NIC MTU (e.g. 1492 on PPPoE, 1420 on cloud VPCs).
+# outer_mtu = 1500
+
+# Outer bind and masquerade network interface (default: from routing table).
+# iface = "eth0"
+
+# Candidate CPU cores for Exit workers (e.g. "0,1" or "0-3").
+# cpus = "0-3"

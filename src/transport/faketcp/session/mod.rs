@@ -223,7 +223,7 @@ impl Session {
         self.generation
     }
 
-    /// The active connection's family; exit candidates do not change it before authentication.
+    #[cfg(test)]
     pub fn family(&self) -> OuterFamily {
         OuterFamily::of(self.local.ip())
     }

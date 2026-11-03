@@ -13,7 +13,7 @@ fn entry(extra: &[&str]) -> Result<Config, String> {
 fn with_file(name: &str, toml: &str, args: &[&str]) -> Result<Config, String> {
     with_raw_file(
         name,
-        &format!("auth_key = '{}'\n{toml}", "a7".repeat(32)),
+        &format!("[global]\nauth_key = '{}'\n{toml}", "a7".repeat(32)),
         args,
     )
 }
@@ -34,7 +34,7 @@ fn transport_defaults_precedence_and_validation() {
     assert_eq!(entry(&[]).unwrap().transport, Transport::Faketcp);
     let tcp = with_file(
         "tcp",
-        "transport = 'tcp'\nbase_port = 1",
+        "transport = 'tcp'\n[entry]\nbase_port = 1",
         &["entry", "--remote", "192.0.2.1:443"],
     )
     .unwrap();
@@ -117,11 +117,15 @@ fn both_roles_require_an_auth_key() {
 fn key_validation_never_discloses_secret_material() {
     let key = "a7B9".repeat(16);
     for role in [
-        "mode = 'entry'\nremote = '192.0.2.1:443'",
-        "mode = 'exit'\nlisten = 443",
+        "mode = 'entry'\n[entry]\nremote = '192.0.2.1:443'",
+        "mode = 'exit'\n[exit]\nlisten = 443",
     ] {
-        let config =
-            with_raw_file("valid-key", &format!("auth_key = '{key}'\n{role}"), &[]).unwrap();
+        let config = with_raw_file(
+            "valid-key",
+            &format!("[global]\nauth_key = '{key}'\n{role}"),
+            &[],
+        )
+        .unwrap();
         assert!(!format!("{config:?}").contains(&key));
         for bad in [
             String::new(),
@@ -131,15 +135,19 @@ fn key_validation_never_discloses_secret_material() {
             "g".repeat(64),
             "é".repeat(32),
         ] {
-            let error = with_raw_file("invalid-key", &format!("auth_key = '{bad}'\n{role}"), &[])
-                .unwrap_err();
+            let error = with_raw_file(
+                "invalid-key",
+                &format!("[global]\nauth_key = '{bad}'\n{role}"),
+                &[],
+            )
+            .unwrap_err();
             if !bad.is_empty() {
                 assert!(!error.contains(&bad));
             }
         }
         for invalid in [
-            format!("auth_key = '{key}'\n{role}\nbroken = ["),
-            format!("auth_key = ['{key}']\n{role}"),
+            format!("[global]\nauth_key = '{key}'\n{role}\nbroken = ["),
+            format!("[global]\nauth_key = ['{key}']\n{role}"),
         ] {
             let error = with_raw_file("invalid-toml", &invalid, &[]).unwrap_err();
             assert!(!error.contains(&key));
@@ -183,7 +191,7 @@ fn exit_defaults() {
     assert_eq!((c.listen, c.remote), (Some(443), None));
     let c = with_file(
         "exit-no-masq",
-        "mode = 'exit'\nlisten = 443\nno_masq = true\n",
+        "mode = 'exit'\n[exit]\nlisten = 443\nno_masq = true\n",
         &["--no-netfilter", "--iface", "eth0"],
     )
     .unwrap();
@@ -256,7 +264,7 @@ fn no_ipv6_disables_inner_v6() {
 fn toml_alone_selects_role() {
     let c = with_file(
         "role",
-        "mode = \"exit\"\nlisten = 8443\ntun_name = \"gx\"\nno_ipv6 = true\n",
+        "mode = \"exit\"\ntun_name = \"gx\"\nno_ipv6 = true\n[exit]\nlisten = 8443\n",
         &[],
     )
     .unwrap();
@@ -269,7 +277,7 @@ fn toml_alone_selects_role() {
 #[test]
 fn cli_overrides_toml() {
     let toml =
-        "remote = \"203.0.113.1:80\"\nconns = 2\ndead_timeout = 30\ntun_name = \"fromfile\"\n";
+        "dead_timeout = 30\ntun_name = \"fromfile\"\n[entry]\nremote = \"203.0.113.1:80\"\nconns = 2\n";
     let c = with_file(
         "override",
         toml,
@@ -296,36 +304,140 @@ fn cli_overrides_toml() {
 fn file_errors() {
     assert!(with_file(
         "conflict",
-        "mode = \"exit\"\nlisten = 1\n",
+        "mode = \"exit\"\n[exit]\nlisten = 1\n",
         &["entry", "--remote", "1.2.3.4:5"]
     )
     .unwrap_err()
     .contains("conflicts"));
-    assert!(with_file("unknown", "mode = \"exit\"\nlisten = 1\nbogus = 1\n", &[]).is_err());
-    assert!(with_file("norole", "conns = 1\n", &[])
+    assert!(with_file(
+        "unknown-global",
+        "mode = \"exit\"\nbogus = 1\n[exit]\nlisten = 1\n",
+        &[]
+    )
+    .is_err());
+    assert!(with_raw_file(
+        "flat-root-rejected",
+        &format!(
+            "auth_key = '{}'\nmode = 'exit'\nlisten = 443\n",
+            "a7".repeat(32)
+        ),
+        &[]
+    )
+    .is_err());
+    assert!(with_file("norole", "[entry]\nconns = 1\n", &[])
         .unwrap_err()
         .contains("missing role"));
     assert!(with_file(
-        "wrongrole",
-        "mode = \"exit\"\nlisten = 1\nremote = \"1.2.3.4:5\"\n",
+        "wrong-section-remote",
+        "mode = \"exit\"\n[exit]\nlisten = 1\nremote = \"1.2.3.4:5\"\n",
         &[]
     )
-    .unwrap_err()
-    .contains("entry mode"));
+    .is_err());
     assert!(with_file(
-        "exit-conns",
-        "mode = \"exit\"\nlisten = 1\nconns = 2\n",
+        "wrong-section-conns",
+        "mode = \"exit\"\n[exit]\nlisten = 1\nconns = 2\n",
         &[]
     )
-    .unwrap_err()
-    .contains("entry mode"));
+    .is_err());
     assert!(with_file(
-        "entry-no-masq",
-        "mode = \"entry\"\nremote = \"1.2.3.4:5\"\nno_masq = true\n",
+        "wrong-section-no-masq",
+        "mode = \"entry\"\n[entry]\nremote = \"1.2.3.4:5\"\nno_masq = true\n",
         &[]
     )
-    .unwrap_err()
-    .contains("exit mode"));
+    .is_err());
+    // Inactive section still validates field names and types so typos fail closed.
+    assert!(with_file(
+        "inactive-exit-typo",
+        "[entry]\nremote = \"1.2.3.4:5\"\n[exit]\nlitsen = 443\n",
+        &["entry"]
+    )
+    .is_err());
+    assert!(with_file(
+        "inactive-exit-bad-type",
+        "[entry]\nremote = \"1.2.3.4:5\"\n[exit]\nlisten = \"not-a-port\"\n",
+        &["entry"]
+    )
+    .is_err());
+    assert!(with_file(
+        "inactive-entry-typo",
+        "[entry]\nbogus = 1\n[exit]\nlisten = 443\n",
+        &["exit"]
+    )
+    .is_err());
+}
+
+#[test]
+fn shared_file_reads_only_global_and_active_role_section() {
+    let shared = "\
+transport = 'tcp'
+tun_name = 'shared0'
+[entry]
+remote = '198.51.100.10:443'
+conns = 3
+base_port = 41000
+tun_ipv4 = '10.210.0.1/30'
+tun_ipv6 = 'fd00:210::1/126'
+outer_mtu = 1492
+iface = 'eth-entry'
+cpus = '0,1'
+[exit]
+listen = 8443
+outer_family = 'ipv6'
+no_masq = true
+tun_ipv4 = '10.210.0.2/30'
+tun_ipv6 = 'fd00:210::2/126'
+outer_mtu = 1420
+iface = 'eth-exit'
+cpus = '2,3'
+";
+    let entry_cfg = with_file("shared-entry", shared, &["entry"]).unwrap();
+    assert_eq!(entry_cfg.mode, Mode::Entry);
+    assert_eq!(entry_cfg.transport, Transport::Tcp);
+    assert_eq!(entry_cfg.tun_name, "shared0");
+    assert_eq!(entry_cfg.remote, Some("198.51.100.10:443".parse().unwrap()));
+    assert_eq!(entry_cfg.listen, None);
+    assert_eq!(entry_cfg.conns, 3);
+    assert_eq!(entry_cfg.base_port, 41000);
+    assert_eq!(entry_cfg.outer_family, OuterMode::Ipv4);
+    assert!(entry_cfg.masq);
+    assert_eq!(entry_cfg.tun_ipv4.to_string(), "10.210.0.1/30");
+    assert_eq!(entry_cfg.tun_ipv6.unwrap().to_string(), "fd00:210::1/126");
+    assert_eq!(entry_cfg.outer_mtu, Some(1492));
+    assert_eq!(entry_cfg.iface.as_deref(), Some("eth-entry"));
+    assert_eq!(entry_cfg.tunables.cpus, Some(vec![0, 1]));
+
+    let exit_cfg = with_file("shared-exit", shared, &["exit"]).unwrap();
+    assert_eq!(exit_cfg.mode, Mode::Exit);
+    assert_eq!(exit_cfg.transport, Transport::Tcp);
+    assert_eq!(exit_cfg.tun_name, "shared0");
+    assert_eq!(exit_cfg.listen, Some(8443));
+    assert_eq!(exit_cfg.remote, None);
+    assert_eq!(exit_cfg.conns, 0);
+    assert_eq!(exit_cfg.outer_family, OuterMode::Ipv6);
+    assert!(!exit_cfg.masq);
+    assert_eq!(exit_cfg.tun_ipv4.to_string(), "10.210.0.2/30");
+    assert_eq!(exit_cfg.tun_ipv6.unwrap().to_string(), "fd00:210::2/126");
+    assert_eq!(exit_cfg.outer_mtu, Some(1420));
+    assert_eq!(exit_cfg.iface.as_deref(), Some("eth-exit"));
+    assert_eq!(exit_cfg.tunables.cpus, Some(vec![2, 3]));
+
+    let example = std::fs::read_to_string("deploy/config.example.toml")
+        .unwrap()
+        .replace(
+            "# auth_key = \"<64 hexadecimal characters>\"",
+            &format!("auth_key = '{}'", "a7".repeat(32)),
+        );
+    assert_eq!(
+        with_raw_file("example-entry", &example, &[]).unwrap().mode,
+        Mode::Entry
+    );
+    let exit_example = example.replace("mode = \"entry\"", "mode = \"exit\"");
+    assert_eq!(
+        with_raw_file("example-exit", &exit_example, &[])
+            .unwrap()
+            .mode,
+        Mode::Exit
+    );
 }
 
 #[test]
@@ -369,21 +481,21 @@ fn outer_family_is_independent_of_inner_ipv6() {
     assert_eq!(c.tun_ipv6, None);
     let c = with_file(
         "v6-family",
-        "mode = 'exit'\nlisten = 443\nouter_family = 'ipv6'\n",
+        "mode = 'exit'\n[exit]\nlisten = 443\nouter_family = 'ipv6'\n",
         &[],
     )
     .unwrap();
     assert_eq!(c.outer_family, OuterMode::Ipv6);
     let c = with_file(
         "v6-override",
-        "mode = 'exit'\nlisten = 443\nouter_family = 'ipv6'\n",
+        "mode = 'exit'\n[exit]\nlisten = 443\nouter_family = 'ipv6'\n",
         &["exit", "--outer-family", "ipv4"],
     )
     .unwrap();
     assert_eq!(c.outer_family, OuterMode::Ipv4);
     assert!(with_file(
         "entry-family",
-        "mode = 'entry'\nremote = '[2001:db8::1]:443'\nouter_family = 'ipv6'\n",
+        "mode = 'entry'\n[entry]\nremote = '[2001:db8::1]:443'\nouter_family = 'ipv6'\n",
         &[]
     )
     .is_err());
@@ -391,7 +503,12 @@ fn outer_family_is_independent_of_inner_ipv6() {
     assert_eq!(v6_listen.outer_family, OuterMode::Ipv6);
     assert_eq!(v6_listen.listen, Some(443));
     assert_eq!(v6_listen.listen_ip, Some("2001:db8::1".parse().unwrap()));
-    let v6_wild = with_file("v6-wild", "mode = 'exit'\nlisten = '[::]:8443'\n", &[]).unwrap();
+    let v6_wild = with_file(
+        "v6-wild",
+        "mode = 'exit'\n[exit]\nlisten = '[::]:8443'\n",
+        &[],
+    )
+    .unwrap();
     assert_eq!(v6_wild.outer_family, OuterMode::Ipv6);
     assert_eq!(v6_wild.listen, Some(8443));
     assert_eq!(v6_wild.listen_ip, None);
@@ -425,7 +542,7 @@ fn mixed_preserves_policy_but_entry_opens_only_the_remote_family() {
     }
     let c = with_file(
         "mixed-exit",
-        "mode = 'exit'\nlisten = 443\nouter_family = 'mixed'\n",
+        "mode = 'exit'\n[exit]\nlisten = 443\nouter_family = 'mixed'\n",
         &[],
     )
     .unwrap();
@@ -449,7 +566,7 @@ fn mixed_preserves_policy_but_entry_opens_only_the_remote_family() {
     }
     let c = with_file(
         "mixed-override",
-        "mode = 'exit'\nlisten = 443\nouter_family = 'mixed'\n",
+        "mode = 'exit'\n[exit]\nlisten = 443\nouter_family = 'mixed'\n",
         &["--outer-family", "ipv4"],
     )
     .unwrap();
@@ -499,7 +616,7 @@ fn reload_updates_mutable_fields_and_rejects_immutable_or_invalid_changes() {
     std::fs::write(
         &path,
         format!(
-            "mode = 'entry'\nremote = '203.0.113.9:443'\nauth_key = '{key1}'\nconns = 2\nping_interval = 5\ndead_timeout = 15\n"
+            "[global]\nmode = 'entry'\nauth_key = '{key1}'\nping_interval = 5\ndead_timeout = 15\n[entry]\nremote = '203.0.113.9:443'\nconns = 2\n"
         ),
     )
     .unwrap();
@@ -512,12 +629,12 @@ fn reload_updates_mutable_fields_and_rejects_immutable_or_invalid_changes() {
     ])
     .unwrap();
 
-    // Updating all four mutable fields (auth_key, ping_interval, dead_timeout, cpus) succeeds
-    // while preserving startup CLI overrides (--base-port 40000).
+    // Updating all four mutable fields (auth_key, ping_interval, dead_timeout, cpus) AND
+    // editing the inactive [exit] section succeeds while preserving startup CLI overrides.
     std::fs::write(
         &path,
         format!(
-            "mode = 'entry'\nremote = '203.0.113.9:443'\nauth_key = '{key2}'\nconns = 2\ncpus = '0,1'\nping_interval = 3\ndead_timeout = 12\n"
+            "[global]\nmode = 'entry'\nauth_key = '{key2}'\nping_interval = 3\ndead_timeout = 12\n[entry]\nremote = '203.0.113.9:443'\nconns = 2\ncpus = '0,1'\n[exit]\nlisten = 8443\nno_masq = true\n"
         ),
     )
     .unwrap();
@@ -532,7 +649,7 @@ fn reload_updates_mutable_fields_and_rejects_immutable_or_invalid_changes() {
     std::fs::write(
         &path,
         format!(
-            "mode = 'entry'\nremote = '203.0.113.9:443'\nauth_key = '{key2}'\ncpus = '0,1,2,3'\nping_interval = 3\ndead_timeout = 12\n"
+            "[global]\nmode = 'entry'\nauth_key = '{key2}'\nping_interval = 3\ndead_timeout = 12\n[entry]\nremote = '203.0.113.9:443'\ncpus = '0,1,2,3'\n"
         ),
     )
     .unwrap();
@@ -542,24 +659,24 @@ fn reload_updates_mutable_fields_and_rejects_immutable_or_invalid_changes() {
 
     // Invalid TOML syntax or invalid key is rejected without disclosing secret material.
     let secret = "c9D0".repeat(16);
-    std::fs::write(&path, format!("auth_key = ['{secret}']\n")).unwrap();
+    std::fs::write(&path, format!("[global]\nauth_key = ['{secret}']\n")).unwrap();
     let err = reloaded.reload().unwrap_err();
     assert!(!err.contains(&secret));
 
     // Changing any immutable field is rejected.
     for bad_toml in [
-        format!("mode = 'entry'\ntransport = 'tcp'\nremote = '203.0.113.9:443'\nauth_key = '{key2}'\nconns = 2\n"),
-        format!("mode = 'exit'\nlisten = 443\nauth_key = '{key2}'\n"),
-        format!("mode = 'entry'\nremote = '203.0.113.10:443'\nauth_key = '{key2}'\nconns = 2\n"),
-        format!("mode = 'entry'\nremote = '[2001:db8::1]:443'\nauth_key = '{key2}'\nconns = 2\n"),
-        format!("mode = 'entry'\nremote = '203.0.113.9:443'\nauth_key = '{key2}'\nconns = 4\n"),
-        format!("mode = 'entry'\nremote = '203.0.113.9:443'\nauth_key = '{key2}'\nconns = 2\ntun_name = 'gtun1'\n"),
-        format!("mode = 'entry'\nremote = '203.0.113.9:443'\nauth_key = '{key2}'\nconns = 2\ntun_ipv4 = '10.200.1.1/30'\n"),
-        format!("mode = 'entry'\nremote = '203.0.113.9:443'\nauth_key = '{key2}'\nconns = 2\ntun_ipv6 = 'fd00:201::1/126'\n"),
-        format!("mode = 'entry'\nremote = '203.0.113.9:443'\nauth_key = '{key2}'\nconns = 2\nouter_mtu = 1420\n"),
-        format!("mode = 'entry'\nremote = '203.0.113.9:443'\nauth_key = '{key2}'\nconns = 2\ntun_mtu = 1360\n"),
-        format!("mode = 'entry'\nremote = '203.0.113.9:443'\nauth_key = '{key2}'\nconns = 2\niface = 'eth9'\n"),
-        format!("mode = 'entry'\nremote = '203.0.113.9:443'\nauth_key = '{key2}'\nconns = 2\nno_netfilter = true\n"),
+        format!("[global]\nmode = 'entry'\ntransport = 'tcp'\nauth_key = '{key2}'\n[entry]\nremote = '203.0.113.9:443'\nconns = 2\n"),
+        format!("[global]\nmode = 'exit'\nauth_key = '{key2}'\n[exit]\nlisten = 443\n"),
+        format!("[global]\nmode = 'entry'\nauth_key = '{key2}'\n[entry]\nremote = '203.0.113.10:443'\nconns = 2\n"),
+        format!("[global]\nmode = 'entry'\nauth_key = '{key2}'\n[entry]\nremote = '[2001:db8::1]:443'\nconns = 2\n"),
+        format!("[global]\nmode = 'entry'\nauth_key = '{key2}'\n[entry]\nremote = '203.0.113.9:443'\nconns = 4\n"),
+        format!("[global]\nmode = 'entry'\nauth_key = '{key2}'\ntun_name = 'gtun1'\n[entry]\nremote = '203.0.113.9:443'\nconns = 2\n"),
+        format!("[global]\nmode = 'entry'\nauth_key = '{key2}'\n[entry]\nremote = '203.0.113.9:443'\nconns = 2\ntun_ipv4 = '10.200.1.1/30'\n"),
+        format!("[global]\nmode = 'entry'\nauth_key = '{key2}'\n[entry]\nremote = '203.0.113.9:443'\nconns = 2\ntun_ipv6 = 'fd00:201::1/126'\n"),
+        format!("[global]\nmode = 'entry'\nauth_key = '{key2}'\n[entry]\nremote = '203.0.113.9:443'\nconns = 2\nouter_mtu = 1420\n"),
+        format!("[global]\nmode = 'entry'\nauth_key = '{key2}'\ntun_mtu = 1360\n[entry]\nremote = '203.0.113.9:443'\nconns = 2\n"),
+        format!("[global]\nmode = 'entry'\nauth_key = '{key2}'\n[entry]\nremote = '203.0.113.9:443'\nconns = 2\niface = 'eth9'\n"),
+        format!("[global]\nmode = 'entry'\nauth_key = '{key2}'\nno_netfilter = true\n[entry]\nremote = '203.0.113.9:443'\nconns = 2\n"),
     ] {
         std::fs::write(&path, &bad_toml).unwrap();
         assert!(reloaded.reload().is_err(), "expected immutable change to fail: {bad_toml}");
@@ -567,25 +684,29 @@ fn reload_updates_mutable_fields_and_rejects_immutable_or_invalid_changes() {
 
     std::fs::write(
         &path,
-        format!("mode = 'exit'\nlisten = 443\nauth_key = '{key1}'\n"),
+        format!("[global]\nmode = 'exit'\nauth_key = '{key1}'\n[exit]\nlisten = 443\n"),
     )
     .unwrap();
     let exit_cfg = parse_from(["ghostun", "--config", path.to_str().unwrap()]).unwrap();
     std::fs::write(
         &path,
-        format!("mode = 'exit'\nlisten = 443\nauth_key = '{key1}'\ncpus = '0,1'\n"),
+        format!(
+            "[global]\nmode = 'exit'\nauth_key = '{key1}'\n[exit]\nlisten = 443\ncpus = '0,1'\n"
+        ),
     )
     .unwrap();
     assert_eq!(exit_cfg.reload().unwrap().tunables.cpus, Some(vec![0, 1]));
     std::fs::write(
         &path,
-        format!("mode = 'exit'\nlisten = 443\nauth_key = '{key1}'\nno_masq = true\n"),
+        format!(
+            "[global]\nmode = 'exit'\nauth_key = '{key1}'\n[exit]\nlisten = 443\nno_masq = true\n"
+        ),
     )
     .unwrap();
     assert!(exit_cfg.reload().unwrap_err().contains("no_masq"));
     std::fs::write(
         &path,
-        format!("mode = 'exit'\nlisten = '192.0.2.1:443'\nauth_key = '{key1}'\n"),
+        format!("[global]\nmode = 'exit'\nauth_key = '{key1}'\n[exit]\nlisten = '192.0.2.1:443'\n"),
     )
     .unwrap();
     assert!(exit_cfg.reload().unwrap_err().contains("listen"));
@@ -593,7 +714,7 @@ fn reload_updates_mutable_fields_and_rejects_immutable_or_invalid_changes() {
     // When inner IPv6 was disabled at startup, reload remains compatible without false mismatch.
     std::fs::write(
         &path,
-        format!("mode = 'entry'\nremote = '203.0.113.9:443'\nauth_key = '{key1}'\nconns = 2\n"),
+        format!("[global]\nmode = 'entry'\nauth_key = '{key1}'\n[entry]\nremote = '203.0.113.9:443'\nconns = 2\n"),
     )
     .unwrap();
     let mut no_v6_cfg = reloaded.clone();
@@ -601,6 +722,5 @@ fn reload_updates_mutable_fields_and_rejects_immutable_or_invalid_changes() {
     let after_no_v6 = no_v6_cfg.reload().unwrap();
     assert_eq!(after_no_v6.tun_ipv6, None);
     assert_eq!(after_no_v6.tunables.auth_key, key1.parse().unwrap());
-
     std::fs::remove_file(&path).unwrap();
 }

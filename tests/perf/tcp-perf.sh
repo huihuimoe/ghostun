@@ -11,16 +11,15 @@ DEAD=4
 mkdir -p "$LOG"
 LOG=$(realpath "$LOG")
 umask 077
-printf "auth_key = '%064d'\nping_interval = 1\ndead_timeout = 4\n" 1 >"$LOG/auth.toml"
-printf "auth_key = '%064d'\n" 2 >"$LOG/wrong.toml"
+printf "[global]\nauth_key = '%064d'\nping_interval = 1\ndead_timeout = 4\n" 1 >"$LOG/auth.toml"
+printf "[global]\nauth_key = '%064d'\n" 2 >"$LOG/wrong.toml"
 PIDS=()
 ENTRY_CPUS=0-1
 EXIT_CPUS=2-3
 write_configs() {
     cat "$LOG/auth.toml" >"$LOG/entry.toml"
-    printf "cpus = '%s'\n" "$ENTRY_CPUS" >>"$LOG/entry.toml"
-    cat "$LOG/auth.toml" >"$LOG/exit.toml"
-    printf "cpus = '%s'\n" "$EXIT_CPUS" >>"$LOG/exit.toml"
+    printf "[entry]\ncpus = '%s'\n[exit]\ncpus = '%s'\n" "$ENTRY_CPUS" "$EXIT_CPUS" >>"$LOG/entry.toml"
+    cp "$LOG/entry.toml" "$LOG/exit.toml"
 }
 write_configs
 ns() { ip netns exec "$@"; }
@@ -257,13 +256,13 @@ check_data
 pass "Exit restart recovered ${t}s with fresh payloads"
 
 # Reload immutable transport atomically, timers in place, then rotate keys on both ends.
-printf "auth_key = '%064d'\ntransport = 'faketcp'\n" 1 >"$LOG/auth.toml"
+printf "[global]\nauth_key = '%064d'\ntransport = 'faketcp'\n" 1 >"$LOG/auth.toml"
 # CLI transport has precedence, so change topology to prove rejection too.
 printf "tun_name = 'other0'\n" >>"$LOG/auth.toml"
 write_configs
 kill -HUP "$ENTRY_PID" "$EXIT_PID"; sleep 0.2
 check_data
-printf "auth_key = '%064d'\nping_interval = 1\ndead_timeout = 5\n" 1 >"$LOG/auth.toml"
+printf "[global]\nauth_key = '%064d'\nping_interval = 1\ndead_timeout = 5\n" 1 >"$LOG/auth.toml"
 ENTRY_CPUS=2-3
 EXIT_CPUS=0-1
 write_configs
@@ -278,7 +277,7 @@ worker_cpus() {
 }
 [[ $(worker_cpus "$ENTRY_PID") == 2,3 ]] || fail "Entry affinity reload"
 [[ $(worker_cpus "$EXIT_PID") == 0,1 ]] || fail "Exit affinity reload"
-printf "auth_key = '%064d'\nping_interval = 1\ndead_timeout = 4\n" 3 >"$LOG/auth.toml"
+printf "[global]\nauth_key = '%064d'\nping_interval = 1\ndead_timeout = 4\n" 3 >"$LOG/auth.toml"
 write_configs
 kill -HUP "$ENTRY_PID" "$EXIT_PID"
 wait_ping 30 >/dev/null || fail "key reload"

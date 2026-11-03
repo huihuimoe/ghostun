@@ -28,8 +28,8 @@ TABLE=ghostun_ghostun0
 mkdir -p "$LOG"
 umask 077
 # Public test-only keys, never deployment credentials.
-printf "auth_key = '%064d'\n" 1 >"$LOG/auth.toml"
-printf "auth_key = '%064d'\n" 2 >"$LOG/wrong.toml"
+printf "[global]\nauth_key = '%064d'\n" 1 >"$LOG/auth.toml"
+printf "[global]\nauth_key = '%064d'\n" 2 >"$LOG/wrong.toml"
 
 ns() { ip netns exec "$@"; }
 pass() { echo "PASS: $*"; }
@@ -272,20 +272,20 @@ pass "recovered ${t}s after one-way black hole; stale entries closed by RST, $N 
 # exercise rollback without resetting untouched sibling workers, then complete a staged
 # rolling auth_key rotation across Entry and Exit.
 pre_reload=$(outer_tuples)
-printf "auth_key = '%064d'\ntun_name = 'other0'\n" 1 >"$LOG/auth.toml"
+printf "[global]\nauth_key = '%064d'\ntun_name = 'other0'\n" 1 >"$LOG/auth.toml"
 kill -HUP "$ENTRY_PID" "$EXIT_PID"
 sleep 0.3
 [[ $(outer_tuples) == "$pre_reload" ]] || fail "rejected reload altered active outer tuples"
 ns entry ping -c2 -i0.2 -W1 10.3.0.2 >/dev/null || fail "rejected reload disrupted forwarding"
 
-printf "auth_key = '%064d'\n" 2 >"$LOG/auth.toml"
+printf "[global]\nauth_key = '%064d'\n" 2 >"$LOG/auth.toml"
 kill -HUP "$ENTRY_PID"
 sleep 0.4
 if ((N > 1)); then
     ns entry ping -c2 -i0.2 -W1 10.3.0.2 >/dev/null || fail "mid-rotation disrupted IPv4 forwarding on sibling workers"
     ns entry ping -6 -c2 -i0.2 -W1 fd00:3::2 >/dev/null || fail "mid-rotation disrupted IPv6 forwarding on sibling workers"
 fi
-printf "auth_key = '%064d'\n" 1 >"$LOG/auth.toml"
+printf "[global]\nauth_key = '%064d'\n" 1 >"$LOG/auth.toml"
 kill -HUP "$ENTRY_PID"
 # Conntrack may retain an RST-closed tuple briefly in ESTABLISHED for challenge ACKs.
 for _ in $(seq 150); do
@@ -296,7 +296,7 @@ after_rollback=$(outer_tuples)
 preserved=$(comm -12 <(printf '%s\n' "$pre_reload") <(printf '%s\n' "$after_rollback") | grep -c . || true)
 [[ $preserved == $((N - 1)) ]] || fail "rollback preserved $preserved tuples, want $((N - 1)) (pre: $pre_reload | after: $after_rollback)"
 
-printf "auth_key = '%064d'\n" 3 >"$LOG/auth.toml"
+printf "[global]\nauth_key = '%064d'\n" 3 >"$LOG/auth.toml"
 kill -HUP "$ENTRY_PID"
 sleep 0.4
 if ((N > 1)); then

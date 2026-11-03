@@ -31,6 +31,15 @@ enum Start {
     Tcp(Box<tcp::Worker>),
 }
 
+impl Start {
+    fn run(self, stop: &AtomicBool, ctrl: &Control) {
+        match self {
+            Self::Fake(worker) => worker.run(stop, ctrl),
+            Self::Tcp(worker) => worker.run(stop, ctrl),
+        }
+    }
+}
+
 enum ExitDispatcher {
     Fake(faketcp::SharedExitState),
     Tcp(tcp::SharedExitState),
@@ -119,10 +128,7 @@ pub fn start(
                     .name(format!("ghostun-w{i}"))
                     .spawn(move || {
                         let _guard = StopOnDrop(stop, main_wake);
-                        match start {
-                            Start::Fake(worker) => worker.run(stop, &worker_ctrl),
-                            Start::Tcp(worker) => worker.run(stop, &worker_ctrl),
-                        }
+                        start.run(stop, &worker_ctrl);
                     })
                     .expect("spawning worker thread"),
             );
@@ -228,8 +234,14 @@ impl Running {
         }
     }
 
-    fn spawn_exit_tcp(&mut self, id: usize, conn: tcp::Connection) {
-        self.replace_exit_slot(id, None);
+    fn spawn_exit_slot(
+        &mut self,
+        id: usize,
+        tuple: Option<(SocketAddr, SocketAddr)>,
+        peer_label: String,
+        build: impl FnOnce(&Self, OwnedFd) -> Result<Start, String>,
+    ) {
+        self.replace_exit_slot(id, tuple);
         let tun = match sys::tun::open_queue(&self.cfg.tun_name) {
             Ok(fd) => fd,
             Err(e) => {
@@ -237,54 +249,8 @@ impl Running {
                 return;
             }
         };
-        let peer_label = conn.to_string();
-        let worker = tcp::Worker::new_exit(id, self.cfg.clone(), self.tun_mtu as u16, tun, conn);
-        let cpu = self.core_table.acquire();
-        let ctrl = Arc::new(Control::new(cpu, self.main_wake));
-        let worker_ctrl = Arc::clone(&ctrl);
-        let stop = self.stop;
-        let main_wake = self.main_wake;
-        let thread = std::thread::Builder::new()
-            .name(format!("ghostun-w{id}"))
-            .spawn(move || {
-                let _guard = ExitWorkerGuard {
-                    stop,
-                    ctrl: Arc::clone(&worker_ctrl),
-                    main_wake,
-                };
-                worker.run(stop, &worker_ctrl);
-            })
-            .expect("spawning exit TCP worker thread");
-        self.exit_workers[id] = Some(ExitSlot {
-            ctrl,
-            thread,
-            cpu,
-            tuple: None,
-            peer_label,
-        });
-    }
-
-    fn spawn_exit_fake(&mut self, promo: faketcp::Promoted, state: faketcp::SharedExitState) {
-        let id = promo.worker;
-        self.replace_exit_slot(id, Some((promo.local, promo.peer)));
-        let tun = match sys::tun::open_queue(&self.cfg.tun_name) {
-            Ok(fd) => fd,
-            Err(e) => {
-                log::error!("worker {id}: opening TUN queue {}: {e}", self.cfg.tun_name);
-                return;
-            }
-        };
-        let peer_label = format!("{} <-> {}", promo.local, promo.peer);
-        let worker = match faketcp::Worker::new_exit(
-            id,
-            &self.cfg,
-            self.outer_mtu,
-            tun,
-            promo,
-            state,
-            self.seed,
-        ) {
-            Ok(w) => w,
+        let start = match build(self, tun) {
+            Ok(start) => start,
             Err(e) => {
                 log::error!("worker {id}: {e}");
                 return;
@@ -303,14 +269,14 @@ impl Running {
                     ctrl: Arc::clone(&worker_ctrl),
                     main_wake,
                 };
-                worker.run(stop, &worker_ctrl);
+                start.run(stop, &worker_ctrl);
             })
-            .expect("spawning exit FakeTCP worker thread");
+            .expect("spawning exit worker thread");
         self.exit_workers[id] = Some(ExitSlot {
             ctrl,
             thread,
             cpu,
-            tuple: Some((promo.local, promo.peer)),
+            tuple,
             peer_label,
         });
     }
@@ -351,12 +317,12 @@ impl Running {
             }
             Some(ExitDispatcher::Fake(state)) => {
                 let mut s = state.lock().unwrap();
-                s.key = cfg.tunables.auth_key.clone();
-                s.timeout = cfg.tunables.dead_timeout;
-                s.epoch += 1;
                 if key_changed {
+                    s.key = cfg.tunables.auth_key.clone();
+                    s.epoch += 1;
                     s.admitted.clear();
                 }
+                s.timeout = cfg.tunables.dead_timeout;
             }
             None => {}
         }
@@ -414,7 +380,16 @@ impl Running {
                 loop {
                     let next = state.lock().unwrap().admitted.pop_front();
                     let Some((id, conn)) = next else { break };
-                    self.spawn_exit_tcp(id, conn);
+                    let peer_label = conn.to_string();
+                    self.spawn_exit_slot(id, None, peer_label, |this, tun| {
+                        Ok(Start::Tcp(Box::new(tcp::Worker::new_exit(
+                            id,
+                            this.cfg.clone(),
+                            this.tun_mtu as u16,
+                            tun,
+                            conn,
+                        ))))
+                    });
                 }
             }
             Some(ExitDispatcher::Fake(state)) => {
@@ -422,7 +397,22 @@ impl Running {
                 loop {
                     let next = state.lock().unwrap().admitted.pop_front();
                     let Some(promo) = next else { break };
-                    self.spawn_exit_fake(promo, Arc::clone(&state));
+                    let id = promo.worker;
+                    let tuple = Some((promo.local, promo.peer));
+                    let peer_label = format!("{} <-> {}", promo.local, promo.peer);
+                    let worker_state = Arc::clone(&state);
+                    self.spawn_exit_slot(id, tuple, peer_label, |this, tun| {
+                        faketcp::Worker::new_exit(
+                            id,
+                            &this.cfg,
+                            this.outer_mtu,
+                            tun,
+                            promo,
+                            worker_state,
+                            this.seed,
+                        )
+                        .map(|w| Start::Fake(Box::new(w)))
+                    });
                 }
             }
             None => {}

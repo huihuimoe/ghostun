@@ -73,14 +73,9 @@ impl RawSink<'_> {
         }
     }
 
-    fn data<'a>(
-        &mut self,
-        index: usize,
-        frames: impl ExactSizeIterator<Item = (&'a [u8], IpAddr)> + Clone,
-    ) {
+    fn data<'a>(&mut self, frames: impl ExactSizeIterator<Item = (&'a [u8], IpAddr)> + Clone) {
         let completed = if self.pending.packets.is_empty() {
-            self.sender
-                .send(self.sockets[index].1.as_fd(), frames.clone())
+            self.sender.send(self.sockets[0].1.as_fd(), frames.clone())
         } else {
             0
         };
@@ -252,8 +247,8 @@ impl Listener {
             }
             if sys::poll_wake(fds[0], wake.as_fd()) {
                 let s = state.lock().unwrap();
+                auth.reload(&s.key, s.timeout);
                 if s.epoch != applied_epoch {
-                    auth.reload(&s.key, s.timeout);
                     auth.reset();
                     applied_epoch = s.epoch;
                 }
@@ -436,7 +431,7 @@ pub struct Worker {
     mode: Mode,
     session: Session,
     tun: OwnedFd,
-    sockets: Vec<(OuterFamily, OwnedFd)>,
+    socket: (OuterFamily, OwnedFd),
     pending_out: Pending<IpAddr>,
     exit_cleanup: Option<(SharedExitState, SocketAddr, SocketAddr)>,
 }
@@ -457,7 +452,6 @@ impl Worker {
         let filter = entry_filter(remote, cfg.base_port, cfg.conns, worker);
         let fd = raw::socket(family, outer_dev, &filter, Some((local_ip, remote.ip())))
             .map_err(|e| format!("{family:?} raw socket: {e}"))?;
-        let sockets = vec![(family, fd)];
         let mss = (outer_mtu - cfg.outer_family.overhead() as u32) as u16;
         let scfg = SessionConfig::from_config(cfg, local_ip, 0, worker, mss);
         let session = Session::new(scfg, Instant::now(), seed ^ (u64::from(worker) << 48))
@@ -467,7 +461,7 @@ impl Worker {
             mode: Mode::Entry,
             session,
             tun,
-            sockets,
+            socket: (family, fd),
             pending_out: Pending::default(),
             exit_cleanup: None,
         })
@@ -487,7 +481,7 @@ impl Worker {
         let filter = exit_worker_filter(promo.local, promo.peer);
         let fd = raw::socket(family, cfg.iface.as_deref(), &filter, None)
             .map_err(|e| format!("{family:?} raw socket: {e}"))?;
-        let sockets = vec![(family, fd)];
+        let socket = (family, fd);
         let mss = (outer_mtu - cfg.outer_family.overhead() as u32) as u16;
         let scfg =
             SessionConfig::from_config(cfg, promo.local.ip(), promo.local.port(), worker, mss);
@@ -500,7 +494,7 @@ impl Worker {
         let mut attached = false;
         control::sync_tun_queue(id, tun.as_fd(), &mut attached, true);
         let mut out = RawSink {
-            sockets: &sockets,
+            sockets: std::slice::from_ref(&socket),
             sender: raw::Sender::new(family),
             pending: Pending::default(),
         };
@@ -518,7 +512,7 @@ impl Worker {
             mode: Mode::Exit,
             session,
             tun,
-            sockets,
+            socket,
             pending_out,
             exit_cleanup: Some((state, promo.local, promo.peer)),
         })
@@ -531,39 +525,32 @@ impl Worker {
             mode,
             mut session,
             tun,
-            sockets,
+            socket,
             pending_out,
             exit_cleanup,
         } = self;
         let mut cpu = ctrl.initial_cpu();
         control::pin(id, cpu);
-        let overhead = sockets
-            .iter()
-            .map(|(f, _)| f.overhead())
-            .max()
-            .expect("outer sockets");
+        let family = socket.0;
+        let overhead = family.overhead();
         let stride = (overhead + usize::from(session.mss()) + OPT_HEADROOM).max(MIN_STRIDE);
+        let sockets = std::slice::from_ref(&socket);
         let mut out = RawSink {
-            sockets: &sockets,
-            sender: raw::Sender::new(sockets[0].0),
+            sockets,
+            sender: raw::Sender::new(family),
             pending: pending_out,
         };
         session.start(Instant::now(), &mut out);
         let mut generation = session.generation();
         let mut driver = TunDriver::new(tun.as_fd(), stride - overhead);
         let mut attached = mode == Mode::Exit;
-        let mut receivers: Vec<_> = sockets
-            .iter()
-            .map(|(f, _)| raw::Receiver::new(*f, stride))
-            .collect();
-        let mut fds = vec![
+        let mut rx = raw::Receiver::new(family, stride);
+        let mut fds = [
             sys::pollfd(tun.as_raw_fd(), libc::POLLIN),
             sys::pollfd(ctrl.wake_fd().as_raw_fd(), libc::POLLIN),
             sys::pollfd(-1, libc::POLLIN),
+            sys::pollfd(socket.1.as_raw_fd(), libc::POLLIN),
         ];
-        for (_, fd) in &sockets {
-            fds.push(sys::pollfd(fd.as_raw_fd(), libc::POLLIN));
-        }
         let mut busy = false;
         let mut applied_gen = 0;
         while !stop.load(Ordering::Relaxed) && !ctrl.is_stopped() {
@@ -581,20 +568,12 @@ impl Worker {
             } else {
                 0
             };
-            for (index, _) in sockets.iter().enumerate() {
-                let poll_index = index + 3;
-                fds[poll_index].events = libc::POLLIN
-                    | if out
-                        .pending
-                        .packets
-                        .front()
-                        .is_some_and(|p| OuterFamily::of(p.metadata) == sockets[index].0)
-                    {
-                        libc::POLLOUT
-                    } else {
-                        0
-                    };
-            }
+            fds[3].events = libc::POLLIN
+                | if out.pending.packets.is_empty() {
+                    0
+                } else {
+                    libc::POLLOUT
+                };
             let timeout = if busy || (driver.has_reads() && out.room(&driver, stride, 1)) {
                 0
             } else {
@@ -619,7 +598,7 @@ impl Worker {
             let now = Instant::now();
             let read_allowed = out.room(&driver, stride, 1);
             driver.service(attached, read_allowed);
-            if fds[3..].iter().any(|fd| fd.revents & sys::WRITE_READY != 0) {
+            if fds[3].revents & sys::WRITE_READY != 0 {
                 out.flush();
             }
             if fds[0].revents & sys::WRITE_READY != 0 {
@@ -627,17 +606,10 @@ impl Worker {
             }
             let mut tun_ready = (fds[0].revents & libc::POLLIN != 0 || driver.has_reads())
                 && out.room(&driver, stride, 1);
-            let mut raw_ready = [false; 2];
-            for (index, ready) in raw_ready[..sockets.len()].iter_mut().enumerate() {
-                *ready = fds[index + 3].revents & libc::POLLIN != 0;
-            }
+            let mut raw_ready = fds[3].revents & libc::POLLIN != 0;
             for _ in 0..ROUNDS {
-                for (index, ready) in raw_ready[..sockets.len()].iter_mut().enumerate() {
-                    if !*ready {
-                        continue;
-                    }
-                    let rx = &mut receivers[index];
-                    *ready = match rx.receive(sockets[index].1.as_fd()) {
+                if raw_ready {
+                    raw_ready = match rx.receive(socket.1.as_fd()) {
                         Ok(m) => {
                             for k in 0..m {
                                 let n = rx.lens[k];
@@ -669,9 +641,6 @@ impl Worker {
                     };
                 }
                 if tun_ready && out.room(&driver, stride, 1) {
-                    let index = out.socket_index(session.family());
-                    let overhead = sockets[index].0.overhead();
-                    let rx = &mut receivers[index];
                     let mut reads = 0;
                     let mut count = 0;
                     let mut bytes = 0;
@@ -691,7 +660,6 @@ impl Worker {
                     }
                     if let Some(dst) = batch_dst {
                         out.data(
-                            index,
                             rx.lens[..count]
                                 .iter()
                                 .enumerate()
@@ -702,11 +670,11 @@ impl Worker {
                 } else {
                     tun_ready = false;
                 }
-                if !raw_ready.iter().any(|ready| *ready) && !tun_ready {
+                if !raw_ready && !tun_ready {
                     break;
                 }
             }
-            busy = raw_ready.iter().any(|ready| *ready) || tun_ready;
+            busy = raw_ready || tun_ready;
             if now >= session.next_deadline() {
                 session.on_tick(now, &mut out);
             }

@@ -46,7 +46,7 @@ images are available at `ghcr.io/huihuimoe/ghostun:latest`.
 ```sh
 umask 077
 {
-    printf 'auth_key = "'
+    printf '[global]\nauth_key = "'
     od -An -N32 -tx1 /dev/urandom | tr -d ' \n'
     printf '"\n'
 } > auth.toml
@@ -144,7 +144,7 @@ ghostun [options] [entry|exit]
 | `-V`, `--version` | — | Print version and exit |
 | `-h`, `--help` | — | Show help and exit |
 
-All CLI options can be placed in the TOML file using `snake_case` keys (`mode = "entry"` or `"exit"`). Explicit CLI flags override file values. See [`deploy/config.example.toml`](deploy/config.example.toml).
+TOML files group settings into `[global]`, `[entry]`, and `[exit]` sections using `snake_case` keys (`mode = "entry"` or `"exit"` under `[global]`); only `[global]` and the active role section are read. Explicit CLI flags override file values. See [`deploy/config.example.toml`](deploy/config.example.toml).
 
 ## Deployment
 

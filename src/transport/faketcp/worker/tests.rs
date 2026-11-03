@@ -25,7 +25,7 @@ fn test_cfg(key_byte: u8, cpus: Option<&str>) -> Config {
     std::fs::write(
         &path,
         format!(
-            "mode = 'entry'\nremote = '203.0.113.9:443'\nauth_key = '{hex}'\nconns = 2\n{cpus_line}"
+            "[global]\nmode = 'entry'\nauth_key = '{hex}'\n[entry]\nremote = '203.0.113.9:443'\nconns = 2\n{cpus_line}"
         ),
     )
     .unwrap();

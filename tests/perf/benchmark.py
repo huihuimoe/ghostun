@@ -173,7 +173,7 @@ class Topology:
         self.cleanup()
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         auth_file = LOG_DIR / f"{self.transport}-auth.toml"
-        auth_file.write_text(f'auth_key = "{AUTH_KEY}"\nping_interval = 1\ndead_timeout = 4\n')
+        auth_file.write_text(f'[global]\nauth_key = "{AUTH_KEY}"\nping_interval = 1\ndead_timeout = 4\n')
 
         for n in ["entry", "fw", "exit", "inet"]:
             run(["ip", "netns", "add", n])
