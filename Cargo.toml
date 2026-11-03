@@ -22,7 +22,7 @@ sha2 = "0.11.1"
 getrandom = "0.4.3"
 netlink-sys = "0.9"
 netlink-packet-core = "0.9"
-netlink-packet-route = "0.33"
+netlink-packet-route = "0.34"
 netlink-packet-netfilter = "0.4"
 zerocopy = { version = "0.8", features = ["derive"] }
 
