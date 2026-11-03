@@ -76,14 +76,17 @@ start_relay() {
 }
 if [[ $RELAY == 1 ]]; then
     start_relay
+    FAMILY=$OUTER_FAMILY; ENTRY_FAMILY=()
     if [[ $OUTER_FAMILY == ipv4 ]]; then REMOTE=$RELAY_IP:8443; else REMOTE="[$RELAY_IP]:8443"; fi
+else
+    FAMILY=mixed; ENTRY_FAMILY=(--outer-family mixed); MTU=1360
 fi
 start_exit() {
-    ip netns exec exit "$BIN" --config "$LOG/exit.toml" exit --transport tcp --listen 443 --outer-family "$OUTER_FAMILY" --conns $N --outer-mtu 1420 >"$LOG/exit.log" 2>&1 &
+    ip netns exec exit "$BIN" --config "$LOG/exit.toml" exit --transport tcp --listen 443 --outer-family "$FAMILY" --conns $N --outer-mtu 1420 >"$LOG/exit.log" 2>&1 &
     EXIT_PID=$!; PIDS+=("$EXIT_PID")
 }
 start_entry() {
-    ip netns exec entry "$BIN" --config "$LOG/entry.toml" entry --transport tcp --remote "$REMOTE" --iface e0 --conns $N --outer-mtu 1420 >"$LOG/entry.log" 2>&1 &
+    ip netns exec entry "$BIN" --config "$LOG/entry.toml" entry --transport tcp --remote "$REMOTE" "${ENTRY_FAMILY[@]}" --iface e0 --conns $N --outer-mtu 1420 >"$LOG/entry.log" 2>&1 &
     ENTRY_PID=$!; PIDS+=("$ENTRY_PID")
     for _ in $(seq 50); do
         ns entry ip -o link show up dev ghostun0 2>/dev/null | grep -q . && break; sleep 0.1
@@ -109,7 +112,7 @@ s=socket.socket(socket.AF_INET6 if ':' in sys.argv[1] else socket.AF_INET)
 s.bind((sys.argv[1],443));s.listen();time.sleep(30)
 PYTEST
 occupied=$!; PIDS+=("$occupied"); sleep 0.2
-if ns exit "$BIN" --config "$LOG/auth.toml" exit --transport tcp --listen 443 --outer-family "$OUTER_FAMILY" --tun failed0 --conns $N --outer-mtu 1420 >"$LOG/failed-start.log" 2>&1; then fail "occupied listener accepted startup"; fi
+if ns exit "$BIN" --config "$LOG/auth.toml" exit --transport tcp --listen 443 --outer-family "$FAMILY" --tun failed0 --conns $N --outer-mtu 1420 >"$LOG/failed-start.log" 2>&1; then fail "occupied listener accepted startup"; fi
 ! ns exit ip link show failed0 >/dev/null 2>&1 || fail "failed startup leaked TUN"
 ! ns exit nft list table inet ghostun_failed0 >/dev/null 2>&1 || fail "failed startup leaked rules"
 kill "$occupied"; wait "$occupied" 2>/dev/null || true
@@ -213,7 +216,7 @@ pass "malformed framing closes candidate without disturbing active slots"
 # Freeze the old Entry's userspace while its kernel sockets stay alive. A fully
 # authenticated new Entry must immediately replace slots without waiting for liveness expiry.
 kill -STOP "$ENTRY_PID"
-ip netns exec inet "$BIN" --config "$LOG/auth.toml" entry --transport tcp --remote "$([[ $OUTER_FAMILY == ipv4 ]] && echo "$EXIT_IP:443" || echo "[$EXIT_IP]:443")" --iface i0 --tun takeover0 --conns $N --outer-mtu 1420 >"$LOG/takeover.log" 2>&1 &
+ip netns exec inet "$BIN" --config "$LOG/auth.toml" entry --transport tcp --remote "$([[ $OUTER_FAMILY == ipv4 ]] && echo "$EXIT_IP:443" || echo "[$EXIT_IP]:443")" "${ENTRY_FAMILY[@]}" --iface i0 --tun takeover0 --conns $N --outer-mtu 1420 >"$LOG/takeover.log" 2>&1 &
 replacement=$!; PIDS+=("$replacement")
 connected=false
 for _ in $(seq 20); do

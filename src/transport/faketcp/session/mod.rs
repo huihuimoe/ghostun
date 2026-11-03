@@ -158,6 +158,11 @@ impl Session {
         self.generation
     }
 
+    /// The active connection's family; exit candidates do not change it before authentication.
+    pub fn family(&self) -> OuterFamily {
+        OuterFamily::of(self.local.ip())
+    }
+
     pub fn mss(&self) -> u16 {
         self.cfg.mss
     }

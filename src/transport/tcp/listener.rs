@@ -26,7 +26,7 @@ pub(super) type Slots = Arc<Vec<Mutex<Slot>>>;
 
 /// Owns listener setup before any workers start.
 pub struct Listener {
-    listener: TcpListener,
+    listeners: Vec<TcpListener>,
     wake: OwnedFd,
     pub(super) slots: Slots,
     mtu: u16,
@@ -35,12 +35,16 @@ pub struct Listener {
 
 impl Listener {
     pub fn bind(cfg: &Config, mtu: u16) -> io::Result<Self> {
-        // Explicit IPV6_V6ONLY keeps one selected outer family per instance.
-        let listener = sys::tcp::listener(
-            SocketAddr::new(cfg.exit_ip(), cfg.listen.unwrap()),
-            cfg.iface.as_deref(),
-        )?;
-        listener.set_nonblocking(true)?;
+        let mut listeners = Vec::new();
+        for &family in cfg.socket_families() {
+            let ip = cfg.listen_ip.unwrap_or_else(|| family.unspecified());
+            let listener = sys::tcp::listener(
+                SocketAddr::new(ip, cfg.listen.unwrap()),
+                cfg.iface.as_deref(),
+            )?;
+            listener.set_nonblocking(true)?;
+            listeners.push(listener);
+        }
         let wake = sys::eventfd()?;
         let slots = Arc::new(
             (0..cfg.conns)
@@ -56,7 +60,7 @@ impl Listener {
                 .collect(),
         );
         Ok(Self {
-            listener,
+            listeners,
             wake,
             slots,
             mtu,
@@ -84,11 +88,14 @@ impl Listener {
     fn run(self, stop: &AtomicBool) {
         let cap = (2 * self.slots.len()).min(256);
         let mut candidates: Vec<Candidate> = Vec::with_capacity(cap);
-        let mut fds = Vec::with_capacity(cap + 2);
+        let candidate_offset = self.listeners.len() + 1;
+        let mut fds = Vec::with_capacity(cap + candidate_offset);
         while !stop.load(Ordering::Relaxed) {
             // Candidate count is bounded; poll all sockets and listener without per-candidate threads.
             fds.clear();
-            fds.push(pollfd(self.listener.as_raw_fd(), libc::POLLIN));
+            for listener in &self.listeners {
+                fds.push(pollfd(listener.as_raw_fd(), libc::POLLIN));
+            }
             fds.push(pollfd(self.wake.as_raw_fd(), libc::POLLIN));
             for c in &candidates {
                 fds.push(pollfd(
@@ -111,7 +118,7 @@ impl Listener {
                 log::error!("accept poll: {e}");
                 return;
             }
-            sys::poll_wake(fds[1], self.wake.as_fd());
+            sys::poll_wake(fds[self.listeners.len()], self.wake.as_fd());
             if stop.load(Ordering::Relaxed) {
                 break;
             }
@@ -119,7 +126,7 @@ impl Listener {
             let mut i = 0;
             while i < candidates.len() {
                 let expired = now.duration_since(candidates[i].conn.since) >= candidates[i].timeout;
-                if fds[i + 2].revents == 0 && !expired {
+                if fds[i + candidate_offset].revents == 0 && !expired {
                     i += 1;
                     continue;
                 }
@@ -127,7 +134,7 @@ impl Listener {
                     Ok(false) => i += 1,
                     result => {
                         let candidate = candidates.swap_remove(i);
-                        fds.swap_remove(i + 2);
+                        fds.swap_remove(i + candidate_offset);
                         let (id, local, peer) = (
                             candidate.identity.map(|v| v.0),
                             candidate.conn.local,
@@ -147,10 +154,13 @@ impl Listener {
                     }
                 }
             }
-            if fds[0].revents & READ_READY != 0 {
+            for (index, listener) in self.listeners.iter().enumerate() {
+                if fds[index].revents & READ_READY == 0 {
+                    continue;
+                }
                 // Bound accepts per turn so hostile arrivals cannot starve candidate deadlines.
                 for _ in 0..BATCH {
-                    match self.listener.accept() {
+                    match listener.accept() {
                         Ok((socket, peer)) => {
                             if candidates.len() == cap {
                                 drop(socket);

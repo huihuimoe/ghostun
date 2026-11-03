@@ -25,8 +25,8 @@ remote = "203.0.113.10:443"
 # --- exit only (required) ---
 # Outer listen port or IP:PORT (e.g. 443, "192.0.2.10:443", or "[2001:db8::10]:443").
 # listen = 443
-# Outer transport family (exit only; inferred when listen includes an IP).
-# outer_family = "ipv4"  # or "ipv6"; one family per instance
+# Outer listen family: "ipv4" (listen only IPv4), "ipv6" (listen only IPv6), or "mixed" (listen both).
+# outer_family = "ipv4"
 
 # Inner TUN interface; bind your proxy outbound to it (SO_BINDTODEVICE).
 tun_name = "ghostun0"
@@ -43,8 +43,8 @@ tun_name = "ghostun0"
 # cpus = "0-3"
 
 # Outer path MTU (default: MTU of the egress interface, else 1500) and inner TUN MTU
-# (default: outer_mtu - 40 for outer IPv4, outer_mtu - 60 for outer IPv6).
-# Inner IPv6 requires tun_mtu >= 1280, hence outer_mtu >= 1320 (IPv4) or 1340 (IPv6).
+# (default: outer_mtu - 40 for outer IPv4, outer_mtu - 60 for outer IPv6 or mixed).
+# Inner IPv6 requires tun_mtu >= 1280, hence outer_mtu >= 1320 (IPv4) or 1340 (IPv6/mixed).
 # outer_mtu = 1500
 # TCP peers must have equal effective MTUs; set a common value if detected defaults differ.
 # tun_mtu = 1460

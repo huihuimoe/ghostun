@@ -11,7 +11,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use netlink_packet_netfilter::nftables::NfTablesMessage;
 
-use crate::config::{Config, Mode, Transport};
+use crate::config::{Config, Mode, OuterMode, Transport};
 use crate::net::{Cidr, OuterFamily};
 use crate::sys;
 
@@ -19,7 +19,8 @@ use crate::sys;
 pub struct NftSpec {
     pub mode: Mode,
     pub transport: Transport,
-    pub outer_family: OuterFamily,
+    /// None matches both IP families in the inet table.
+    pub outer_family: Option<OuterFamily>,
     pub tun_name: String,
     /// Entry: exit node outer address.
     pub remote: Option<SocketAddr>,
@@ -39,7 +40,11 @@ impl NftSpec {
         Self {
             mode: cfg.mode,
             transport: cfg.transport,
-            outer_family: cfg.outer_family,
+            outer_family: if cfg.mode == Mode::Exit && cfg.outer_family == OuterMode::Mixed {
+                None
+            } else {
+                Some(cfg.socket_families()[0])
+            },
             tun_name: cfg.tun_name.clone(),
             remote: cfg.remote,
             base_port: cfg.base_port,

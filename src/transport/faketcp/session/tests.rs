@@ -1114,3 +1114,52 @@ fn shutdown_discards_old_backlog_before_queueing_closing_controls() {
         assert_ne!(parsed(&packet.bytes).meta.flags & flags::RST, 0);
     }
 }
+
+#[test]
+fn wildcard_exit_allows_authenticated_takeover_between_families() {
+    let mut pair = Pair::new(0, 1, 310);
+    let mut exit_cfg = cfg(Mode::Exit, 0, 1);
+    exit_cfg.local_ip = "0.0.0.0".parse().unwrap();
+    exit_cfg.mss = 1440;
+    pair.exit = Session::new(exit_cfg, pair.t, 311).unwrap();
+    pair.connect();
+    let old_meta = pair.entry.meta(EXIT, flags::PSH | flags::ACK);
+    for (local_ip, remote, overhead) in [
+        ("2001:db8:1::1", "[2001:db8:2::1]:443", 60),
+        ("192.0.2.10", "198.51.100.20:443", 40),
+    ] {
+        let mut candidate_cfg = cfg(Mode::Entry, 0, 1);
+        candidate_cfg.local_ip = local_ip.parse().unwrap();
+        candidate_cfg.remote = Some(remote.parse().unwrap());
+        candidate_cfg.mss = 1440;
+        let previous_family = pair.exit.family();
+        let previous_generation = pair.exit.generation();
+        let mut candidate = Session::new(candidate_cfg, pair.t, 312 + overhead).unwrap();
+        let auth = start_auth(&mut candidate, &mut pair.exit, pair.t);
+        assert_eq!(
+            pair.exit.family(),
+            previous_family,
+            "unauthenticated candidate changed active family"
+        );
+        assert_eq!(pair.exit.generation(), previous_generation);
+        let mut wire = Wire::default();
+        candidate.on_outer(pair.t, &auth.challenge, &mut wire);
+        pair.entry = candidate;
+        pair.pump(wire.take());
+        assert!(pair.entry.is_established());
+        assert!(pair.exit.is_established());
+        assert_eq!(
+            pair.exit.family(),
+            OuterFamily::of(local_ip.parse().unwrap())
+        );
+        assert!(pair.exit.generation() > previous_generation);
+        let inner = vec![0x45; 1440];
+        let data = encap(&mut pair.entry, &inner, overhead as usize).unwrap();
+        assert_eq!(pair.pump(vec![data]).0, vec![inner.clone()]);
+        let reply = encap(&mut pair.exit, &inner, overhead as usize).unwrap();
+        assert_eq!(parsed(&reply).payload, inner);
+        let mut wire = Wire::default();
+        let stale = frame(old_meta, &inner);
+        assert!(pair.exit.on_outer(pair.t, &stale, &mut wire).is_none());
+    }
+}

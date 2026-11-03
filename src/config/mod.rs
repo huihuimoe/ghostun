@@ -27,6 +27,49 @@ pub enum Transport {
     Tcp,
 }
 
+/// Configured outer policy; sockets and packets always use a concrete `OuterFamily`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, FromArgValue)]
+#[serde(rename_all = "lowercase")]
+pub enum OuterMode {
+    #[default]
+    Ipv4,
+    Ipv6,
+    Mixed,
+}
+
+impl OuterMode {
+    pub fn families(self) -> &'static [OuterFamily] {
+        match self {
+            Self::Ipv4 => &[OuterFamily::Ipv4],
+            Self::Ipv6 => &[OuterFamily::Ipv6],
+            Self::Mixed => &[OuterFamily::Ipv4, OuterFamily::Ipv6],
+        }
+    }
+
+    pub const fn overhead(self) -> usize {
+        match self {
+            Self::Ipv4 => OuterFamily::Ipv4.overhead(),
+            Self::Ipv6 | Self::Mixed => OuterFamily::Ipv6.overhead(),
+        }
+    }
+
+    pub const fn min_mtu(self) -> u32 {
+        match self {
+            Self::Ipv4 => OuterFamily::Ipv4.min_mtu(),
+            Self::Ipv6 | Self::Mixed => OuterFamily::Ipv6.min_mtu(),
+        }
+    }
+}
+
+impl From<OuterFamily> for OuterMode {
+    fn from(family: OuterFamily) -> Self {
+        match family {
+            OuterFamily::Ipv4 => Self::Ipv4,
+            OuterFamily::Ipv6 => Self::Ipv6,
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct AuthKey(pub [u8; 32]);
 
@@ -150,7 +193,7 @@ pub struct Config {
     pub listen: Option<u16>,
     /// Optional specific outer listen IP in exit mode (`None` means wildcard).
     pub listen_ip: Option<IpAddr>,
-    pub outer_family: OuterFamily,
+    pub outer_family: OuterMode,
     cli: Cli,
 }
 
@@ -165,10 +208,19 @@ impl Config {
         }
     }
 
-    /// Bound exit listen IP, or the outer family's unspecified wildcard address.
+    /// Initial exit address; mixed sessions learn the concrete local address at admission.
     pub fn exit_ip(&self) -> IpAddr {
         self.listen_ip
-            .unwrap_or_else(|| self.outer_family.unspecified())
+            .unwrap_or_else(|| self.outer_family.families()[0].unspecified())
+    }
+
+    /// Entry opens only its remote's family, even when mixed reserves IPv6 overhead.
+    pub fn socket_families(&self) -> &[OuterFamily] {
+        match self.remote {
+            Some(remote) if remote.is_ipv4() => &[OuterFamily::Ipv4],
+            Some(_) => &[OuterFamily::Ipv6],
+            None => self.outer_family.families(),
+        }
     }
 
     pub fn resolve_tun_mtu(&self, outer_mtu: u32) -> Result<u32, String> {
@@ -232,9 +284,9 @@ struct Cli {
     /// outer listen port or IP:PORT (exit only)
     #[argh(option, arg_name = "[IP:]PORT")]
     listen: Option<ListenSpec>,
-    /// outer address family; entry derives it from --remote [default: ipv4]
+    /// outer family: ipv4, ipv6, or mixed; entry accepts mixed or derives from --remote
     #[argh(option)]
-    outer_family: Option<OuterFamily>,
+    outer_family: Option<OuterMode>,
     /// inner TUN interface name [default: ghostun0]
     #[argh(option, long = "tun", arg_name = "NAME")]
     tun_name: Option<String>,
@@ -305,7 +357,7 @@ struct File {
     no_masq: bool,
     remote: Option<SocketAddr>,
     listen: Option<ListenSpec>,
-    outer_family: Option<OuterFamily>,
+    outer_family: Option<OuterMode>,
 }
 
 pub fn load() -> Result<Config, String> {
@@ -371,21 +423,17 @@ fn build_config(cli: Cli, running_conns: Option<u16>) -> Result<Config, String> 
     let listen_ip = listen_spec.and_then(|l| l.ip);
     let listen_family = listen_spec.and_then(|l| l.family);
     let outer_family = cli.outer_family.or(file.outer_family);
-    if mode == Mode::Entry && outer_family.is_some() {
-        return Err(
-            "`outer_family` is only valid in exit mode; entry uses the remote address family"
-                .into(),
-        );
+    if mode == Mode::Entry && outer_family.is_some_and(|f| f != OuterMode::Mixed) {
+        return Err("entry accepts only explicit `outer_family = mixed`; otherwise it uses the remote address family".into());
     }
     if let (Some(explicit), Some(inferred)) = (outer_family, listen_family) {
-        if explicit != inferred {
-            return Err("`outer_family` conflicts with `listen` address family".into());
+        if explicit != OuterMode::from(inferred) {
+            return Err("`outer_family` conflicts with `listen` address family; mixed requires a bare listen port".into());
         }
     }
-    let outer_family = remote
-        .map(|r| OuterFamily::of(r.ip()))
-        .or(listen_family)
-        .or(outer_family)
+    let outer_family = outer_family
+        .or_else(|| remote.map(|r| OuterFamily::of(r.ip()).into()))
+        .or_else(|| listen_family.map(Into::into))
         .unwrap_or_default();
     let no_masq = cli.no_masq || file.no_masq;
     match mode {

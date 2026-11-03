@@ -189,7 +189,9 @@ fn u32_attribute(kind: u16, value: u32) -> DefaultNla {
 
 fn outer(spec: &NftSpec, incoming: bool) -> Rule {
     let mut rule = Rule::default();
-    rule.family(spec.outer_family);
+    if let Some(family) = spec.outer_family {
+        rule.family(family);
+    }
     match spec.mode {
         Mode::Entry => {
             let remote = spec.remote.expect("entry netfilter spec requires remote");

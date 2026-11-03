@@ -11,7 +11,7 @@ fn spec() -> NftSpec {
     NftSpec {
         mode: Mode::Exit,
         transport: Transport::Tcp,
-        outer_family: OuterFamily::Ipv4,
+        outer_family: Some(OuterFamily::Ipv4),
         tun_name: "nft_atomic".into(),
         remote: None,
         base_port: 30000,

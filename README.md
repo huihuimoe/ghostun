@@ -74,6 +74,22 @@ FakeTCP is the default. For direct TCP or a terminating TCP relay, add
 Both peers must use the same `--conns` and effective `--tun-mtu`.
 Changing transport requires a restart.
 
+For dual-stack outer admission, set `--outer-family mixed` on both peers. Exit
+listens on IPv4 and IPv6 at the same port; use a bare `--listen` port. Entry still
+connects to one `--remote` IP literal. Both peers reserve 60 bytes of overhead,
+including over IPv4: outer MTU 1500 gives TUN MTU 1440. Exit detects both families'
+egress MTUs and uses the smaller value; set a common MTU if peer defaults differ.
+
+```sh
+ghostun --config auth.toml exit --listen 443 --outer-family mixed --conns 4
+ghostun --config auth.toml entry --remote 203.0.113.10:443 --outer-family mixed --conns 4
+```
+
+Both transports keep one active authenticated connection per worker. Different
+workers may use different families; a new authenticated connection can take over
+its worker across families. This remains one logical P2P tunnel. Mixed does not
+add multiple remotes, load balancing, or automatic fallback.
+
 3. Bind your proxy outbound to `ghostun0` (Entry does not alter system routes):
 
 **sing-box**
@@ -111,7 +127,7 @@ ghostun [options] [entry|exit]
 | `--config PATH` | — | TOML configuration file (required for `auth_key`) |
 | `--remote IP:PORT` | — | Entry only: Exit outer address (IP literal) |
 | `--listen [IP:]PORT` | — | Exit only: outer listen port or `IP:PORT` |
-| `--outer-family ipv4\|ipv6` | `ipv4` | Exit only: outer transport family (inferred when `--listen` includes an IP) |
+| `--outer-family ipv4\|ipv6\|mixed` | Exit: `ipv4`; Entry: remote family | Exit listener family; Entry can select `mixed` to reserve IPv6 overhead |
 | `--conns N` | CPU count | Number of pinned workers and outer connections (`1..=256`) |
 | `--cpus LIST` | all usable CPUs | Worker CPU list or ranges (e.g. `0,1` or `2-3`) |
 | `--tun NAME` | `ghostun0` | Inner TUN device name (`[A-Za-z0-9_.-]`, up to 15 chars) |
@@ -119,7 +135,7 @@ ghostun [options] [entry|exit]
 | `--tun-ipv6 CIDR` | `fd00:200::1/126` / `::2/126` | Inner IPv6 address (Entry / Exit) |
 | `--no-ipv6` | off | Disable inner IPv6 |
 | `--outer-mtu MTU` | egress MTU or `1500` | Outer path MTU |
-| `--tun-mtu MTU` | `outer_mtu - 40` / `- 60` | Inner TUN MTU (IPv4 / IPv6 outer overhead) |
+| `--tun-mtu MTU` | `outer_mtu - 40` / `- 60` | Inner TUN MTU (IPv4 / IPv6 or mixed overhead) |
 | `--iface IFACE` | route lookup | Outer interface (Entry egress; Exit socket bind and masquerade) |
 | `--base-port PORT` | `32768` | FakeTCP Entry source-port pool; TCP warns and ignores explicit values |
 | `--ping-interval SECS` | `5` | Health probe interval |

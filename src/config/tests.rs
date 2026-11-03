@@ -355,7 +355,7 @@ fn validation_errors() {
 #[test]
 fn outer_family_is_independent_of_inner_ipv6() {
     let c = parse(&["entry", "--remote", "[2001:db8::1]:443", "--no-ipv6"]).unwrap();
-    assert_eq!(c.outer_family, OuterFamily::Ipv6);
+    assert_eq!(c.outer_family, OuterMode::Ipv6);
     assert_eq!(c.tun_ipv6, None);
     let c = with_file(
         "v6-family",
@@ -363,14 +363,14 @@ fn outer_family_is_independent_of_inner_ipv6() {
         &[],
     )
     .unwrap();
-    assert_eq!(c.outer_family, OuterFamily::Ipv6);
+    assert_eq!(c.outer_family, OuterMode::Ipv6);
     let c = with_file(
         "v6-override",
         "mode = 'exit'\nlisten = 443\nouter_family = 'ipv6'\n",
         &["exit", "--outer-family", "ipv4"],
     )
     .unwrap();
-    assert_eq!(c.outer_family, OuterFamily::Ipv4);
+    assert_eq!(c.outer_family, OuterMode::Ipv4);
     assert!(with_file(
         "entry-family",
         "mode = 'entry'\nremote = '[2001:db8::1]:443'\nouter_family = 'ipv6'\n",
@@ -378,15 +378,15 @@ fn outer_family_is_independent_of_inner_ipv6() {
     )
     .is_err());
     let v6_listen = parse(&["exit", "--listen", "[2001:db8::1]:443"]).unwrap();
-    assert_eq!(v6_listen.outer_family, OuterFamily::Ipv6);
+    assert_eq!(v6_listen.outer_family, OuterMode::Ipv6);
     assert_eq!(v6_listen.listen, Some(443));
     assert_eq!(v6_listen.listen_ip, Some("2001:db8::1".parse().unwrap()));
     let v6_wild = with_file("v6-wild", "mode = 'exit'\nlisten = '[::]:8443'\n", &[]).unwrap();
-    assert_eq!(v6_wild.outer_family, OuterFamily::Ipv6);
+    assert_eq!(v6_wild.outer_family, OuterMode::Ipv6);
     assert_eq!(v6_wild.listen, Some(8443));
     assert_eq!(v6_wild.listen_ip, None);
     let v4_wild = parse(&["exit", "--listen", "0.0.0.0:443"]).unwrap();
-    assert_eq!(v4_wild.outer_family, OuterFamily::Ipv4);
+    assert_eq!(v4_wild.outer_family, OuterMode::Ipv4);
     assert_eq!(v4_wild.listen_ip, None);
     assert!(parse(&[
         "exit",
@@ -400,8 +400,55 @@ fn outer_family_is_independent_of_inner_ipv6() {
 }
 
 #[test]
+fn mixed_preserves_policy_but_entry_opens_only_the_remote_family() {
+    for (remote, family) in [
+        ("192.0.2.1:443", OuterFamily::Ipv4),
+        ("[2001:db8::1]:443", OuterFamily::Ipv6),
+    ] {
+        let c = parse(&["entry", "--remote", remote, "--outer-family", "mixed"]).unwrap();
+        assert_eq!(c.outer_family, OuterMode::Mixed);
+        assert_eq!(c.socket_families(), &[family]);
+        assert_eq!(c.resolve_tun_mtu(1500).unwrap(), 1440);
+        assert_eq!(c.resolve_tun_mtu(1420).unwrap(), 1360);
+        let spec = crate::netfilter::NftSpec::from_config(&c, 0);
+        assert_eq!(spec.outer_family, Some(family));
+    }
+    let c = with_file(
+        "mixed-exit",
+        "mode = 'exit'\nlisten = 443\nouter_family = 'mixed'\n",
+        &[],
+    )
+    .unwrap();
+    assert_eq!(c.outer_family, OuterMode::Mixed);
+    assert_eq!(c.socket_families(), &[OuterFamily::Ipv4, OuterFamily::Ipv6]);
+    assert_eq!(
+        crate::netfilter::NftSpec::from_config(&c, 443).outer_family,
+        None
+    );
+    for listen in [
+        "192.0.2.1:443",
+        "[2001:db8::1]:443",
+        "0.0.0.0:443",
+        "[::]:443",
+    ] {
+        assert!(
+            parse(&["exit", "--listen", listen, "--outer-family", "mixed"])
+                .unwrap_err()
+                .contains("bare listen port")
+        );
+    }
+    let c = with_file(
+        "mixed-override",
+        "mode = 'exit'\nlisten = 443\nouter_family = 'mixed'\n",
+        &["--outer-family", "ipv4"],
+    )
+    .unwrap();
+    assert_eq!(c.outer_family, OuterMode::Ipv4);
+}
+
+#[test]
 fn mtu_validation_uses_outer_family_and_detected_mtu() {
-    for (family, overhead) in [("ipv4", 40), ("ipv6", 60)] {
+    for (family, overhead) in [("ipv4", 40), ("ipv6", 60), ("mixed", 60)] {
         let mut c = parse(&["exit", "--listen", "443", "--outer-family", family]).unwrap();
         assert_eq!(c.resolve_tun_mtu(1500).unwrap(), 1500 - overhead);
         assert_eq!(c.resolve_tun_mtu(1280 + overhead).unwrap(), 1280);

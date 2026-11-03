@@ -22,32 +22,50 @@ extern "C" fn on_signal(sig: libc::c_int) {
     sys::eventfd_notify(MAIN_WAKE.load(Ordering::Relaxed));
 }
 
+fn interface_mtu(dev: &str) -> u32 {
+    sys::iface_mtu(dev).unwrap_or_else(|e| {
+        log::warn!("cannot read MTU of {dev} ({e}), assuming 1500");
+        1500
+    })
+}
+
 fn resolve_outer(cfg: &Config) -> Result<Outer, String> {
-    let (local_ip, dev) = match (cfg.mode, cfg.remote) {
-        (Mode::Entry, Some(remote)) => {
-            let route = route::route_to(remote.ip(), cfg.iface.as_deref())
-                .map_err(|e| format!("route to {remote}: {e}"))?;
-            (route.src, Some(route.dev))
+    if let Some(remote) = cfg.remote {
+        let route = route::route_to(remote.ip(), cfg.iface.as_deref())
+            .map_err(|e| format!("route to {remote}: {e}"))?;
+        let mtu = cfg.outer_mtu.unwrap_or_else(|| interface_mtu(&route.dev));
+        return Ok(Outer {
+            local_ip: route.src,
+            dev: Some(route.dev),
+            mtu,
+        });
+    }
+    let mut devs = Vec::new();
+    for &family in cfg.socket_families() {
+        if let Some(dev) = cfg
+            .iface
+            .clone()
+            .or_else(|| route::default_route_dev(family).ok())
+        {
+            if !devs.contains(&dev) {
+                devs.push(dev);
+            }
         }
-        _ => (
-            cfg.exit_ip(),
-            cfg.iface
-                .clone()
-                .or_else(|| route::default_route_dev(cfg.outer_family).ok()),
-        ),
-    };
-    let mtu = match (cfg.outer_mtu, &dev) {
-        (Some(mtu), _) => mtu,
-        (None, Some(dev)) => sys::iface_mtu(dev).unwrap_or_else(|e| {
-            log::warn!("cannot read MTU of {dev} ({e}), assuming 1500");
-            1500
-        }),
-        (None, None) => {
-            log::warn!("no egress interface found, assuming outer MTU 1500");
-            1500
-        }
-    };
-    Ok(Outer { local_ip, dev, mtu })
+    }
+    let mtu = cfg.outer_mtu.unwrap_or_else(|| {
+        devs.iter()
+            .map(|dev| interface_mtu(dev))
+            .min()
+            .unwrap_or_else(|| {
+                log::warn!("no egress interface found, assuming outer MTU 1500");
+                1500
+            })
+    });
+    Ok(Outer {
+        local_ip: cfg.exit_ip(),
+        dev: (devs.len() == 1).then(|| devs.pop().expect("single egress device")),
+        mtu,
+    })
 }
 
 pub fn run(mut cfg: Config) -> Result<(), String> {
@@ -78,7 +96,20 @@ pub fn run(mut cfg: Config) -> Result<(), String> {
             outer.local_ip,
             cfg.remote.expect("validated")
         ),
-        Mode::Exit => format!("listen {}", SocketAddr::new(outer.local_ip, listen_port)),
+        Mode::Exit => format!(
+            "listen {}",
+            cfg.socket_families()
+                .iter()
+                .map(|family| {
+                    SocketAddr::new(
+                        cfg.listen_ip.unwrap_or_else(|| family.unspecified()),
+                        listen_port,
+                    )
+                    .to_string()
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     };
     let tun_addrs = match cfg.tun_ipv6 {
         Some(v6) => format!("{}, {v6}", cfg.tun_ipv4),
