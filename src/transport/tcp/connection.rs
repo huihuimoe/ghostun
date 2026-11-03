@@ -10,7 +10,7 @@ use super::{can_io, BATCH, ROUNDS};
 use crate::sys::{self, READ_READY, WRITE_READY};
 use crate::transport::keepalive::{self, Keepalive};
 
-pub(super) struct Connection {
+pub struct Connection {
     pub(super) socket: TcpStream,
     pub(super) local: SocketAddr,
     pub(super) peer: SocketAddr,

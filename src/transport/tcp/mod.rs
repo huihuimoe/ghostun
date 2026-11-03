@@ -12,9 +12,8 @@ mod worker;
 
 use std::io;
 
-use connection::Connection;
-
-pub use listener::Listener;
+pub use connection::Connection;
+pub use listener::{Listener, SharedExitState};
 pub use worker::Worker;
 
 const ROUNDS: usize = 4;

@@ -2,9 +2,12 @@
 
 use std::net::{IpAddr, SocketAddr};
 
+use super::frame::flags;
 use crate::net::{ipv4, ipv6, tcp, OuterFamily};
 
 const ACCEPT: u32 = u32::MAX;
+const OFF_DATA_OFFSET: u32 = 12;
+const OFF_FLAGS: u32 = 13;
 
 /// Linear cBPF builder: conditions fall through on success and share one rejection tail.
 struct Prog(Vec<libc::sock_filter>);
@@ -21,6 +24,16 @@ impl Prog {
         self.0.push(libc::sock_filter {
             code: code as u16,
             jt: 0,
+            jf: 0,
+            k,
+        });
+        self
+    }
+
+    fn branch_eq(&mut self, k: u32) -> &mut Self {
+        self.0.push(libc::sock_filter {
+            code: JEQ as u16,
+            jt: 1,
             jf: 0,
             k,
         });
@@ -47,10 +60,19 @@ impl Prog {
     }
 
     fn finish(&mut self) -> Vec<libc::sock_filter> {
-        let reject = self.0.len() + 1;
+        self.finish_at(self.0.len())
+    }
+
+    fn finish_at(&mut self, tail: usize) -> Vec<libc::sock_filter> {
+        let accept = self.0.len();
+        let reject = accept + 1;
         for (pc, ins) in self.0.iter_mut().enumerate() {
             if u32::from(ins.code) & 0x07 == libc::BPF_JMP {
-                ins.jf = (reject - pc - 1) as u8;
+                if ins.jt != 0 {
+                    ins.jt = (tail - pc - 1) as u8;
+                } else {
+                    ins.jf = (reject - pc - 1) as u8;
+                }
             }
         }
         let ret = libc::BPF_RET | libc::BPF_K;
@@ -58,14 +80,19 @@ impl Prog {
         std::mem::take(&mut self.0)
     }
 }
-
+const LD_LEN: u32 = libc::BPF_LD | libc::BPF_W | libc::BPF_LEN;
 const LD_W_ABS: u32 = libc::BPF_LD | libc::BPF_W | libc::BPF_ABS;
 const LDX_IHL: u32 = libc::BPF_LDX | libc::BPF_B | libc::BPF_MSH;
 const LD_H_IND: u32 = libc::BPF_LD | libc::BPF_H | libc::BPF_IND;
+const LD_B_IND: u32 = libc::BPF_LD | libc::BPF_B | libc::BPF_IND;
 const JEQ: u32 = libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K;
 const JGE: u32 = libc::BPF_JMP | libc::BPF_JGE | libc::BPF_K;
 const MOD: u32 = libc::BPF_ALU | libc::BPF_MOD | libc::BPF_K;
-
+const AND: u32 = libc::BPF_ALU | libc::BPF_AND | libc::BPF_K;
+const LSH: u32 = libc::BPF_ALU | libc::BPF_LSH | libc::BPF_K;
+const RSH: u32 = libc::BPF_ALU | libc::BPF_RSH | libc::BPF_K;
+const ADD_X: u32 = libc::BPF_ALU | libc::BPF_ADD | libc::BPF_X;
+const TAX: u32 = libc::BPF_MISC | libc::BPF_TAX;
 // Raw sockets only see reassembled datagrams, so the filters need no fragment handling.
 
 /// Entry worker `i`: `saddr == exit.ip && sport == exit.port && dport >= base_port && dport % n == i`.
@@ -83,25 +110,60 @@ pub fn entry_filter(exit: SocketAddr, base_port: u16, n: u16, i: u16) -> Vec<lib
         .finish()
 }
 
-/// Exit worker `i`: `dport == listen_port && sport % n == i` (and `daddr == listen_ip` when set).
-pub fn exit_filter(
+/// Exit listener: `dport == listen_port` (and `daddr == listen_ip` when set), accepting only
+/// `SYN` or control frames (`PSH|ACK` with `payload[0] < 4`) so tunnel data never wakes the listener.
+pub fn exit_listener_filter(
     family: OuterFamily,
     listen_ip: Option<IpAddr>,
     listen_port: u16,
-    n: u16,
-    i: u16,
 ) -> Vec<libc::sock_filter> {
     let mut p = Prog(Vec::new());
-    p.init(family)
+    // Valid SYN and control frames (Proof is 181 B) are always < 256 B; reject bulk data immediately.
+    p.stmt(LD_LEN, 0)
+        .stmt(AND, !0xff)
+        .stmt(JEQ, 0)
+        .init(family)
         .stmt(LD_H_IND, tcp::OFF_DPORT as u32)
         .stmt(JEQ, u32::from(listen_port))
-        .stmt(LD_H_IND, tcp::OFF_SPORT as u32)
-        .stmt(MOD, u32::from(n))
-        .stmt(JEQ, u32::from(i));
+        .stmt(LD_B_IND, OFF_FLAGS)
+        .stmt(AND, u32::from(flags::SYN | flags::ACK | flags::RST))
+        .branch_eq(u32::from(flags::SYN))
+        .stmt(LD_B_IND, OFF_FLAGS)
+        .stmt(
+            AND,
+            u32::from(flags::PSH | flags::ACK | flags::SYN | flags::RST),
+        )
+        .stmt(JEQ, u32::from(flags::PSH | flags::ACK))
+        .stmt(LD_B_IND, OFF_DATA_OFFSET)
+        .stmt(RSH, 4)
+        .stmt(JGE, 5)
+        .stmt(LSH, 2)
+        .stmt(ADD_X, 0)
+        .stmt(TAX, 0)
+        .stmt(LD_B_IND, 0)
+        .stmt(AND, 0xfc)
+        .stmt(JEQ, 0);
+    let tail = p.0.len();
     if let Some(ip) = listen_ip {
         p.ip(ip, ipv4::OFF_DST, ipv6::OFF_DST);
     }
-    p.finish()
+    p.finish_at(tail)
+}
+
+/// Exit worker: steers by `(sport == peer.port() && dport == local.port() && !SYN)`.
+/// Full 32-bit/128-bit endpoint addresses are verified in userspace by `Session::on_exit_outer`
+/// without per-packet `SKF_NET_OFF` kernel helper calls.
+pub fn exit_worker_filter(local: SocketAddr, peer: SocketAddr) -> Vec<libc::sock_filter> {
+    let mut p = Prog(Vec::new());
+    p.init(OuterFamily::of(local.ip()))
+        .stmt(LD_H_IND, tcp::OFF_SPORT as u32)
+        .stmt(JEQ, u32::from(peer.port()))
+        .stmt(LD_H_IND, tcp::OFF_DPORT as u32)
+        .stmt(JEQ, u32::from(local.port()))
+        .stmt(LD_B_IND, OFF_FLAGS)
+        .stmt(AND, u32::from(flags::SYN))
+        .stmt(JEQ, 0)
+        .finish()
 }
 
 #[cfg(test)]
@@ -123,20 +185,41 @@ mod tests {
                 transport + k as usize
             }
         };
-        let h = |at: usize| u32::from(u16::from_be_bytes([pkt[at], pkt[at + 1]]));
         loop {
             let ins = prog[pc];
             pc += 1;
             let code = u32::from(ins.code);
             let k = ins.k;
             match code {
+                LD_LEN => a = (pkt.len() - transport) as u32,
                 LD_W_ABS => {
                     let at = offset(k);
+                    if at + 4 > pkt.len() {
+                        return 0;
+                    }
                     a = u32::from_be_bytes(pkt[at..at + 4].try_into().unwrap())
                 }
                 LDX_IHL => x = u32::from(pkt[k as usize] & 0x0f) * 4,
-                LD_H_IND => a = h(offset(x + k)),
+                LD_H_IND => {
+                    let at = offset(x + k);
+                    if at + 2 > pkt.len() {
+                        return 0;
+                    }
+                    a = u32::from(u16::from_be_bytes([pkt[at], pkt[at + 1]]));
+                }
+                LD_B_IND => {
+                    let at = offset(x + k);
+                    if at >= pkt.len() {
+                        return 0;
+                    }
+                    a = u32::from(pkt[at]);
+                }
                 MOD => a %= k,
+                AND => a &= k,
+                LSH => a <<= k,
+                RSH => a >>= k,
+                ADD_X => a = a.wrapping_add(x),
+                TAX => x = a,
                 c if c == libc::BPF_LDX | libc::BPF_IMM => x = k,
                 JEQ | JGE => {
                     let taken = if code == JEQ { a == k } else { a >= k };
@@ -184,71 +267,69 @@ mod tests {
     }
 
     #[test]
-    fn exit_filter_steers_by_sport_residue() {
-        let me = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 7), 443);
-        let from = |sport| {
-            frame_with_options(
-                0,
-                0,
-                &[],
-                SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), sport),
-                me,
-            )
+    fn exit_listener_and_worker_filters_separate_handshakes_from_4tuple_data() {
+        let me = SocketAddr::from(B);
+        let peer: SocketAddr = "192.0.2.1:40001".parse().unwrap();
+        let other_peer: SocketAddr = "192.0.2.1:40002".parse().unwrap();
+        let listener = exit_listener_filter(OuterFamily::Ipv4, None, 443);
+        let bound_listener = exit_listener_filter(OuterFamily::Ipv4, Some(me.ip()), 443);
+        let worker = exit_worker_filter(me, peer);
+        let make = |src: SocketAddr, dst: SocketAddr, fl: u8, payload: &[u8]| {
+            let mut buf = vec![0u8; 40 + payload.len()];
+            buf[40..].copy_from_slice(payload);
+            let m = TcpMeta {
+                src,
+                dst,
+                seq: 1,
+                ack: 2,
+                flags: fl,
+                window: 65535,
+            };
+            let n = write_headers(&mut buf, &m, payload.len(), 0);
+            buf.truncate(n);
+            buf
         };
+        let syn = make(peer, me, flags::SYN, &[]);
+        let hello = make(peer, me, flags::PSH | flags::ACK, &[3, 1, 1]);
+        let ping = make(peer, me, flags::PSH | flags::ACK, &[1, 0, 0]);
+        let v4_data = make(peer, me, flags::PSH | flags::ACK, &[0x45, 0, 0, 20]);
+        let v6_data = make(peer, me, flags::PSH | flags::ACK, &[0x60, 0, 0, 0]);
+        let bare_ack = make(peer, me, flags::ACK, &[]);
+        let rst = make(peer, me, flags::RST | flags::ACK, &[]);
+
+        assert_eq!(run_bpf(&listener, &syn), ACCEPT);
+        assert_eq!(run_bpf(&bound_listener, &syn), ACCEPT);
+        assert_eq!(run_bpf(&listener, &hello), ACCEPT);
+        assert_eq!(run_bpf(&listener, &ping), ACCEPT);
+        assert_eq!(run_bpf(&listener, &v4_data), 0, "listener drops inner IPv4");
+        assert_eq!(run_bpf(&listener, &v6_data), 0, "listener drops inner IPv6");
+        assert_eq!(run_bpf(&listener, &bare_ack), 0, "listener drops bare ACK");
+        assert_eq!(run_bpf(&listener, &rst), 0, "listener drops RST");
         assert_eq!(
             run_bpf(
-                &exit_filter(OuterFamily::Ipv4, None, 443, 3, 2),
-                &from(40001)
-            ),
-            ACCEPT
-        ); // 40001 % 3 == 2
-        assert_eq!(
-            run_bpf(
-                &exit_filter(OuterFamily::Ipv4, None, 443, 3, 0),
-                &from(40001)
-            ),
-            0
-        );
-        assert_eq!(
-            run_bpf(
-                &exit_filter(OuterFamily::Ipv4, None, 444, 3, 2),
-                &from(40001)
-            ),
-            0,
-            "wrong dport"
-        );
-        assert_eq!(
-            run_bpf(
-                &exit_filter(OuterFamily::Ipv4, Some((*me.ip()).into()), 443, 3, 2),
-                &from(40001)
-            ),
-            ACCEPT
-        );
-        assert_eq!(
-            run_bpf(
-                &exit_filter(
+                &exit_listener_filter(
                     OuterFamily::Ipv4,
                     Some(Ipv4Addr::new(198, 51, 100, 8).into()),
-                    443,
-                    3,
-                    2
+                    443
                 ),
-                &from(40001)
+                &syn
             ),
             0,
             "wrong destination IP"
         );
-        let with_opts = frame_with_options(
-            8,
-            0,
-            &[],
-            SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 40001),
-            me,
-        );
+
+        assert_eq!(run_bpf(&worker, &syn), 0, "worker drops SYN");
+        assert_eq!(run_bpf(&worker, &v4_data), ACCEPT);
+        assert_eq!(run_bpf(&worker, &v6_data), ACCEPT);
+        assert_eq!(run_bpf(&worker, &bare_ack), ACCEPT);
+        assert_eq!(run_bpf(&worker, &rst), ACCEPT);
         assert_eq!(
-            run_bpf(&exit_filter(OuterFamily::Ipv4, None, 443, 3, 2), &with_opts),
-            ACCEPT,
-            "IHL=28"
+            run_bpf(
+                &worker,
+                &make(other_peer, me, flags::PSH | flags::ACK, &[0x45])
+            ),
+            0,
+            "wrong peer port"
         );
     }
 
@@ -285,37 +366,24 @@ mod tests {
         m.src = entry;
         m.dst = exit;
         write_headers(&mut buf, &m, 0, 0);
+        let worker_filter = exit_worker_filter(exit, entry);
+        assert_eq!(run_bpf(&worker_filter, &buf[..len]), ACCEPT);
+        m.src.set_port(40002);
+        write_headers(&mut buf, &m, 0, 0);
+        assert_eq!(run_bpf(&worker_filter, &buf[..len]), 0);
+        m.src = entry;
+        m.flags = flags::SYN;
+        let len = write_headers(&mut buf, &m, 0, 0);
         assert_eq!(
             run_bpf(
-                &exit_filter(OuterFamily::Ipv6, None, 443, 3, 2),
+                &exit_listener_filter(OuterFamily::Ipv6, Some(exit.ip()), 443),
                 &buf[..len]
             ),
             ACCEPT
         );
         assert_eq!(
             run_bpf(
-                &exit_filter(OuterFamily::Ipv6, Some(exit.ip()), 443, 3, 2),
-                &buf[..len]
-            ),
-            ACCEPT
-        );
-        assert_eq!(
-            run_bpf(
-                &exit_filter(OuterFamily::Ipv6, Some(entry.ip()), 443, 3, 2),
-                &buf[..len]
-            ),
-            0
-        );
-        assert_eq!(
-            run_bpf(
-                &exit_filter(OuterFamily::Ipv6, None, 443, 3, 1),
-                &buf[..len]
-            ),
-            0
-        );
-        assert_eq!(
-            run_bpf(
-                &exit_filter(OuterFamily::Ipv6, None, 444, 3, 2),
+                &exit_listener_filter(OuterFamily::Ipv6, Some(entry.ip()), 443),
                 &buf[..len]
             ),
             0

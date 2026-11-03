@@ -12,6 +12,7 @@ use serde::Deserialize;
 
 use crate::net::{ipv4, ipv6, Cidr, OuterFamily};
 
+pub const MAX_CONNS: usize = 256;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, FromArgValue)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
@@ -296,7 +297,7 @@ struct Cli {
     /// inner IPv6 address [default: entry fd00:200::1/126, exit fd00:200::2/126]
     #[argh(option, arg_name = "CIDR")]
     tun_ipv6: Option<String>,
-    /// outer connections = worker threads; must match on both ends [default: CPU count]
+    /// outer connections = worker threads (entry only) [default: CPU count]
     #[argh(option, arg_name = "N")]
     conns: Option<u16>,
     /// worker CPU list or ranges, e.g. 0,1 or 2-3 [default: all usable CPUs]
@@ -436,10 +437,12 @@ fn build_config(cli: Cli, running_conns: Option<u16>) -> Result<Config, String> 
         .or_else(|| listen_family.map(Into::into))
         .unwrap_or_default();
     let no_masq = cli.no_masq || file.no_masq;
+    let conns = cli.conns.or(file.conns);
     match mode {
         Mode::Entry if listen.is_some() => return Err("`listen` is only valid in exit mode".into()),
         Mode::Entry if no_masq => return Err("`no_masq` is only valid in exit mode".into()),
         Mode::Exit if remote.is_some() => return Err("`remote` is only valid in entry mode".into()),
+        Mode::Exit if conns.is_some() => return Err("`conns` is only valid in entry mode".into()),
         _ => {}
     }
     let (v4_default, v6_default) = match mode {
@@ -471,8 +474,8 @@ fn build_config(cli: Cli, running_conns: Option<u16>) -> Result<Config, String> 
         .transpose()?;
     let default_conns = running_conns.unwrap_or_else(|| {
         cpus.as_ref().map_or_else(
-            || std::thread::available_parallelism().map_or(1, |n| n.get().min(256) as u16),
-            |c| c.len().min(256) as u16,
+            || std::thread::available_parallelism().map_or(1, |n| n.get().min(MAX_CONNS) as u16),
+            |c| c.len().min(MAX_CONNS) as u16,
         )
     });
     let cfg = Config {
@@ -505,7 +508,11 @@ fn build_config(cli: Cli, running_conns: Option<u16>) -> Result<Config, String> 
             .unwrap_or_else(|| "ghostun0".into()),
         tun_ipv4,
         tun_ipv6,
-        conns: cli.conns.or(file.conns).unwrap_or(default_conns),
+        conns: if mode == Mode::Entry {
+            conns.unwrap_or(default_conns)
+        } else {
+            0
+        },
         outer_mtu: cli.outer_mtu.or(file.outer_mtu),
         tun_mtu: cli.tun_mtu.or(file.tun_mtu),
         iface: cli.iface.clone().or(file.iface),
@@ -601,9 +608,6 @@ fn validate(c: &Config) -> Result<(), String> {
             "invalid TUN name {name:?}: 1-15 characters of [A-Za-z0-9_.-]"
         ));
     }
-    if !(1..=256).contains(&c.conns) {
-        return Err("`conns` must be within 1..=256".into());
-    }
     if let Some(m) = c.outer_mtu {
         c.resolve_tun_mtu(m)?;
     } else if let Some(m) = c.tun_mtu {
@@ -622,6 +626,9 @@ fn validate(c: &Config) -> Result<(), String> {
     }
     match c.mode {
         Mode::Entry => {
+            if !(1..=MAX_CONNS as u16).contains(&c.conns) {
+                return Err(format!("`conns` must be within 1..={MAX_CONNS}"));
+            }
             let remote = c.remote.ok_or("entry mode requires `remote` (IP:PORT)")?;
             if remote.port() == 0 {
                 return Err("`remote` port must not be 0".into());

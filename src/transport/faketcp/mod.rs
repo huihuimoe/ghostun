@@ -8,4 +8,5 @@ mod session;
 mod tun_driver;
 mod worker;
 
-pub use worker::Worker;
+pub use session::Promoted;
+pub use worker::{Listener, SharedExitState, Worker};

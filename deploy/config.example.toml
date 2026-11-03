@@ -18,9 +18,11 @@ transport = "faketcp"  # or "tcp", which also supports terminating TCP relays
 # larger values allow more unsent data to queue. CLI: --tcp-notsent 128.
 # tcp_notsent = 64
 
-# --- entry only (required) ---
-# Outer address of the exit node. IPv6 example: "[2001:db8::10]:443".
+# --- entry only ---
+# Outer address of the exit node (required). IPv6 example: "[2001:db8::10]:443".
 remote = "203.0.113.10:443"
+# Outer connections = worker threads (default: number of CPUs).
+# conns = 4
 
 # --- exit only (required) ---
 # Outer listen port or IP:PORT (e.g. 443, "192.0.2.10:443", or "[2001:db8::10]:443").
@@ -36,9 +38,6 @@ tun_name = "ghostun0"
 # tun_ipv6 = "fd00:200::1/126"
 # no_ipv6 = false  # inner IPv6 only; independent of the outer family
 
-# Outer connections = worker threads, one per CPU. MUST be identical on entry and exit.
-# Default: number of CPUs.
-# conns = 4
 # Optional worker CPU affinity list or ranges (e.g. "0,1" or "2-3").
 # cpus = "0-3"
 

@@ -111,7 +111,7 @@ route_inner() {
 }
 
 start() {
-    ip netns exec exit "$BIN" --config "$LOG/auth.toml" exit --listen "$REMOTE" --conns "$N" "${EXIT_CPU_ARGS[@]}" --ping-interval 1 --dead-timeout $DEAD >"$LOG/exit.log" 2>&1 &
+    ip netns exec exit "$BIN" --config "$LOG/auth.toml" exit --listen "$REMOTE" "${EXIT_CPU_ARGS[@]}" --ping-interval 1 --dead-timeout $DEAD >"$LOG/exit.log" 2>&1 &
     EXIT_PID=$!
     PIDS="$EXIT_PID"
     start_entry
@@ -335,7 +335,7 @@ pass "SIGTERM: RSTs released firewall slots, ghostun0 and nft tables removed"
 # FakeTCP bypass and Exit MSS clamping (Exit tun_mtu=1280 < Entry tun_mtu and inet MTU=1420).
 ns inet ip route add 10.200.0.0/30 via 10.3.0.1
 ns inet ip -6 route add fd00:200::/126 via fd00:3::1
-ip netns exec exit "$BIN" --config "$LOG/auth.toml" exit --listen 443 --outer-family mixed --conns "$N" "${EXIT_CPU_ARGS[@]}" --tun-mtu 1280 --no-masq --ping-interval 1 --dead-timeout $DEAD >"$LOG/exit-nomasq.log" 2>&1 &
+ip netns exec exit "$BIN" --config "$LOG/auth.toml" exit --listen 443 --outer-family mixed "${EXIT_CPU_ARGS[@]}" --tun-mtu 1280 --no-masq --ping-interval 1 --dead-timeout $DEAD >"$LOG/exit-nomasq.log" 2>&1 &
 EXIT_PID=$!
 PIDS="$EXIT_PID"
 start_entry

@@ -1,20 +1,24 @@
-//! Per-core event loop pumping one TUN queue and steered raw sockets through a FakeTCP [`Session`].
+//! Per-core event loop pumping one TUN queue and steered raw socket through a FakeTCP [`Session`],
+//! plus the Exit handshake listener that authenticates incoming peers before workers are spawned.
 
+use std::collections::VecDeque;
 use std::io;
-use std::net::IpAddr;
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::net::{IpAddr, SocketAddr};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use super::filter::{entry_filter, exit_filter};
+use super::auth::{self, Auth, ExitStep, PROOF_LEN};
+use super::filter::{entry_filter, exit_listener_filter, exit_worker_filter};
+use super::frame::{self, flags, TcpMeta, MAX_OVERHEAD};
 use super::queue::Pending;
-use super::session::{Session, SessionConfig, Sink};
+use super::session::{emit, Promoted, Session, SessionConfig, Sink, WINDOW};
 use super::tun_driver::TunDriver;
-use crate::config::{Config, Mode};
+use crate::config::{AuthKey, Config, Mode, MAX_CONNS};
 use crate::net::OuterFamily;
 use crate::sys::{self, raw};
 use crate::transport::control::{self, Control};
-
 #[cfg(test)]
 mod tests;
 
@@ -113,6 +117,291 @@ impl Sink for RawSink<'_> {
     }
 }
 
+#[derive(Clone, Copy)]
+pub struct ActivePeer {
+    pub local: SocketAddr,
+    pub peer: SocketAddr,
+    pub irs: u32,
+    pub iss: u32,
+}
+
+pub struct ExitState {
+    pub(crate) key: AuthKey,
+    pub(crate) epoch: u64,
+    pub(crate) timeout: Duration,
+    pub(crate) active: Box<[Option<ActivePeer>; MAX_CONNS]>,
+    pub(crate) admitted: VecDeque<Promoted>,
+    pub(crate) main_wake: RawFd,
+}
+
+pub type SharedExitState = Arc<Mutex<ExitState>>;
+
+pub struct Listener {
+    sockets: Vec<(OuterFamily, OwnedFd)>,
+    wake: OwnedFd,
+    pub(crate) state: SharedExitState,
+    auth: Auth,
+    listen_ip: Option<IpAddr>,
+    listen_port: u16,
+    mss: u16,
+    ip_id: u16,
+}
+
+impl Listener {
+    pub fn bind(cfg: &Config, outer_mtu: u32, seed: u64, main_wake: RawFd) -> Result<Self, String> {
+        let listen_port = cfg.listen.expect("validated exit listen port");
+        let mut sockets = Vec::new();
+        for &family in cfg.socket_families() {
+            let filter = exit_listener_filter(family, cfg.listen_ip, listen_port);
+            let fd = raw::socket(family, cfg.iface.as_deref(), &filter, None)
+                .map_err(|e| format!("{family:?} raw socket: {e}"))?;
+            sockets.push((family, fd));
+        }
+        let wake = sys::eventfd().map_err(|e| format!("listener eventfd: {e}"))?;
+        let auth = Auth::new(
+            &cfg.tunables.auth_key,
+            Mode::Exit,
+            Instant::now(),
+            cfg.tunables.dead_timeout,
+        )
+        .map_err(|e| format!("initializing exit authentication: {e}"))?;
+        let state = Arc::new(Mutex::new(ExitState {
+            key: cfg.tunables.auth_key.clone(),
+            epoch: 0,
+            timeout: cfg.tunables.dead_timeout,
+            active: Box::new([None; MAX_CONNS]),
+            admitted: VecDeque::new(),
+            main_wake,
+        }));
+        Ok(Self {
+            sockets,
+            wake,
+            state,
+            auth,
+            listen_ip: cfg.listen_ip,
+            listen_port,
+            mss: (outer_mtu - cfg.outer_family.overhead() as u32) as u16,
+            ip_id: seed as u16,
+        })
+    }
+
+    pub fn wake_fd(&self) -> RawFd {
+        self.wake.as_raw_fd()
+    }
+
+    pub fn spawn(
+        self,
+        stop: &'static AtomicBool,
+        main_wake: RawFd,
+    ) -> io::Result<std::thread::JoinHandle<()>> {
+        std::thread::Builder::new()
+            .name("ghostun-fk-accept".into())
+            .spawn(move || {
+                let _guard = control::StopOnDrop(stop, main_wake);
+                self.run(stop);
+            })
+    }
+
+    fn run(self, stop: &AtomicBool) {
+        let Self {
+            sockets,
+            wake,
+            state,
+            mut auth,
+            listen_ip,
+            listen_port,
+            mss,
+            mut ip_id,
+        } = self;
+        let mut out = RawSink {
+            sockets: &sockets,
+            sender: raw::Sender::new(sockets[0].0),
+            pending: Pending::default(),
+        };
+        let mut receivers: Vec<_> = sockets
+            .iter()
+            .map(|(f, _)| raw::Receiver::new(*f, MIN_STRIDE))
+            .collect();
+        let mut fds = vec![sys::pollfd(wake.as_raw_fd(), libc::POLLIN)];
+        for (_, fd) in &sockets {
+            fds.push(sys::pollfd(fd.as_raw_fd(), libc::POLLIN));
+        }
+        let mut scratch = [0u8; MAX_OVERHEAD + PROOF_LEN];
+        let mut applied_epoch = 0;
+        while !stop.load(Ordering::Relaxed) {
+            for (index, _) in sockets.iter().enumerate() {
+                fds[index + 1].events = libc::POLLIN
+                    | if out
+                        .pending
+                        .packets
+                        .front()
+                        .is_some_and(|p| OuterFamily::of(p.metadata) == sockets[index].0)
+                    {
+                        libc::POLLOUT
+                    } else {
+                        0
+                    };
+            }
+            match sys::poll(&mut fds, -1) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(e) => {
+                    log::error!("faketcp listener poll: {e}");
+                    return;
+                }
+            }
+            if sys::poll_wake(fds[0], wake.as_fd()) {
+                let s = state.lock().unwrap();
+                if s.epoch != applied_epoch {
+                    auth.reload(&s.key, s.timeout);
+                    auth.reset();
+                    applied_epoch = s.epoch;
+                }
+            }
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            if fds[1..].iter().any(|fd| fd.revents & sys::WRITE_READY != 0) {
+                out.flush();
+            }
+            let now = Instant::now();
+            for (index, (family, fd)) in sockets.iter().enumerate() {
+                if fds[index + 1].revents & libc::POLLIN == 0 {
+                    continue;
+                }
+                let rx = &mut receivers[index];
+                for _ in 0..ROUNDS {
+                    let Ok(m) = rx.receive(fd.as_fd()) else {
+                        break;
+                    };
+                    for k in 0..m {
+                        let n = rx.lens[k];
+                        if n == 0 {
+                            continue;
+                        }
+                        let frame = &rx.buffers()[k * MIN_STRIDE..k * MIN_STRIDE + n];
+                        let Some(p) = frame::parse(frame) else {
+                            continue;
+                        };
+                        let meta = &p.meta;
+                        if meta.dst.port() != listen_port
+                            || OuterFamily::of(meta.dst.ip()) != *family
+                            || listen_ip.is_some_and(|ip| meta.dst.ip() != ip)
+                        {
+                            continue;
+                        }
+                        if meta.flags & flags::SYN != 0 {
+                            if meta.flags & (flags::ACK | flags::RST) == 0 && p.payload.is_empty() {
+                                let seq = state
+                                    .lock()
+                                    .unwrap()
+                                    .active
+                                    .iter()
+                                    .flatten()
+                                    .find(|a| {
+                                        a.local == meta.dst
+                                            && a.peer == meta.src
+                                            && a.irs == meta.seq
+                                    })
+                                    .map_or_else(|| auth.syn_cookie(now, meta), |a| a.iss);
+                                let reply = TcpMeta {
+                                    src: meta.dst,
+                                    dst: meta.src,
+                                    seq,
+                                    ack: meta.seq.wrapping_add(1),
+                                    flags: flags::SYN | flags::ACK,
+                                    window: WINDOW,
+                                };
+                                ip_id = ip_id.wrapping_add(1);
+                                let len = frame::write_syn(&mut scratch, &reply, mss, ip_id);
+                                out.send(&scratch[..len], reply.dst.ip());
+                            }
+                            continue;
+                        }
+                        if meta.flags & (flags::ACK | flags::RST) != flags::ACK {
+                            continue;
+                        }
+                        if p.payload.first() == Some(&auth::CONTROL) {
+                            match auth.on_exit_request(now, true, meta, p.payload) {
+                                Ok(ExitStep::Ignore) => {}
+                                Ok(ExitStep::Challenge(challenge)) => {
+                                    let reply = TcpMeta {
+                                        src: meta.dst,
+                                        dst: meta.src,
+                                        seq: meta.ack,
+                                        ack: meta.seq.wrapping_add(p.payload.len() as u32),
+                                        flags: flags::PSH | flags::ACK,
+                                        window: WINDOW,
+                                    };
+                                    ip_id = ip_id.wrapping_add(1);
+                                    emit(&mut scratch, &reply, &challenge, ip_id, &mut out);
+                                }
+                                Ok(ExitStep::Finished(finished)) => {
+                                    let reply = TcpMeta {
+                                        src: meta.dst,
+                                        dst: meta.src,
+                                        seq: meta.ack,
+                                        ack: meta.seq.wrapping_add(p.payload.len() as u32),
+                                        flags: flags::PSH | flags::ACK,
+                                        window: WINDOW,
+                                    };
+                                    ip_id = ip_id.wrapping_add(1);
+                                    emit(&mut scratch, &reply, &finished, ip_id, &mut out);
+                                }
+                                Ok(ExitStep::Promote(promo)) => {
+                                    let main_wake = {
+                                        let mut s = state.lock().unwrap();
+                                        s.admitted.push_back(Promoted {
+                                            worker: promo.worker,
+                                            local: meta.dst,
+                                            peer: meta.src,
+                                            req_seq: meta.seq,
+                                            req_ack: meta.ack,
+                                            req_len: p.payload.len(),
+                                            iss: promo.iss,
+                                            irs: promo.irs,
+                                            snd_nxt: promo.snd_nxt,
+                                            rcv_nxt: promo.rcv_nxt,
+                                            finished: promo.finished,
+                                        });
+                                        s.main_wake
+                                    };
+                                    sys::eventfd_notify(main_wake);
+                                }
+                                Err(e) => log::error!("authentication randomness: {e}"),
+                            }
+                        } else if !p.payload.is_empty() {
+                            let is_active = state
+                                .lock()
+                                .unwrap()
+                                .active
+                                .iter()
+                                .flatten()
+                                .any(|a| a.local == meta.dst && a.peer == meta.src);
+                            if !is_active {
+                                let rst = TcpMeta {
+                                    src: meta.dst,
+                                    dst: meta.src,
+                                    seq: meta.ack,
+                                    ack: 0,
+                                    flags: flags::RST,
+                                    window: 0,
+                                };
+                                ip_id = ip_id.wrapping_add(1);
+                                let len = frame::write_headers(&mut scratch, &rst, 0, ip_id);
+                                out.send(&scratch[..len], rst.dst.ip());
+                            }
+                        }
+                    }
+                    if m < raw::BATCH {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[inline]
 fn apply_reload(
     ctrl: &Control,
@@ -144,15 +433,16 @@ fn apply_reload(
 
 pub struct Worker {
     id: usize,
+    mode: Mode,
     session: Session,
     tun: OwnedFd,
     sockets: Vec<(OuterFamily, OwnedFd)>,
+    pending_out: Pending<IpAddr>,
+    exit_cleanup: Option<(SharedExitState, SocketAddr, SocketAddr)>,
 }
 
 impl Worker {
-    /// Opens this worker's steered raw socket and session. Entry binds to `outer_dev`, the
-    /// routed egress interface; exit binds to the configured `iface`.
-    pub fn new(
+    pub fn new_entry(
         id: usize,
         cfg: &Config,
         local_ip: IpAddr,
@@ -162,47 +452,88 @@ impl Worker {
         seed: u64,
     ) -> Result<Self, String> {
         let worker = id as u16;
-        let listen_port = cfg.listen.unwrap_or(0);
-        let bind_dev = match cfg.mode {
-            Mode::Entry => outer_dev,
-            Mode::Exit => cfg.iface.as_deref(),
-        };
-        let entry_addresses =
-            (cfg.mode == Mode::Entry).then(|| (local_ip, cfg.remote.expect("validated").ip()));
-        let mut sockets = Vec::new();
-        for &family in cfg.socket_families() {
-            let filter = match cfg.mode {
-                Mode::Entry => entry_filter(
-                    cfg.remote.expect("validated"),
-                    cfg.base_port,
-                    cfg.conns,
-                    worker,
-                ),
-                Mode::Exit => exit_filter(family, cfg.listen_ip, listen_port, cfg.conns, worker),
-            };
-            let fd = raw::socket(family, bind_dev, &filter, entry_addresses)
-                .map_err(|e| format!("{family:?} raw socket: {e}"))?;
-            sockets.push((family, fd));
-        }
+        let remote = cfg.remote.expect("validated");
+        let family = OuterFamily::of(remote.ip());
+        let filter = entry_filter(remote, cfg.base_port, cfg.conns, worker);
+        let fd = raw::socket(family, outer_dev, &filter, Some((local_ip, remote.ip())))
+            .map_err(|e| format!("{family:?} raw socket: {e}"))?;
+        let sockets = vec![(family, fd)];
         let mss = (outer_mtu - cfg.outer_family.overhead() as u32) as u16;
-        let scfg = SessionConfig::from_config(cfg, local_ip, listen_port, worker, mss);
+        let scfg = SessionConfig::from_config(cfg, local_ip, 0, worker, mss);
         let session = Session::new(scfg, Instant::now(), seed ^ (u64::from(worker) << 48))
             .map_err(|e| format!("initializing worker {worker} authentication: {e}"))?;
         Ok(Self {
             id,
+            mode: Mode::Entry,
             session,
             tun,
             sockets,
+            pending_out: Pending::default(),
+            exit_cleanup: None,
         })
     }
 
-    /// Runs until `stop` is set, then resets the outer connection so firewalls free its slot.
+    pub fn new_exit(
+        id: usize,
+        cfg: &Config,
+        outer_mtu: u32,
+        tun: OwnedFd,
+        promo: Promoted,
+        state: SharedExitState,
+        seed: u64,
+    ) -> Result<Self, String> {
+        let worker = id as u16;
+        let family = OuterFamily::of(promo.local.ip());
+        let filter = exit_worker_filter(promo.local, promo.peer);
+        let fd = raw::socket(family, cfg.iface.as_deref(), &filter, None)
+            .map_err(|e| format!("{family:?} raw socket: {e}"))?;
+        let sockets = vec![(family, fd)];
+        let mss = (outer_mtu - cfg.outer_family.overhead() as u32) as u16;
+        let scfg =
+            SessionConfig::from_config(cfg, promo.local.ip(), promo.local.port(), worker, mss);
+        state.lock().unwrap().active[id] = Some(ActivePeer {
+            local: promo.local,
+            peer: promo.peer,
+            irs: promo.irs,
+            iss: promo.iss,
+        });
+        let mut attached = false;
+        control::sync_tun_queue(id, tun.as_fd(), &mut attached, true);
+        let mut out = RawSink {
+            sockets: &sockets,
+            sender: raw::Sender::new(family),
+            pending: Pending::default(),
+        };
+        let session = Session::new_exit_established(
+            scfg,
+            &promo,
+            Instant::now(),
+            seed ^ (u64::from(worker) << 48),
+            &mut out,
+        )
+        .map_err(|e| format!("initializing exit worker {worker}: {e}"))?;
+        let pending_out = out.pending;
+        Ok(Self {
+            id,
+            mode: Mode::Exit,
+            session,
+            tun,
+            sockets,
+            pending_out,
+            exit_cleanup: Some((state, promo.local, promo.peer)),
+        })
+    }
+
+    /// Runs until `stop` is set (or the session closes on Exit).
     pub fn run(self, stop: &AtomicBool, ctrl: &Control) {
         let Self {
             id,
+            mode,
             mut session,
             tun,
             sockets,
+            pending_out,
+            exit_cleanup,
         } = self;
         let mut cpu = ctrl.initial_cpu();
         control::pin(id, cpu);
@@ -215,12 +546,12 @@ impl Worker {
         let mut out = RawSink {
             sockets: &sockets,
             sender: raw::Sender::new(sockets[0].0),
-            pending: Pending::default(),
+            pending: pending_out,
         };
         session.start(Instant::now(), &mut out);
         let mut generation = session.generation();
         let mut driver = TunDriver::new(tun.as_fd(), stride - overhead);
-        let mut attached = false;
+        let mut attached = mode == Mode::Exit;
         let mut receivers: Vec<_> = sockets
             .iter()
             .map(|(f, _)| raw::Receiver::new(*f, stride))
@@ -235,7 +566,7 @@ impl Worker {
         }
         let mut busy = false;
         let mut applied_gen = 0;
-        while !stop.load(Ordering::Relaxed) {
+        while !stop.load(Ordering::Relaxed) && !ctrl.is_stopped() {
             fds[2].fd = if driver.read_fd() == tun.as_raw_fd() {
                 -1
             } else {
@@ -282,7 +613,7 @@ impl Worker {
                 }
             }
             sys::poll_wake(fds[1], ctrl.wake_fd());
-            if stop.load(Ordering::Relaxed) {
+            if stop.load(Ordering::Relaxed) || ctrl.is_stopped() {
                 break;
             }
             let now = Instant::now();
@@ -393,12 +724,23 @@ impl Worker {
                 generation = session.generation();
             }
             let established = session.is_established();
+            if mode == Mode::Exit && !established {
+                break;
+            }
             control::sync_tun_queue(id, tun.as_fd(), &mut attached, established);
             let read_allowed = out.room(&driver, stride, 1);
             driver.service(attached, read_allowed);
             ctrl.report(applied_gen, established, wait);
         }
-        session.shutdown(&mut out);
+        if mode == Mode::Entry || stop.load(Ordering::Relaxed) || ctrl.should_send_rst() {
+            session.shutdown(&mut out);
+        }
         out.flush();
+        if let Some((state, local, peer)) = exit_cleanup {
+            let mut s = state.lock().unwrap();
+            if s.active[id].is_some_and(|a| a.local == local && a.peer == peer) {
+                s.active[id] = None;
+            }
+        }
     }
 }

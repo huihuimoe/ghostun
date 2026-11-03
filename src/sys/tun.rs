@@ -62,9 +62,9 @@ fn tun_ioctl(fd: BorrowedFd<'_>, request: libc::Ioctl, req: &mut libc::ifreq) ->
     cvt(unsafe { libc::ioctl(fd.as_raw_fd(), request, req as *mut libc::ifreq) }).map(drop)
 }
 
-/// Opens `queues` non-blocking, initially detached queue fds of one multi-queue TUN device.
+/// Opens one non-blocking, initially detached queue fd of a multi-queue TUN device.
 /// Without `IFF_PERSIST` the kernel destroys the device when the last fd closes, including on SIGKILL.
-pub fn create(name: &str, queues: usize) -> io::Result<Vec<OwnedFd>> {
+pub fn open_queue(name: &str) -> io::Result<OwnedFd> {
     if name.is_empty() || name.len() >= libc::IFNAMSIZ {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -75,21 +75,22 @@ pub fn create(name: &str, queues: usize) -> io::Result<Vec<OwnedFd>> {
     for (dst, &src) in req.ifr_name.iter_mut().zip(name.as_bytes()) {
         *dst = src as libc::c_char;
     }
-    (0..queues)
-        .map(|_| {
-            // SAFETY: plain open(2) of a NUL-terminated path; the fd is owned immediately.
-            let fd = cvt(unsafe {
-                libc::open(
-                    c"/dev/net/tun".as_ptr(),
-                    libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
-                )
-            })?;
-            let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-            tun_ioctl(fd.as_fd(), libc::TUNSETIFF as _, &mut req)?;
-            set_queue(fd.as_fd(), false)?;
-            Ok(fd)
-        })
-        .collect()
+    // SAFETY: plain open(2) of a NUL-terminated path; the fd is owned immediately.
+    let fd = cvt(unsafe {
+        libc::open(
+            c"/dev/net/tun".as_ptr(),
+            libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    })?;
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    tun_ioctl(fd.as_fd(), libc::TUNSETIFF as _, &mut req)?;
+    set_queue(fd.as_fd(), false)?;
+    Ok(fd)
+}
+
+/// Opens `queues` non-blocking, initially detached queue fds of one multi-queue TUN device.
+pub fn create(name: &str, queues: usize) -> io::Result<Vec<OwnedFd>> {
+    (0..queues).map(|_| open_queue(name)).collect()
 }
 
 /// Attaches or detaches one multi-queue TUN fd so the kernel only hashes inner flows onto

@@ -39,7 +39,7 @@ ip netns exec "$EXIT" bash -c '
     set -e
     mount -t tmpfs tmpfs /proc/sys/net/ipv6
     exec "$@"
-' _ "$BIN" --config "$LOG/auth.toml" exit --transport "$TRANSPORT" --listen 443 --iface x0 --conns 1 >"$LOG/exit.log" 2>&1 &
+' _ "$BIN" --config "$LOG/auth.toml" exit --transport "$TRANSPORT" --listen 443 --iface x0 >"$LOG/exit.log" 2>&1 &
 PIDS+=("$!")
 ip netns exec "$ENTRY" bash -c '
     set -e

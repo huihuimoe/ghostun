@@ -79,7 +79,7 @@ if [[ $RELAY == 1 ]]; then
     if [[ $OUTER_FAMILY == ipv4 ]]; then REMOTE=$RELAY_IP:8443; else REMOTE="[$RELAY_IP]:8443"; fi
 fi
 start_exit() {
-    ip netns exec exit "$BIN" --config "$LOG/exit.toml" exit --transport tcp --tcp-notsent 64 --listen 443 --outer-family "$OUTER_FAMILY" --conns $N --outer-mtu 1420 >"$LOG/exit.log" 2>&1 &
+    ip netns exec exit "$BIN" --config "$LOG/exit.toml" exit --transport tcp --tcp-notsent 64 --listen 443 --outer-family "$OUTER_FAMILY" --outer-mtu 1420 >"$LOG/exit.log" 2>&1 &
     EXIT_PID=$!; PIDS+=("$EXIT_PID")
 }
 start_entry() {
@@ -109,7 +109,7 @@ s=socket.socket(socket.AF_INET6 if ':' in sys.argv[1] else socket.AF_INET)
 s.bind((sys.argv[1],443));s.listen();time.sleep(30)
 PYTEST
 occupied=$!; PIDS+=("$occupied"); sleep 0.2
-if ns exit "$BIN" --config "$LOG/auth.toml" exit --transport tcp --listen 443 --outer-family "$OUTER_FAMILY" --tun failed0 --conns $N --outer-mtu 1420 >"$LOG/failed-start.log" 2>&1; then fail "occupied listener accepted startup"; fi
+if ns exit "$BIN" --config "$LOG/auth.toml" exit --transport tcp --listen 443 --outer-family "$OUTER_FAMILY" --tun failed0 --outer-mtu 1420 >"$LOG/failed-start.log" 2>&1; then fail "occupied listener accepted startup"; fi
 ! ns exit ip link show failed0 >/dev/null 2>&1 || fail "failed startup leaked TUN"
 ! ns exit nft list table inet ghostun_failed0 >/dev/null 2>&1 || fail "failed startup leaked rules"
 kill "$occupied"; wait "$occupied" 2>/dev/null || true
@@ -147,7 +147,7 @@ EXIT_FDS=$(fd_count "$EXIT_PID")
 pass "$OUTER_FAMILY relay=$RELAY: exact TCP/UDP payloads in both directions, dual-stack, $N connections, ordinary TCP rules"
 
 # Wrong-key and mismatched parameters cannot disturb existing slots or carry data.
-for args in "wrong.toml 2 $MTU" "auth.toml 3 $MTU" "auth.toml 2 $((MTU-20))"; do
+for args in "wrong.toml 2 $MTU" "auth.toml 2 $((MTU-20))"; do
     read -r file conns mtu <<<"$args"
     ip netns exec inet "$BIN" --config "$LOG/$file" entry --transport tcp --remote "$([[ $OUTER_FAMILY == ipv4 ]] && echo "$EXIT_IP:443" || echo "[$EXIT_IP]:443")" --iface i0 --tun unauth0 --conns "$conns" --outer-mtu 1420 --tun-mtu "$mtu" --ping-interval 1 --dead-timeout $DEAD >"$LOG/rejected.log" 2>&1 &
     bad=$!; PIDS+=("$bad"); sleep 0.5
@@ -162,7 +162,7 @@ ip netns exec inet python3 - "$EXIT_IP" <<'PY' >"$LOG/saturation.log" 2>&1 &
 import select,socket,sys,time
 address=sys.argv[1]; family=socket.AF_INET6 if ':' in address else socket.AF_INET
 sockets=[]
-for _ in range(20):
+for _ in range(272):
  s=socket.socket(family); s.settimeout(1); s.connect((address,443)); sockets.append(s)
 pending=set(sockets)
 deadline=time.monotonic()+1
@@ -172,7 +172,7 @@ while pending and time.monotonic()<deadline:
   except ConnectionResetError: data=b''
   assert data==b''
   pending.remove(s)
-assert len(pending)==4, f'expected 4 candidates before auth deadline, got {len(pending)}'
+assert len(pending)==256, f'expected 256 candidates before auth deadline, got {len(pending)}'
 # The initial candidates must time out and make capacity available again.
 time.sleep(4)
 for s in pending:

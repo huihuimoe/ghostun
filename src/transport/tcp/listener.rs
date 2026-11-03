@@ -1,6 +1,7 @@
 //! Exit-side accept dispatcher: authenticates bounded candidates and hands them to workers.
 //! The dispatcher never owns a TUN queue.
 
+use std::collections::VecDeque;
 use std::io;
 use std::net::{SocketAddr, TcpListener};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
@@ -8,33 +9,35 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use super::auth::{self, Handshake, Params};
+use super::auth::{self, Handshake};
 use super::{invalid, Connection, BATCH};
-use crate::config::{AuthKey, Config};
+use crate::config::{AuthKey, Config, MAX_CONNS};
 use crate::sys::{self, poll, poll_ms, pollfd, READ_READY};
 use crate::transport::control;
 
-pub(super) struct Slot {
-    pub(super) key: AuthKey,
-    pub(super) epoch: u64,
-    pub(super) timeout: Duration,
-    pub(super) pending: Option<Connection>,
-    pub(super) wake: RawFd,
+pub const MAX_CANDIDATES: usize = MAX_CONNS;
+
+pub struct ExitState {
+    pub(crate) key: AuthKey,
+    pub(crate) epoch: u64,
+    pub(crate) timeout: Duration,
+    pub(crate) admitted: VecDeque<(usize, Connection)>,
+    pub(crate) main_wake: RawFd,
 }
 
-pub(super) type Slots = Arc<Vec<Mutex<Slot>>>;
+pub type SharedExitState = Arc<Mutex<ExitState>>;
 
-/// Owns listener setup before any workers start.
+/// Owns listener setup before the accept loop starts.
 pub struct Listener {
     listeners: Vec<TcpListener>,
     wake: OwnedFd,
-    pub(super) slots: Slots,
+    pub(crate) state: SharedExitState,
     mtu: u16,
     tcp_notsent: u32,
 }
 
 impl Listener {
-    pub fn bind(cfg: &Config, mtu: u16) -> io::Result<Self> {
+    pub fn bind(cfg: &Config, mtu: u16, main_wake: RawFd) -> io::Result<Self> {
         let mut listeners = Vec::new();
         for &family in cfg.socket_families() {
             let ip = cfg.listen_ip.unwrap_or_else(|| family.unspecified());
@@ -46,23 +49,17 @@ impl Listener {
             listeners.push(listener);
         }
         let wake = sys::eventfd()?;
-        let slots = Arc::new(
-            (0..cfg.conns)
-                .map(|_| {
-                    Mutex::new(Slot {
-                        key: cfg.tunables.auth_key.clone(),
-                        epoch: 0,
-                        timeout: cfg.tunables.dead_timeout,
-                        pending: None,
-                        wake: -1,
-                    })
-                })
-                .collect(),
-        );
+        let state = Arc::new(Mutex::new(ExitState {
+            key: cfg.tunables.auth_key.clone(),
+            epoch: 0,
+            timeout: cfg.tunables.dead_timeout,
+            admitted: VecDeque::new(),
+            main_wake,
+        }));
         Ok(Self {
             listeners,
             wake,
-            slots,
+            state,
             mtu,
             tcp_notsent: cfg.tcp_notsent,
         })
@@ -86,10 +83,9 @@ impl Listener {
     }
 
     fn run(self, stop: &AtomicBool) {
-        let cap = (2 * self.slots.len()).min(256);
-        let mut candidates: Vec<Candidate> = Vec::with_capacity(cap);
+        let mut candidates: Vec<Candidate> = Vec::with_capacity(MAX_CANDIDATES);
         let candidate_offset = self.listeners.len() + 1;
-        let mut fds = Vec::with_capacity(cap + candidate_offset);
+        let mut fds = Vec::with_capacity(MAX_CANDIDATES + candidate_offset);
         while !stop.load(Ordering::Relaxed) {
             // Candidate count is bounded; poll all sockets and listener without per-candidate threads.
             fds.clear();
@@ -130,7 +126,7 @@ impl Listener {
                     i += 1;
                     continue;
                 }
-                match candidates[i].advance(&self.slots, self.mtu) {
+                match candidates[i].advance(&self.state, self.mtu) {
                     Ok(false) => i += 1,
                     result => {
                         let candidate = candidates.swap_remove(i);
@@ -140,7 +136,7 @@ impl Listener {
                             candidate.conn.local,
                             candidate.conn.peer,
                         );
-                        if let Err(e) = result.and_then(|_| candidate.admit(&self.slots, self.mtu))
+                        if let Err(e) = result.and_then(|_| candidate.admit(&self.state, self.mtu))
                         {
                             match id {
                                 Some(id) => log::debug!(
@@ -162,7 +158,7 @@ impl Listener {
                 for _ in 0..BATCH {
                     match listener.accept() {
                         Ok((socket, peer)) => {
-                            if candidates.len() == cap {
+                            if candidates.len() == MAX_CANDIDATES {
                                 drop(socket);
                                 continue;
                             }
@@ -170,7 +166,7 @@ impl Listener {
                                 Ok(conn) => candidates.push(Candidate {
                                     conn,
                                     identity: None,
-                                    timeout: self.slots[0].lock().unwrap().timeout,
+                                    timeout: self.state.lock().unwrap().timeout,
                                 }),
                                 Err(e) => log::debug!("candidate setup ({peer}): {e}"),
                             }
@@ -195,7 +191,7 @@ pub(super) struct Candidate {
 }
 
 impl Candidate {
-    pub(super) fn advance(&mut self, slots: &Slots, mtu: u16) -> io::Result<bool> {
+    pub(super) fn advance(&mut self, state: &SharedExitState, mtu: u16) -> io::Result<bool> {
         let now = Instant::now();
         if now.duration_since(self.conn.since) >= self.timeout {
             return Err(io::Error::new(
@@ -209,27 +205,13 @@ impl Candidate {
             }
             let hello = self.conn.rx.payload();
             let p = auth::hello_params(hello)?;
-            let slot = slots
-                .get(p.worker as usize)
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("invalid worker ID {} (conns={})", p.worker, slots.len()),
-                    )
-                })?
-                .lock()
-                .unwrap();
-            self.timeout = slot.timeout;
-            self.identity = Some((p.worker as usize, slot.epoch));
-            let (auth, challenge) = Handshake::exit(
-                &slot.key,
-                Params {
-                    worker: p.worker,
-                    conns: slots.len() as u16,
-                    mtu,
-                },
-                hello,
-            )?;
+            let (key, epoch, timeout) = {
+                let s = state.lock().unwrap();
+                (s.key.clone(), s.epoch, s.timeout)
+            };
+            let (auth, challenge) = Handshake::exit(&key, mtu, hello)?;
+            self.timeout = timeout;
+            self.identity = Some((usize::from(p.worker), epoch));
             self.conn.auth = Some(auth);
             self.conn.tx.push(&challenge);
             self.conn.rx.clear();
@@ -237,16 +219,16 @@ impl Candidate {
         self.conn.authenticate(now, self.timeout)
     }
 
-    pub(super) fn admit(mut self, slots: &Slots, mtu: u16) -> io::Result<()> {
+    pub(super) fn admit(mut self, state: &SharedExitState, mtu: u16) -> io::Result<()> {
         let (id, epoch) = self.identity.unwrap();
         let wake = {
-            let mut slot = slots[id].lock().unwrap();
-            if slot.epoch != epoch {
+            let mut s = state.lock().unwrap();
+            if s.epoch != epoch {
                 return Err(invalid("authentication invalidated by key reload"));
             }
             self.conn.establish(mtu);
-            slot.pending = Some(self.conn);
-            slot.wake
+            s.admitted.push_back((id, self.conn));
+            s.main_wake
         };
         sys::eventfd_notify(wake);
         Ok(())

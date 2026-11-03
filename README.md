@@ -52,12 +52,11 @@ umask 077
 } > auth.toml
 ```
 
-2. Start Exit and Entry (`--conns` must match on both ends):
+2. Start Exit and Entry (`--conns` is set on Entry; Exit spawns workers per connection):
 
 ```sh
 # Exit (IPv4 outer)
-ghostun --config auth.toml exit --listen 443 --conns 4
-
+ghostun --config auth.toml exit --listen 443
 # Entry (IPv4 outer)
 ghostun --config auth.toml entry --remote 203.0.113.10:443 --conns 4
 ```
@@ -65,13 +64,13 @@ ghostun --config auth.toml entry --remote 203.0.113.10:443 --conns 4
 For an IPv6 outer path, set `--outer-family ipv6` on Exit and pass a bracketed IPv6 address on Entry:
 
 ```sh
-ghostun --config auth.toml exit --listen 443 --outer-family ipv6 --conns 4
+ghostun --config auth.toml exit --listen 443 --outer-family ipv6
 ghostun --config auth.toml entry --remote '[2001:db8::10]:443' --conns 4
 ```
 
 FakeTCP is the default. For direct TCP or a terminating TCP relay, add
 `--transport tcp` on both peers and point Entry at Exit or the relay.
-Both peers must use the same `--conns` and effective `--tun-mtu`.
+Both peers must use the same effective `--tun-mtu`.
 Changing transport requires a restart.
 
 For dual-stack outer admission, set `--outer-family mixed` on both peers. Exit
@@ -81,7 +80,7 @@ including over IPv4: outer MTU 1500 gives TUN MTU 1440. Exit detects both famili
 egress MTUs and uses the smaller value; set a common MTU if peer defaults differ.
 
 ```sh
-ghostun --config auth.toml exit --listen 443 --outer-family mixed --conns 4
+ghostun --config auth.toml exit --listen 443 --outer-family mixed
 ghostun --config auth.toml entry --remote 203.0.113.10:443 --outer-family mixed --conns 4
 ```
 
@@ -128,7 +127,7 @@ ghostun [options] [entry|exit]
 | `--remote IP:PORT` | — | Entry only: Exit outer address (IP literal) |
 | `--listen [IP:]PORT` | — | Exit only: outer listen port or `IP:PORT` |
 | `--outer-family ipv4\|ipv6\|mixed` | Exit: `ipv4`; Entry: remote family | Exit listener family; Entry can select `mixed` to reserve IPv6 overhead |
-| `--conns N` | CPU count | Number of pinned workers and outer connections (`1..=256`) |
+| `--conns N` | CPU count | Entry only: outer connections and worker threads (`1..=256`) |
 | `--cpus LIST` | all usable CPUs | Worker CPU list or ranges (e.g. `0,1` or `2-3`) |
 | `--tun NAME` | `ghostun0` | Inner TUN device name (`[A-Za-z0-9_.-]`, up to 15 chars) |
 | `--tun-ipv4 CIDR` | `10.200.0.1/30` / `.2/30` | Inner IPv4 address (Entry / Exit) |

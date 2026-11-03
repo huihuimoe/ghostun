@@ -9,7 +9,7 @@ use zerocopy::byteorder::network_endian::U16;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 use super::invalid;
-use crate::config::AuthKey;
+use crate::config::{AuthKey, MAX_CONNS};
 use crate::sys;
 
 const MSG_HELLO: u8 = 1;
@@ -30,7 +30,6 @@ struct HelloWire {
     magic: [u8; 4],
     version: u8,
     worker: U16,
-    conns: U16,
     mtu: U16,
     nonce: [u8; NONCE_LEN],
 }
@@ -55,7 +54,6 @@ const DOMAIN_READY: &[u8] = b"ghostun-tcp-v1/ready";
 #[derive(Clone, Copy)]
 pub struct Params {
     pub worker: u16,
-    pub conns: u16,
     pub mtu: u16,
 }
 
@@ -67,7 +65,6 @@ impl Params {
         hello.magic = *HELLO_MAGIC;
         hello.version = PROTOCOL_VERSION;
         hello.worker.set(self.worker);
-        hello.conns.set(self.conns);
         hello.mtu.set(self.mtu);
         sys::random(&mut hello.nonce)?;
         Ok(bytes)
@@ -86,7 +83,6 @@ pub fn hello_params(hello: &[u8]) -> io::Result<Params> {
     }
     Ok(Params {
         worker: hello.worker.get(),
-        conns: hello.conns.get(),
         mtu: hello.mtu.get(),
     })
 }
@@ -127,20 +123,20 @@ impl Handshake {
         ))
     }
 
-    pub fn exit(key: &AuthKey, p: Params, hello: &[u8]) -> io::Result<(Self, [u8; CHALLENGE_LEN])> {
+    pub fn exit(key: &AuthKey, mtu: u16, hello: &[u8]) -> io::Result<(Self, [u8; CHALLENGE_LEN])> {
         let peer = hello_params(hello)?;
-        if peer.worker != p.worker || peer.worker >= p.conns {
+        if usize::from(peer.worker) >= MAX_CONNS {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("invalid worker ID {} (conns={})", peer.worker, p.conns),
+                format!("invalid worker ID {} (max={MAX_CONNS})", peer.worker),
             ));
         }
-        if peer.conns != p.conns || peer.mtu != p.mtu {
+        if peer.mtu != mtu {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "incompatible peer parameters (peer conns={}, mtu={}; local conns={}, mtu={})",
-                    peer.conns, peer.mtu, p.conns, p.mtu
+                    "incompatible peer MTU (peer mtu={}, local mtu={mtu})",
+                    peer.mtu
                 ),
             ));
         }

@@ -32,61 +32,62 @@ TOOLS = Path(os.environ.get("TOOLS", WORKSPACE / "tests/perf/tcp-tools.py"))
 
 AUTH_KEY = "0000000000000000000000000000000000000000000000000000000000000001"
 
+# Local dev VM baseline: 4-vCPU AMD EPYC-Genoa, Linux 7.2.11, Docker ghostun-e2e.
 BASELINE_100M = {
     ("faketcp", "clean"): {
-        "v4_up": 92.1, "v4_down": 91.7,
-        "v6_up": 90.2, "v6_down": 90.7,
-        "p95": 15.0, "p99": 40.9,
-        "cpu_str": "4–5%", "cpu_min": 4.0, "cpu_max": 5.0
+        "v4_up": 92.1, "v4_down": 92.3,
+        "v6_up": 90.8, "v6_down": 90.7,
+        "p95": 11.2, "p99": 20.4,
+        "cpu_str": "18–22%", "cpu_min": 18.0, "cpu_max": 22.0
     },
     ("faketcp", "rtt20-loss0.1"): {
-        "v4_up": 90.9, "v4_down": 91.2,
-        "v6_up": 89.6, "v6_down": 89.9,
-        "p95": 55.5, "p99": 68.8,
-        "cpu_str": "4–5%", "cpu_min": 4.0, "cpu_max": 5.0
+        "v4_up": 91.1, "v4_down": 91.2,
+        "v6_up": 89.3, "v6_down": 89.6,
+        "p95": 58.2, "p99": 65.9,
+        "cpu_str": "18–23%", "cpu_min": 18.0, "cpu_max": 23.0
     },
     ("tcp_direct", "clean"): {
-        "v4_up": 90.4, "v4_down": 90.2,
-        "v6_up": 88.4, "v6_down": 89.1,
-        "p95": 14.0, "p99": 31.1,
-        "cpu_str": "2–2%", "cpu_min": 2.0, "cpu_max": 2.0
+        "v4_up": 90.2, "v4_down": 90.7,
+        "v6_up": 88.7, "v6_down": 89.4,
+        "p95": 22.1, "p99": 39.2,
+        "cpu_str": "9–15%", "cpu_min": 9.0, "cpu_max": 15.0
     },
     ("tcp_direct", "rtt20-loss0.1"): {
-        "v4_up": 88.2, "v4_down": 88.3,
-        "v6_up": 87.6, "v6_down": 87.6,
-        "p95": 201.4, "p99": 226.7,
-        "cpu_str": "2–3%", "cpu_min": 2.0, "cpu_max": 3.0
+        "v4_up": 84.6, "v4_down": 86.5,
+        "v6_up": 88.0, "v6_down": 87.6,
+        "p95": 120.0, "p99": 128.4,
+        "cpu_str": "10–14%", "cpu_min": 10.0, "cpu_max": 14.0
     },
     ("tcp_relay", "clean"): {
-        "v4_up": 90.5, "v4_down": 90.7,
-        "v6_up": 88.7, "v6_down": 88.9,
-        "p95": 25.7, "p99": 64.2,
-        "cpu_str": "2–4%", "cpu_min": 2.0, "cpu_max": 4.0
+        "v4_up": 89.9, "v4_down": 90.9,
+        "v6_up": 88.4, "v6_down": 89.6,
+        "p95": 16.7, "p99": 34.5,
+        "cpu_str": "9–20%", "cpu_min": 9.0, "cpu_max": 20.0
     },
     ("tcp_relay", "rtt20-loss0.1"): {
-        "v4_up": 85.1, "v4_down": 88.9,
-        "v6_up": 87.0, "v6_down": 87.3,
-        "p95": 201.0, "p99": 419.6,
-        "cpu_str": "4–4%", "cpu_min": 4.0, "cpu_max": 4.0
+        "v4_up": 84.6, "v4_down": 88.8,
+        "v6_up": 86.6, "v6_down": 88.1,
+        "p95": 131.6, "p99": 191.4,
+        "cpu_str": "13–22%", "cpu_min": 13.0, "cpu_max": 22.0
     },
 }
 
 BASELINE_FAKETCP_MAX = {
-    ("large", "ipv4"): {"v4_up": 4.98, "v4_down": 5.19, "v6_up": 4.84, "v6_down": 4.78, "kpps": "545–574"},
-    ("large", "ipv6"): {"v4_up": 4.66, "v4_down": 4.40, "v6_up": 4.36, "v6_down": 4.19, "kpps": "492–519"},
-    ("mixed", "ipv4"): {"v4_up": 3.55, "v4_down": 4.45, "v6_up": 3.52, "v6_down": 3.82, "kpps": "531–583"},
-    ("mixed", "ipv6"): {"v4_up": 3.01, "v4_down": 3.53, "v6_up": 3.15, "v6_down": 3.92, "kpps": "468–513"},
-    ("small", "ipv4"): {"v4_up": 449.0, "v4_down": 387.0, "v6_up": 437.0, "v6_down": 387.0, "kpps": "542–606"},
-    ("small", "ipv6"): {"v4_up": 464.0, "v4_down": 351.0, "v6_up": 439.0, "v6_down": 331.0, "kpps": "478–554"},
+    ("large", "ipv4"): {"v4_up": 2.21, "v4_down": 2.33, "v6_up": 2.32, "v6_down": 2.38, "kpps": "263–276"},
+    ("large", "ipv6"): {"v4_up": 2.17, "v4_down": 2.02, "v6_up": 1.87, "v6_down": 2.03, "kpps": "229–259"},
+    ("mixed", "ipv4"): {"v4_up": 1.97, "v4_down": 2.02, "v6_up": 1.53, "v6_down": 2.06, "kpps": "276–297"},
+    ("mixed", "ipv6"): {"v4_up": 1.49, "v4_down": 1.45, "v6_up": 1.46, "v6_down": 1.45, "kpps": "240–261"},
+    ("small", "ipv4"): {"v4_up": 206.0, "v4_down": 227.0, "v6_up": 227.0, "v6_down": 214.0, "kpps": "276–322"},
+    ("small", "ipv6"): {"v4_up": 203.0, "v4_down": 210.0, "v6_up": 203.0, "v6_down": 204.0, "kpps": "283–295"},
 }
 
 BASELINE_TCP_MAX = {
-    ("large", "ipv4"): {"v4_up": 6.48, "v4_down": 7.72, "v6_up": 5.55, "v6_down": 7.00, "kpps": "677–910"},
-    ("large", "ipv6"): {"v4_up": 6.64, "v4_down": 8.63, "v6_up": 5.58, "v6_down": 7.02, "kpps": "698–1010"},
-    ("mixed", "ipv4"): {"v4_up": 3.76, "v4_down": 5.67, "v6_up": 3.10, "v6_down": 5.07, "kpps": "724–949"},
-    ("mixed", "ipv6"): {"v4_up": 4.15, "v4_down": 4.65, "v6_up": 2.64, "v6_down": 4.28, "kpps": "714–926"},
-    ("small", "ipv4"): {"v4_up": 644.0, "v4_down": 615.0, "v6_up": 574.0, "v6_down": 620.0, "kpps": "755–874"},
-    ("small", "ipv6"): {"v4_up": 602.0, "v4_down": 625.0, "v6_up": 592.0, "v6_down": 597.0, "kpps": "794–878"},
+    ("large", "ipv4"): {"v4_up": 3.89, "v4_down": 4.58, "v6_up": 3.20, "v6_down": 4.03, "kpps": "364–508"},
+    ("large", "ipv6"): {"v4_up": 3.57, "v4_down": 4.74, "v6_up": 3.72, "v6_down": 4.08, "kpps": "405–521"},
+    ("mixed", "ipv4"): {"v4_up": 2.28, "v4_down": 2.91, "v6_up": 2.06, "v6_down": 1.58, "kpps": "421–504"},
+    ("mixed", "ipv6"): {"v4_up": 2.47, "v4_down": 2.32, "v6_up": 2.79, "v6_down": 2.52, "kpps": "413–489"},
+    ("small", "ipv4"): {"v4_up": 337.0, "v4_down": 289.0, "v6_up": 310.0, "v6_down": 294.0, "kpps": "414–460"},
+    ("small", "ipv6"): {"v4_up": 334.0, "v4_down": 284.0, "v6_up": 315.0, "v6_down": 285.0, "kpps": "401–454"},
 }
 
 def ns_cmd(ns_name, *cmd):
@@ -248,7 +249,6 @@ class Topology:
             str(BIN), "--config", str(auth_file), "exit",
             "--transport", self.transport,
             "--outer-family", self.outer_family,
-            "--conns", "2",
             "--cpus", "2-3",
             "--ping-interval", "1",
             "--dead-timeout", "4",
@@ -631,7 +631,7 @@ def generate_report(results):
 
     if "uncapped_tcp" in results:
         lines.append("\n## 3. TCP maximum throughput\n")
-        lines.append("TCP peers use `--tcp-notsent 128` (KiB); stored baselines may use different tuning.\n")
+        lines.append("TCP peers use `--tcp-notsent 128` (KiB).\n")
         lines.append("| Scenario | Outer family | Inner IPv4 upload / download | Diff | Inner IPv6 upload / download | Diff | Tunnel packet rate |")
         lines.append("|---|---|---|---|---|---|---|")
         tcp_data = results["uncapped_tcp"]

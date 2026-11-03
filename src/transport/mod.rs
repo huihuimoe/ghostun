@@ -6,19 +6,21 @@ mod faketcp;
 mod keepalive;
 mod tcp;
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::os::fd::{OwnedFd, RawFd};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
-use crate::config::{Config, Mode, Transport};
+use crate::config::{Config, Mode, Transport, MAX_CONNS};
 use crate::sys;
-use control::{Control, RollingReload, StopOnDrop};
+use control::{
+    candidate_cpus, Control, CoreTable, ExitWorkerGuard, Reload, RollingReload, StopOnDrop,
+};
 
 /// Outer addressing derived from config plus the routing table.
 pub struct Outer {
-    /// Entry source address. The exit learns its address from each incoming SYN instead.
+    /// Entry source address. The exit learns its address from each incoming packet/stream instead.
     pub local_ip: IpAddr,
     pub dev: Option<String>,
     pub mtu: u32,
@@ -29,18 +31,43 @@ enum Start {
     Tcp(Box<tcp::Worker>),
 }
 
-/// Running worker threads, one per TUN queue, plus the exit TCP accept thread.
-pub struct Running {
-    controls: Vec<Arc<Control>>,
-    threads: Vec<JoinHandle<()>>,
-    listener_wake: Option<RawFd>,
-    default_cpus: Vec<usize>,
-    generation: u64,
-    rolling: Option<RollingReload>,
+enum ExitDispatcher {
+    Fake(faketcp::SharedExitState),
+    Tcp(tcp::SharedExitState),
 }
 
-/// Opens every outer socket before spawning any thread, so a setup error leaves nothing running.
-/// Any thread that exits sets `stop` and notifies `main_wake`.
+struct ExitSlot {
+    ctrl: Arc<Control>,
+    thread: JoinHandle<()>,
+    cpu: Option<usize>,
+    tuple: Option<(SocketAddr, SocketAddr)>,
+    peer_label: String,
+}
+
+/// Manager state owning persistent Entry workers or dynamic Exit workers and the CPU binding table.
+pub struct Running {
+    cfg: Config,
+    outer_mtu: u32,
+    tun_mtu: u32,
+    seed: u64,
+    stop: &'static AtomicBool,
+    main_wake: RawFd,
+    default_cpus: Vec<usize>,
+    core_table: CoreTable,
+    entry_controls: Vec<Arc<Control>>,
+    entry_cpus: Vec<Option<usize>>,
+    entry_threads: Vec<JoinHandle<()>>,
+    rolling: Option<RollingReload>,
+    _anchor_tun: Option<OwnedFd>,
+    exit_dispatcher: Option<ExitDispatcher>,
+    listener_wake: Option<RawFd>,
+    listener_thread: Option<JoinHandle<()>>,
+    exit_workers: Vec<Option<ExitSlot>>,
+    exit_reload_gen: Option<u64>,
+    generation: u64,
+}
+
+/// Opens outer listener/entry sockets before spawning any thread, so a setup error leaves nothing running.
 pub fn start(
     cfg: &Config,
     outer: &Outer,
@@ -52,103 +79,391 @@ pub fn start(
     if cfg.transport == Transport::Tcp && cfg.base_port_explicit {
         log::warn!("tcp transport: explicitly configured base_port is ignored; kernel assigns source ports");
     }
-    let listener = if cfg.transport == Transport::Tcp && cfg.mode == Mode::Exit {
-        Some(tcp::Listener::bind(cfg, tun_mtu as u16).map_err(|e| format!("tcp listener: {e}"))?)
-    } else {
-        None
-    };
+    let default_cpus = sys::usable_cpus();
+    let mut core_table = CoreTable::new(candidate_cpus(cfg, &default_cpus));
     let seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos() as u64);
-    let mut starts = Vec::with_capacity(tuns.len());
-    for (i, tun) in tuns.into_iter().enumerate() {
-        starts.push(match cfg.transport {
-            Transport::Tcp => Start::Tcp(Box::new(tcp::Worker::new(
-                i,
-                cfg.clone(),
-                tun_mtu as u16,
-                tun,
-                listener.as_ref(),
-            ))),
-            Transport::Faketcp => Start::Fake(Box::new(faketcp::Worker::new(
-                i,
-                cfg,
-                outer.local_ip,
-                outer.dev.as_deref(),
-                outer.mtu,
-                tun,
-                seed,
-            )?)),
+    if cfg.mode == Mode::Entry {
+        let mut starts = Vec::with_capacity(tuns.len());
+        for (i, tun) in tuns.into_iter().enumerate() {
+            starts.push(match cfg.transport {
+                Transport::Tcp => Start::Tcp(Box::new(tcp::Worker::new_entry(
+                    i,
+                    cfg.clone(),
+                    tun_mtu as u16,
+                    tun,
+                ))),
+                Transport::Faketcp => Start::Fake(Box::new(faketcp::Worker::new_entry(
+                    i,
+                    cfg,
+                    outer.local_ip,
+                    outer.dev.as_deref(),
+                    outer.mtu,
+                    tun,
+                    seed,
+                )?)),
+            });
+        }
+        let mut entry_controls = Vec::with_capacity(starts.len());
+        let mut entry_cpus = Vec::with_capacity(starts.len());
+        let mut entry_threads = Vec::with_capacity(starts.len());
+        for (i, start) in starts.into_iter().enumerate() {
+            let cpu = core_table.acquire();
+            let ctrl = Arc::new(Control::new(cpu, main_wake));
+            let worker_ctrl = Arc::clone(&ctrl);
+            entry_cpus.push(cpu);
+            entry_controls.push(ctrl);
+            entry_threads.push(
+                std::thread::Builder::new()
+                    .name(format!("ghostun-w{i}"))
+                    .spawn(move || {
+                        let _guard = StopOnDrop(stop, main_wake);
+                        match start {
+                            Start::Fake(worker) => worker.run(stop, &worker_ctrl),
+                            Start::Tcp(worker) => worker.run(stop, &worker_ctrl),
+                        }
+                    })
+                    .expect("spawning worker thread"),
+            );
+        }
+        return Ok(Running {
+            cfg: cfg.clone(),
+            outer_mtu: outer.mtu,
+            tun_mtu,
+            seed,
+            stop,
+            main_wake,
+            default_cpus,
+            core_table,
+            entry_controls,
+            entry_cpus,
+            entry_threads,
+            rolling: None,
+            _anchor_tun: None,
+            exit_dispatcher: None,
+            listener_wake: None,
+            listener_thread: None,
+            exit_workers: Vec::new(),
+            exit_reload_gen: None,
+            generation: 0,
         });
     }
-    let default_cpus = sys::usable_cpus();
-    let mut controls = Vec::with_capacity(starts.len());
-    let mut threads = Vec::with_capacity(starts.len() + 1);
-    for (i, start) in starts.into_iter().enumerate() {
-        let cpu = control::cpu_for(cfg, &default_cpus, i);
-        let ctrl = Arc::new(Control::new(cpu, main_wake));
-        let worker_ctrl = Arc::clone(&ctrl);
-        controls.push(ctrl);
-        threads.push(
-            std::thread::Builder::new()
-                .name(format!("ghostun-w{i}"))
-                .spawn(move || {
-                    let _guard = StopOnDrop(stop, main_wake);
-                    match start {
-                        Start::Fake(worker) => worker.run(stop, &worker_ctrl),
-                        Start::Tcp(worker) => worker.run(stop, &worker_ctrl),
-                    }
-                })
-                .expect("spawning worker thread"),
-        );
-    }
-    let listener_wake = listener.as_ref().map(tcp::Listener::wake_fd);
-    if let Some(listener) = listener {
-        threads.push(
-            listener
+
+    let anchor_tun = tuns.into_iter().next();
+    let (exit_dispatcher, listener_wake, listener_thread) = match cfg.transport {
+        Transport::Tcp => {
+            let listener = tcp::Listener::bind(cfg, tun_mtu as u16, main_wake)
+                .map_err(|e| format!("tcp listener: {e}"))?;
+            let wake = listener.wake_fd();
+            let state = Arc::clone(&listener.state);
+            let thread = listener
                 .spawn(stop, main_wake)
-                .expect("spawning TCP accept thread"),
-        );
-    }
+                .expect("spawning TCP accept thread");
+            (ExitDispatcher::Tcp(state), wake, thread)
+        }
+        Transport::Faketcp => {
+            let listener = faketcp::Listener::bind(cfg, outer.mtu, seed, main_wake)?;
+            let wake = listener.wake_fd();
+            let state = Arc::clone(&listener.state);
+            let thread = listener
+                .spawn(stop, main_wake)
+                .expect("spawning FakeTCP accept thread");
+            (ExitDispatcher::Fake(state), wake, thread)
+        }
+    };
     Ok(Running {
-        controls,
-        threads,
-        listener_wake,
+        cfg: cfg.clone(),
+        outer_mtu: outer.mtu,
+        tun_mtu,
+        seed,
+        stop,
+        main_wake,
         default_cpus,
-        generation: 0,
+        core_table,
+        entry_controls: Vec::new(),
+        entry_cpus: Vec::new(),
+        entry_threads: Vec::new(),
         rolling: None,
+        _anchor_tun: anchor_tun,
+        exit_dispatcher: Some(exit_dispatcher),
+        listener_wake: Some(listener_wake),
+        listener_thread: Some(listener_thread),
+        exit_workers: (0..MAX_CONNS).map(|_| None).collect(),
+        exit_reload_gen: None,
+        generation: 0,
     })
 }
 
 impl Running {
     pub fn is_reloading(&self) -> bool {
-        self.rolling.is_some()
+        self.rolling.is_some() || self.exit_reload_gen.is_some()
     }
 
-    /// Starts a rolling reload to `cfg`, superseding any reload still in progress.
+    fn reap_exited_workers(&mut self) {
+        for slot in &mut self.exit_workers {
+            if slot.as_ref().is_some_and(|s| s.ctrl.is_exited()) {
+                let finished = slot.take().unwrap();
+                let _ = finished.thread.join();
+                self.core_table.release(finished.cpu);
+            }
+        }
+    }
+
+    fn replace_exit_slot(&mut self, id: usize, new_tuple: Option<(SocketAddr, SocketAddr)>) {
+        if let Some(old) = self.exit_workers[id].take() {
+            let send_rst = match (old.tuple, new_tuple) {
+                (Some(old_t), Some(new_t)) => old_t != new_t,
+                _ => true,
+            };
+            if !old.ctrl.is_exited() {
+                log::info!(
+                    "worker {id}: authenticated takeover, closing {}",
+                    old.peer_label
+                );
+            }
+            old.ctrl.stop(send_rst);
+            let _ = old.thread.join();
+            self.core_table.release(old.cpu);
+        }
+    }
+
+    fn spawn_exit_tcp(&mut self, id: usize, conn: tcp::Connection) {
+        self.replace_exit_slot(id, None);
+        let tun = match sys::tun::open_queue(&self.cfg.tun_name) {
+            Ok(fd) => fd,
+            Err(e) => {
+                log::error!("worker {id}: opening TUN queue {}: {e}", self.cfg.tun_name);
+                return;
+            }
+        };
+        let peer_label = conn.to_string();
+        let worker = tcp::Worker::new_exit(id, self.cfg.clone(), self.tun_mtu as u16, tun, conn);
+        let cpu = self.core_table.acquire();
+        let ctrl = Arc::new(Control::new(cpu, self.main_wake));
+        let worker_ctrl = Arc::clone(&ctrl);
+        let stop = self.stop;
+        let main_wake = self.main_wake;
+        let thread = std::thread::Builder::new()
+            .name(format!("ghostun-w{id}"))
+            .spawn(move || {
+                let _guard = ExitWorkerGuard {
+                    stop,
+                    ctrl: Arc::clone(&worker_ctrl),
+                    main_wake,
+                };
+                worker.run(stop, &worker_ctrl);
+            })
+            .expect("spawning exit TCP worker thread");
+        self.exit_workers[id] = Some(ExitSlot {
+            ctrl,
+            thread,
+            cpu,
+            tuple: None,
+            peer_label,
+        });
+    }
+
+    fn spawn_exit_fake(&mut self, promo: faketcp::Promoted, state: faketcp::SharedExitState) {
+        let id = promo.worker;
+        self.replace_exit_slot(id, Some((promo.local, promo.peer)));
+        let tun = match sys::tun::open_queue(&self.cfg.tun_name) {
+            Ok(fd) => fd,
+            Err(e) => {
+                log::error!("worker {id}: opening TUN queue {}: {e}", self.cfg.tun_name);
+                return;
+            }
+        };
+        let peer_label = format!("{} <-> {}", promo.local, promo.peer);
+        let worker = match faketcp::Worker::new_exit(
+            id,
+            &self.cfg,
+            self.outer_mtu,
+            tun,
+            promo,
+            state,
+            self.seed,
+        ) {
+            Ok(w) => w,
+            Err(e) => {
+                log::error!("worker {id}: {e}");
+                return;
+            }
+        };
+        let cpu = self.core_table.acquire();
+        let ctrl = Arc::new(Control::new(cpu, self.main_wake));
+        let worker_ctrl = Arc::clone(&ctrl);
+        let stop = self.stop;
+        let main_wake = self.main_wake;
+        let thread = std::thread::Builder::new()
+            .name(format!("ghostun-w{id}"))
+            .spawn(move || {
+                let _guard = ExitWorkerGuard {
+                    stop,
+                    ctrl: Arc::clone(&worker_ctrl),
+                    main_wake,
+                };
+                worker.run(stop, &worker_ctrl);
+            })
+            .expect("spawning exit FakeTCP worker thread");
+        self.exit_workers[id] = Some(ExitSlot {
+            ctrl,
+            thread,
+            cpu,
+            tuple: Some((promo.local, promo.peer)),
+            peer_label,
+        });
+    }
+
+    /// Starts a reload to `cfg`, superseding any reload still in progress.
     pub fn reload(&mut self, cfg: Config) {
         self.generation += 1;
         log::info!("reloading configuration (generation {})", self.generation);
-        self.rolling =
-            RollingReload::start(&self.controls, &self.default_cpus, self.generation, cfg);
-    }
+        if self.cfg.mode == Mode::Entry {
+            if cfg.tunables.cpus != self.cfg.tunables.cpus {
+                self.core_table = CoreTable::new(candidate_cpus(&cfg, &self.default_cpus));
+                self.entry_cpus = (0..self.entry_controls.len())
+                    .map(|_| self.core_table.acquire())
+                    .collect();
+            }
+            self.cfg = cfg.clone();
+            self.rolling = RollingReload::start(
+                &self.entry_controls,
+                self.entry_cpus.clone(),
+                self.generation,
+                cfg.tunables,
+            );
+            return;
+        }
 
-    /// Moves the rolling reload to the next worker once the current one has applied it.
-    pub fn advance(&mut self) {
-        RollingReload::advance(&self.controls, &self.default_cpus, &mut self.rolling);
-    }
-
-    /// Wakes every thread to observe `stop`, which the caller has set, and joins them.
-    pub fn join(self) {
-        for ctrl in &self.controls {
-            ctrl.wake();
+        let key_changed = self.cfg.tunables.auth_key != cfg.tunables.auth_key;
+        let cpus_changed = self.cfg.tunables.cpus != cfg.tunables.cpus;
+        self.cfg = cfg.clone();
+        match &self.exit_dispatcher {
+            Some(ExitDispatcher::Tcp(state)) => {
+                let mut s = state.lock().unwrap();
+                if key_changed {
+                    s.key = cfg.tunables.auth_key.clone();
+                    s.epoch += 1;
+                    s.admitted.clear();
+                }
+                s.timeout = cfg.tunables.dead_timeout;
+            }
+            Some(ExitDispatcher::Fake(state)) => {
+                let mut s = state.lock().unwrap();
+                s.key = cfg.tunables.auth_key.clone();
+                s.timeout = cfg.tunables.dead_timeout;
+                s.epoch += 1;
+                if key_changed {
+                    s.admitted.clear();
+                }
+            }
+            None => {}
         }
         if let Some(fd) = self.listener_wake {
             sys::eventfd_notify(fd);
         }
-        for thread in self.threads {
+        self.reap_exited_workers();
+        if key_changed {
+            for slot in &mut self.exit_workers {
+                if let Some(old) = slot.take() {
+                    old.ctrl.stop(true);
+                    let _ = old.thread.join();
+                    self.core_table.release(old.cpu);
+                }
+            }
+            if cpus_changed {
+                self.core_table = CoreTable::new(candidate_cpus(&self.cfg, &self.default_cpus));
+            }
+            self.exit_reload_gen = None;
+            log::info!(
+                "configuration reload complete (generation {})",
+                self.generation
+            );
+        } else {
+            if cpus_changed {
+                self.core_table = CoreTable::new(candidate_cpus(&self.cfg, &self.default_cpus));
+                for slot in self.exit_workers.iter_mut().flatten() {
+                    slot.cpu = self.core_table.acquire();
+                }
+            }
+            for slot in self.exit_workers.iter().flatten() {
+                slot.ctrl.publish(
+                    self.generation,
+                    Reload {
+                        tunables: self.cfg.tunables.clone(),
+                        cpu: slot.cpu,
+                    },
+                );
+            }
+            self.exit_reload_gen = Some(self.generation);
+            self.advance();
+        }
+    }
+
+    /// Reaps exited workers, spawns newly admitted Exit workers, and advances active reloads.
+    pub fn advance(&mut self) {
+        if self.cfg.mode == Mode::Entry {
+            RollingReload::advance(&self.entry_controls, &mut self.rolling);
+            return;
+        }
+        self.reap_exited_workers();
+        match self.exit_dispatcher.as_ref() {
+            Some(ExitDispatcher::Tcp(state)) => {
+                let state = Arc::clone(state);
+                loop {
+                    let next = state.lock().unwrap().admitted.pop_front();
+                    let Some((id, conn)) = next else { break };
+                    self.spawn_exit_tcp(id, conn);
+                }
+            }
+            Some(ExitDispatcher::Fake(state)) => {
+                let state = Arc::clone(state);
+                loop {
+                    let next = state.lock().unwrap().admitted.pop_front();
+                    let Some(promo) = next else { break };
+                    self.spawn_exit_fake(promo, Arc::clone(&state));
+                }
+            }
+            None => {}
+        }
+        if let Some(gen) = self.exit_reload_gen {
+            if self
+                .exit_workers
+                .iter()
+                .flatten()
+                .all(|s| s.ctrl.is_step_complete(gen))
+            {
+                log::info!("configuration reload complete (generation {gen})");
+                self.exit_reload_gen = None;
+            }
+        }
+    }
+
+    /// Wakes every thread to observe `stop`, which the caller has set, and joins them.
+    pub fn join(self) {
+        for ctrl in &self.entry_controls {
+            ctrl.wake();
+        }
+        for slot in self.exit_workers.iter().flatten() {
+            slot.ctrl.stop(true);
+        }
+        if let Some(fd) = self.listener_wake {
+            sys::eventfd_notify(fd);
+        }
+        for thread in self.entry_threads {
             if thread.join().is_err() {
                 log::error!("worker panicked");
+            }
+        }
+        for slot in self.exit_workers.into_iter().flatten() {
+            if slot.thread.join().is_err() {
+                log::error!("worker panicked");
+            }
+        }
+        if let Some(thread) = self.listener_thread {
+            if thread.join().is_err() {
+                log::error!("listener panicked");
             }
         }
     }

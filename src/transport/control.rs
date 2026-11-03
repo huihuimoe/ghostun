@@ -12,6 +12,42 @@ pub struct Reload {
     pub cpu: Option<usize>,
 }
 
+pub struct CoreTable {
+    cores: Vec<(usize, usize)>,
+}
+
+impl CoreTable {
+    pub fn new(cpus: &[usize]) -> Self {
+        let mut cores = Vec::with_capacity(cpus.len());
+        for &cpu in cpus {
+            if !cores.iter().any(|&(c, _)| c == cpu) {
+                cores.push((cpu, 0));
+            }
+        }
+        Self { cores }
+    }
+
+    /// Selects the candidate core with the fewest bound workers (ties broken by list order)
+    /// and increments its active count. When all cores have `count >= 1`, cores are reused.
+    pub fn acquire(&mut self) -> Option<usize> {
+        let (cpu, count) = self.cores.iter_mut().min_by_key(|(_, count)| *count)?;
+        *count += 1;
+        Some(*cpu)
+    }
+
+    pub fn release(&mut self, cpu: Option<usize>) {
+        if let Some(target) = cpu {
+            if let Some((_, count)) = self.cores.iter_mut().find(|(c, _)| *c == target) {
+                *count = count.saturating_sub(1);
+            }
+        }
+    }
+}
+
+pub fn candidate_cpus<'a>(cfg: &'a Config, default_cpus: &'a [usize]) -> &'a [usize] {
+    cfg.tunables.cpus.as_deref().unwrap_or(default_cpus)
+}
+
 pub struct Control {
     initial_cpu: Option<usize>,
     wake: OwnedFd,
@@ -20,6 +56,9 @@ pub struct Control {
     applied_gen: AtomicU64,
     wait_for_established: AtomicBool,
     established: AtomicBool,
+    stopped: AtomicBool,
+    send_rst: AtomicBool,
+    exited: AtomicBool,
     pending: Mutex<Option<(u64, Reload)>>,
 }
 
@@ -33,6 +72,9 @@ impl Control {
             applied_gen: AtomicU64::new(0),
             wait_for_established: AtomicBool::new(false),
             established: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
+            send_rst: AtomicBool::new(true),
+            exited: AtomicBool::new(false),
             pending: Mutex::new(None),
         }
     }
@@ -45,6 +87,32 @@ impl Control {
     #[inline]
     pub fn wake(&self) {
         sys::eventfd_notify(self.wake.as_raw_fd());
+    }
+
+    pub fn stop(&self, send_rst: bool) {
+        self.send_rst.store(send_rst, Ordering::Relaxed);
+        self.stopped.store(true, Ordering::Release);
+        self.wake();
+    }
+
+    #[inline(always)]
+    pub fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
+    }
+
+    #[inline(always)]
+    pub fn should_send_rst(&self) -> bool {
+        self.send_rst.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub fn mark_exited(&self) {
+        self.exited.store(true, Ordering::Release);
+    }
+
+    #[inline(always)]
+    pub fn is_exited(&self) -> bool {
+        self.exited.load(Ordering::Acquire)
     }
 
     pub fn publish(&self, generation: u64, reload: Reload) {
@@ -96,41 +164,37 @@ impl Control {
     }
 }
 
-pub fn cpu_for(cfg: &Config, default_cpus: &[usize], id: usize) -> Option<usize> {
-    let list = cfg.tunables.cpus.as_deref().unwrap_or(default_cpus);
-    (!list.is_empty()).then(|| list[id % list.len()])
-}
-
-pub fn reload_for(cfg: &Config, default_cpus: &[usize], id: usize) -> Reload {
-    Reload {
-        tunables: cfg.tunables.clone(),
-        cpu: cpu_for(cfg, default_cpus, id),
-    }
-}
-
 pub struct RollingReload {
     pub generation: u64,
     pub next_worker: usize,
-    pub target: Config,
+    pub target: Tunables,
+    pub cpus: Vec<Option<usize>>,
 }
 
 impl RollingReload {
     pub fn start(
         controls: &[Arc<Control>],
-        default_cpus: &[usize],
+        cpus: Vec<Option<usize>>,
         generation: u64,
-        target: Config,
+        target: Tunables,
     ) -> Option<Self> {
         let first = controls.first()?;
-        first.publish(generation, reload_for(&target, default_cpus, 0));
+        first.publish(
+            generation,
+            Reload {
+                tunables: target.clone(),
+                cpu: cpus.first().copied().flatten(),
+            },
+        );
         Some(Self {
             generation,
             next_worker: 0,
             target,
+            cpus,
         })
     }
 
-    pub fn advance(controls: &[Arc<Control>], default_cpus: &[usize], rolling: &mut Option<Self>) {
+    pub fn advance(controls: &[Arc<Control>], rolling: &mut Option<Self>) {
         while let Some(state) = rolling.as_mut() {
             if !controls[state.next_worker].is_step_complete(state.generation) {
                 break;
@@ -139,7 +203,10 @@ impl RollingReload {
             if state.next_worker < controls.len() {
                 controls[state.next_worker].publish(
                     state.generation,
-                    reload_for(&state.target, default_cpus, state.next_worker),
+                    Reload {
+                        tunables: state.target.clone(),
+                        cpu: state.cpus.get(state.next_worker).copied().flatten(),
+                    },
                 );
             } else {
                 log::info!(
@@ -176,5 +243,44 @@ impl Drop for StopOnDrop {
     fn drop(&mut self) {
         self.0.store(true, Ordering::Relaxed);
         sys::eventfd_notify(self.1);
+    }
+}
+
+pub struct ExitWorkerGuard {
+    pub stop: &'static AtomicBool,
+    pub ctrl: Arc<Control>,
+    pub main_wake: RawFd,
+}
+
+impl Drop for ExitWorkerGuard {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.stop.store(true, Ordering::Relaxed);
+        }
+        self.ctrl.mark_exited();
+        sys::eventfd_notify(self.main_wake);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn core_table_picks_least_used_core_and_reuses_when_saturated() {
+        let mut table = CoreTable::new(&[2, 4, 2, 6]);
+        assert_eq!(table.acquire(), Some(2));
+        assert_eq!(table.acquire(), Some(4));
+        assert_eq!(table.acquire(), Some(6));
+        // All cores have >= 1 worker bound; reuse starts from the least-used in order.
+        assert_eq!(table.acquire(), Some(2));
+        assert_eq!(table.acquire(), Some(4));
+        // Releasing core 6 makes it the least-used (count 0 vs 2, 2).
+        table.release(Some(6));
+        assert_eq!(table.acquire(), Some(6));
+        // Releasing core 4 once makes it count 1 vs core 2 (count 2) and core 6 (count 1);
+        // tie breaks by candidate order (core 4 before core 6).
+        table.release(Some(4));
+        assert_eq!(table.acquire(), Some(4));
     }
 }

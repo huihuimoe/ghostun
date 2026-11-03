@@ -76,8 +76,11 @@ pub fn run(mut cfg: Config) -> Result<(), String> {
     let outer = resolve_outer(&cfg)?;
     let tun_mtu = cfg.resolve_tun_mtu(outer.mtu)?;
     let listen_port = cfg.listen.unwrap_or(0);
-    let n = usize::from(cfg.conns);
-    let tuns = sys::tun::create(&cfg.tun_name, n)
+    let queues = match cfg.mode {
+        Mode::Entry => usize::from(cfg.conns),
+        Mode::Exit => 1,
+    };
+    let tuns = sys::tun::create(&cfg.tun_name, queues)
         .map_err(|e| format!("creating TUN {}: {e}", cfg.tun_name))?;
     let ipv6 = route::configure_tun(
         &cfg.tun_name,
@@ -115,18 +118,31 @@ pub fn run(mut cfg: Config) -> Result<(), String> {
         Some(v6) => format!("{}, {v6}", cfg.tun_ipv4),
         None => cfg.tun_ipv4.to_string(),
     };
-    log::info!(
-        "{:?} {:?} mode: {} via {} (mtu {}), tun {} {} (mtu {}), {} conns",
-        cfg.transport,
-        cfg.mode,
-        outer_endpoint,
-        outer.dev.as_deref().unwrap_or("?"),
-        outer.mtu,
-        cfg.tun_name,
-        tun_addrs,
-        tun_mtu,
-        cfg.conns
-    );
+    match cfg.mode {
+        Mode::Entry => log::info!(
+            "{:?} {:?} mode: {} via {} (mtu {}), tun {} {} (mtu {}), {} conns",
+            cfg.transport,
+            cfg.mode,
+            outer_endpoint,
+            outer.dev.as_deref().unwrap_or("?"),
+            outer.mtu,
+            cfg.tun_name,
+            tun_addrs,
+            tun_mtu,
+            cfg.conns
+        ),
+        Mode::Exit => log::info!(
+            "{:?} {:?} mode: {} via {} (mtu {}), tun {} {} (mtu {})",
+            cfg.transport,
+            cfg.mode,
+            outer_endpoint,
+            outer.dev.as_deref().unwrap_or("?"),
+            outer.mtu,
+            cfg.tun_name,
+            tun_addrs,
+            tun_mtu
+        ),
+    }
     // Rules go in before sockets exist so the kernel never RSTs our first handshake.
     let guard = if cfg.netfilter {
         let spec = netfilter::NftSpec::from_config(&cfg, listen_port);

@@ -256,13 +256,13 @@ fn no_ipv6_disables_inner_v6() {
 fn toml_alone_selects_role() {
     let c = with_file(
         "role",
-        "mode = \"exit\"\nlisten = 8443\nconns = 2\ntun_name = \"gx\"\nno_ipv6 = true\n",
+        "mode = \"exit\"\nlisten = 8443\ntun_name = \"gx\"\nno_ipv6 = true\n",
         &[],
     )
     .unwrap();
     assert_eq!(
         (c.mode, c.listen, c.conns, c.tun_name.as_str(), c.tun_ipv6),
-        (Mode::Exit, Some(8443), 2, "gx", None)
+        (Mode::Exit, Some(8443), 0, "gx", None)
     );
 }
 
@@ -313,6 +313,13 @@ fn file_errors() {
     .unwrap_err()
     .contains("entry mode"));
     assert!(with_file(
+        "exit-conns",
+        "mode = \"exit\"\nlisten = 1\nconns = 2\n",
+        &[]
+    )
+    .unwrap_err()
+    .contains("entry mode"));
+    assert!(with_file(
         "entry-no-masq",
         "mode = \"entry\"\nremote = \"1.2.3.4:5\"\nno_masq = true\n",
         &[]
@@ -327,6 +334,9 @@ fn validation_errors() {
     assert!(parse(&["exit"]).unwrap_err().contains("listen"));
     assert!(parse(&["exit", "--listen", "0"]).is_err());
     assert!(entry(&["--no-masq"]).unwrap_err().contains("exit mode"));
+    assert!(parse(&["exit", "--listen", "443", "--conns", "2"])
+        .unwrap_err()
+        .contains("entry mode"));
     assert!(entry(&["--ping-interval", "5", "--dead-timeout", "5"])
         .unwrap_err()
         .contains("dead_timeout"));
@@ -539,7 +549,7 @@ fn reload_updates_mutable_fields_and_rejects_immutable_or_invalid_changes() {
     // Changing any immutable field is rejected.
     for bad_toml in [
         format!("mode = 'entry'\ntransport = 'tcp'\nremote = '203.0.113.9:443'\nauth_key = '{key2}'\nconns = 2\n"),
-        format!("mode = 'exit'\nlisten = 443\nauth_key = '{key2}'\nconns = 2\n"),
+        format!("mode = 'exit'\nlisten = 443\nauth_key = '{key2}'\n"),
         format!("mode = 'entry'\nremote = '203.0.113.10:443'\nauth_key = '{key2}'\nconns = 2\n"),
         format!("mode = 'entry'\nremote = '[2001:db8::1]:443'\nauth_key = '{key2}'\nconns = 2\n"),
         format!("mode = 'entry'\nremote = '203.0.113.9:443'\nauth_key = '{key2}'\nconns = 4\n"),
@@ -557,19 +567,25 @@ fn reload_updates_mutable_fields_and_rejects_immutable_or_invalid_changes() {
 
     std::fs::write(
         &path,
-        format!("mode = 'exit'\nlisten = 443\nauth_key = '{key1}'\nconns = 2\n"),
+        format!("mode = 'exit'\nlisten = 443\nauth_key = '{key1}'\n"),
     )
     .unwrap();
     let exit_cfg = parse_from(["ghostun", "--config", path.to_str().unwrap()]).unwrap();
     std::fs::write(
         &path,
-        format!("mode = 'exit'\nlisten = 443\nauth_key = '{key1}'\nconns = 2\nno_masq = true\n"),
+        format!("mode = 'exit'\nlisten = 443\nauth_key = '{key1}'\ncpus = '0,1'\n"),
+    )
+    .unwrap();
+    assert_eq!(exit_cfg.reload().unwrap().tunables.cpus, Some(vec![0, 1]));
+    std::fs::write(
+        &path,
+        format!("mode = 'exit'\nlisten = 443\nauth_key = '{key1}'\nno_masq = true\n"),
     )
     .unwrap();
     assert!(exit_cfg.reload().unwrap_err().contains("no_masq"));
     std::fs::write(
         &path,
-        format!("mode = 'exit'\nlisten = '192.0.2.1:443'\nauth_key = '{key1}'\nconns = 2\n"),
+        format!("mode = 'exit'\nlisten = '192.0.2.1:443'\nauth_key = '{key1}'\n"),
     )
     .unwrap();
     assert!(exit_cfg.reload().unwrap_err().contains("listen"));

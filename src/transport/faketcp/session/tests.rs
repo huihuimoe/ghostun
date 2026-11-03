@@ -166,7 +166,7 @@ fn old_proofs_fail_against_a_fresh_handshake_and_challenge() {
     assert!(wire.take().is_empty());
     assert!(encap(&mut pair.exit, &[0x45; 20], 40).is_none());
     let mut body = parsed(&proof).payload.to_vec();
-    body[147..].copy_from_slice(&parsed(&old_proof).payload[147..]);
+    body[149..].copy_from_slice(&parsed(&old_proof).payload[149..]);
     pair.exit
         .on_outer(pair.t, &frame(parsed(&proof).meta, &body), &mut wire);
     assert!(wire.take().is_empty());
@@ -302,8 +302,8 @@ fn each_lost_authentication_message_recovers_without_reconsuming_sequence_space(
         pair.t += Duration::from_secs(3);
         let first = encap(&mut pair.entry, &[0x45; 100], 40).unwrap();
         let back = encap(&mut pair.exit, &[0x60; 80], 40).unwrap();
-        assert_eq!(parsed(&first).meta.seq, entry_isn.wrapping_add(215));
-        assert_eq!(parsed(&back).meta.seq, exit_isn.unwrap().wrapping_add(191));
+        assert_eq!(parsed(&first).meta.seq, entry_isn.wrapping_add(219));
+        assert_eq!(parsed(&back).meta.seq, exit_isn.unwrap().wrapping_add(193));
         assert_eq!(
             pair.exit.on_outer(pair.t, &first, &mut wire),
             Some(&[0x45; 100][..])
@@ -421,7 +421,7 @@ fn unauthenticated_candidates_cannot_replace_or_keep_an_active_peer_alive() {
         wire.take();
     }
     let mut invalid = parsed(&proof).payload.to_vec();
-    invalid[178] ^= 1;
+    invalid[180] ^= 1;
     assert!(pair
         .exit
         .on_outer(now, &frame(parsed(&proof).meta, &invalid), &mut wire)
@@ -461,12 +461,12 @@ fn invalid_or_reflected_proofs_cannot_authorize_either_role() {
     let exchange = start_auth(&mut pair.entry, &mut pair.exit, pair.t);
     let challenge = parsed(&exchange.challenge);
     let mut malformed = Vec::new();
-    for index in [1, 2, 19, 146] {
+    for index in [1, 2, 21, 148] {
         let mut body = challenge.payload.to_vec();
         body[index] ^= 0xff;
         malformed.push(body);
     }
-    malformed.push(challenge.payload[..146].to_vec());
+    malformed.push(challenge.payload[..148].to_vec());
     malformed.push([challenge.payload, &[0]].concat());
     let mut wire = Wire::default();
     for body in malformed {
@@ -479,13 +479,13 @@ fn invalid_or_reflected_proofs_cannot_authorize_either_role() {
     let proof = wire.take().remove(0);
     let request = parsed(&proof);
     let mut reflected = request.payload.to_vec();
-    reflected[147..179].copy_from_slice(&request.payload[115..147]);
+    reflected[149..181].copy_from_slice(&request.payload[117..149]);
     let mut malformed = vec![
         reflected,
-        request.payload[..178].to_vec(),
+        request.payload[..180].to_vec(),
         [request.payload, &[0]].concat(),
     ];
-    for index in [1, 2, 3, 11, 51, 83, 178] {
+    for index in [1, 2, 3, 11, 19, 53, 85, 180] {
         let mut body = request.payload.to_vec();
         body[index] ^= 0xff;
         malformed.push(body);
@@ -507,7 +507,7 @@ fn invalid_or_reflected_proofs_cannot_authorize_either_role() {
     let finished = wire.take().remove(0);
     let parsed_finished = parsed(&finished);
     let mut bad = parsed_finished.payload.to_vec();
-    bad[11..].copy_from_slice(&request.payload[147..]);
+    bad[11..].copy_from_slice(&request.payload[149..]);
     pair.entry
         .on_outer(pair.t, &frame(parsed_finished.meta, &bad), &mut wire);
     assert!(encap(&mut pair.entry, &[0x45; 20], 40).is_none());

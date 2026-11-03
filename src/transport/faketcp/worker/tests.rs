@@ -92,7 +92,8 @@ fn sync_reload(
 fn rolling_reload_rotates_established_workers_sequentially_and_rolls_back_without_resetting_sibling(
 ) {
     let now = Instant::now();
-    let default_cpus = vec![0, 1];
+    let cpus_1 = vec![Some(1), Some(1)];
+    let cpus_default = vec![Some(0), Some(1)];
     let controls = vec![
         Arc::new(Control::new(Some(0), -1)),
         Arc::new(Control::new(Some(1), -1)),
@@ -131,7 +132,8 @@ fn rolling_reload_rotates_established_workers_sequentially_and_rolls_back_withou
 
     // Start reload to a wrong key (0xb8) while exits still use 0xa7: worker 0 rotates and
     // waits for Established; worker 1 is not touched and keeps forwarding inner packets.
-    let mut rolling = RollingReload::start(&controls, &default_cpus, 1, test_cfg(0xb8, Some("1")));
+    let mut rolling =
+        RollingReload::start(&controls, cpus_1, 1, test_cfg(0xb8, Some("1")).tunables);
     let mut w0 = Wire::default();
     sync_reload(
         &controls[0],
@@ -145,14 +147,14 @@ fn rolling_reload_rotates_established_workers_sequentially_and_rolls_back_withou
     assert_eq!(cpus[0], Some(1));
     exchange(&mut entries[0], &mut exits[0], now, w0.0);
     assert!(!entries[0].is_established());
-    RollingReload::advance(&controls, &default_cpus, &mut rolling);
+    RollingReload::advance(&controls, &mut rolling);
     assert_eq!(rolling.as_ref().unwrap().next_worker, 0);
     assert!(entries[1].is_established());
 
     // Rollback SIGHUP (generation 2) restores key 0xa7 and removes explicit cpus override:
     // worker 0 restores default CPU 0 and re-establishes; worker 1 sees unchanged key 0xa7
     // and completes without emitting any RST or SYN frames.
-    rolling = RollingReload::start(&controls, &default_cpus, 2, test_cfg(0xa7, None));
+    rolling = RollingReload::start(&controls, cpus_default, 2, test_cfg(0xa7, None).tunables);
     let mut w0 = Wire::default();
     sync_reload(
         &controls[0],
@@ -175,7 +177,7 @@ fn rolling_reload_rotates_established_workers_sequentially_and_rolls_back_withou
         &mut entries[0],
         &mut Wire::default(),
     );
-    RollingReload::advance(&controls, &default_cpus, &mut rolling);
+    RollingReload::advance(&controls, &mut rolling);
     assert_eq!(rolling.as_ref().unwrap().next_worker, 1);
 
     let mut w1 = Wire::default();
@@ -193,14 +195,14 @@ fn rolling_reload_rotates_established_workers_sequentially_and_rolls_back_withou
         "unchanged key on worker 1 must not reset its session"
     );
     assert!(entries[1].is_established());
-    RollingReload::advance(&controls, &default_cpus, &mut rolling);
+    RollingReload::advance(&controls, &mut rolling);
     assert!(rolling.is_none());
 }
 
 #[test]
 fn rolling_reload_fast_forwards_unestablished_workers() {
     let now = Instant::now();
-    let default_cpus = vec![0, 1];
+    let cpus_default = vec![Some(0), Some(1)];
     let controls = vec![
         Arc::new(Control::new(Some(0), -1)),
         Arc::new(Control::new(Some(1), -1)),
@@ -212,7 +214,8 @@ fn rolling_reload_fast_forwards_unestablished_workers() {
     let mut cpus = [Some(0), Some(1)];
     let mut gens = [0u64, 0u64];
 
-    let mut rolling = RollingReload::start(&controls, &default_cpus, 1, test_cfg(0xc9, None));
+    let mut rolling =
+        RollingReload::start(&controls, cpus_default, 1, test_cfg(0xc9, None).tunables);
     sync_reload(
         &controls[0],
         0,
@@ -222,7 +225,7 @@ fn rolling_reload_fast_forwards_unestablished_workers() {
         &mut exits[0],
         &mut Wire::default(),
     );
-    RollingReload::advance(&controls, &default_cpus, &mut rolling);
+    RollingReload::advance(&controls, &mut rolling);
     assert_eq!(rolling.as_ref().unwrap().next_worker, 1);
     sync_reload(
         &controls[1],
@@ -233,6 +236,6 @@ fn rolling_reload_fast_forwards_unestablished_workers() {
         &mut exits[1],
         &mut Wire::default(),
     );
-    RollingReload::advance(&controls, &default_cpus, &mut rolling);
+    RollingReload::advance(&controls, &mut rolling);
     assert!(rolling.is_none());
 }

@@ -108,7 +108,7 @@ route_inner() {
 }
 
 start() {
-    ip netns exec exit "$BIN" --config "$LOG/auth.toml" exit --listen 443 --outer-family "$OUTER_FAMILY" --conns "$N" "${EXIT_CPU_ARGS[@]}" --ping-interval 1 --dead-timeout $DEAD >"$LOG/exit.log" 2>&1 &
+    ip netns exec exit "$BIN" --config "$LOG/auth.toml" exit --listen 443 --outer-family "$OUTER_FAMILY" "${EXIT_CPU_ARGS[@]}" --ping-interval 1 --dead-timeout $DEAD >"$LOG/exit.log" 2>&1 &
     EXIT_PID=$!
     PIDS="$EXIT_PID"
     start_entry

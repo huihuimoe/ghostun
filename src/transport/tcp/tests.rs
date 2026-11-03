@@ -7,16 +7,15 @@ use std::time::{Duration, Instant};
 
 use super::auth::{Handshake, Params};
 use super::frame::{Receive, PING, TX_LIMIT};
-use super::listener::{Candidate, Slot, Slots};
+use super::listener::{Candidate, ExitState, SharedExitState};
 use super::queue::SendQueue;
 use super::worker::Backoff;
 use super::*;
-use crate::config::AuthKey;
+use crate::config::{AuthKey, MAX_CONNS};
 
 fn params() -> Params {
     Params {
         worker: 1,
-        conns: 2,
         mtu: 1380,
     }
 }
@@ -43,14 +42,14 @@ fn packet(tag: u8) -> Vec<u8> {
 fn mutual_authentication_rejects_wrong_keys_reflection_replay_and_parameters() {
     let key = AuthKey([7; 32]);
     let (mut entry, hello) = Handshake::entry(&key, params()).unwrap();
-    assert_eq!(&hello[..12], b"\x01GTCP\x01\x00\x01\x00\x02\x05\x64");
+    assert_eq!(&hello[..10], b"\x01GTCP\x01\x00\x01\x05\x64");
     for len in 0..hello.len() {
         assert!(auth::hello_params(&hello[..len]).is_err());
     }
     let mut padded = vec![0xff];
     padded.extend_from_slice(&hello);
     let decoded = auth::hello_params(&padded[1..]).unwrap();
-    assert_eq!((decoded.worker, decoded.conns, decoded.mtu), (1, 2, 1380));
+    assert_eq!((decoded.worker, decoded.mtu), (1, 1380));
     padded.push(0);
     assert!(auth::hello_params(&padded[1..]).is_err());
     let mut bad_magic = hello;
@@ -59,7 +58,7 @@ fn mutual_authentication_rejects_wrong_keys_reflection_replay_and_parameters() {
     let mut bad_kind = hello;
     bad_kind[0] = 2;
     assert!(auth::hello_params(&bad_kind).is_err());
-    let (mut exit, challenge) = Handshake::exit(&key, params(), &hello).unwrap();
+    let (mut exit, challenge) = Handshake::exit(&key, 1380, &hello).unwrap();
     assert!(!entry.done());
     assert!(!exit.done());
     let proof = entry.receive(&challenge).unwrap().unwrap();
@@ -71,7 +70,7 @@ fn mutual_authentication_rejects_wrong_keys_reflection_replay_and_parameters() {
     let ready = entry.receive(&finished).unwrap().unwrap();
     exit.receive(&ready).unwrap();
     assert!(entry.done() && exit.done());
-    let (mut fresh, _) = Handshake::exit(&key, params(), &hello).unwrap();
+    let (mut fresh, _) = Handshake::exit(&key, 1380, &hello).unwrap();
     assert!(
         fresh.receive(&proof).is_err(),
         "fresh Exit nonce rejects replay"
@@ -82,15 +81,11 @@ fn mutual_authentication_rejects_wrong_keys_reflection_replay_and_parameters() {
         "fresh Entry nonce rejects replay"
     );
     let (mut wrong, wrong_hello) = Handshake::entry(&AuthKey([8; 32]), params()).unwrap();
-    let (_, wrong_challenge) = Handshake::exit(&key, params(), &wrong_hello).unwrap();
+    let (_, wrong_challenge) = Handshake::exit(&key, 1380, &wrong_hello).unwrap();
     assert!(wrong.receive(&wrong_challenge).is_err());
     for p in [
         Params {
-            worker: 2,
-            ..params()
-        },
-        Params {
-            conns: 3,
+            worker: MAX_CONNS as u16,
             ..params()
         },
         Params {
@@ -99,7 +94,7 @@ fn mutual_authentication_rejects_wrong_keys_reflection_replay_and_parameters() {
         },
     ] {
         let (_, hello) = Handshake::entry(&key, p).unwrap();
-        assert!(Handshake::exit(&key, params(), &hello).is_err());
+        assert!(Handshake::exit(&key, 1380, &hello).is_err());
     }
     let mut unsupported = hello;
     unsupported[5] = 2;
@@ -397,23 +392,17 @@ fn attempt_deadline_is_absolute_and_jitter_backoff_resets_only_after_stability()
     assert_eq!(b.delay(0, false), Duration::from_secs(1));
 }
 
-fn candidates(key: &AuthKey) -> Slots {
-    Arc::new(
-        (0..2)
-            .map(|_| {
-                Mutex::new(Slot {
-                    key: key.clone(),
-                    epoch: 0,
-                    timeout: Duration::from_secs(4),
-                    pending: None,
-                    wake: -1,
-                })
-            })
-            .collect(),
-    )
+fn candidates(key: &AuthKey) -> SharedExitState {
+    Arc::new(Mutex::new(ExitState {
+        key: key.clone(),
+        epoch: 0,
+        timeout: Duration::from_secs(4),
+        admitted: std::collections::VecDeque::new(),
+        main_wake: -1,
+    }))
 }
 
-fn admit(slots: &Slots, key: &AuthKey) -> Connection {
+fn admit(state: &SharedExitState, key: &AuthKey) -> Connection {
     let (client, server) = pair();
     let now = Instant::now();
     let mut client = conn(client, now);
@@ -429,14 +418,14 @@ fn admit(slots: &Slots, key: &AuthKey) -> Connection {
         let done = client
             .authenticate(Instant::now(), Duration::from_secs(4))
             .unwrap();
-        if candidate.advance(slots, 1380).unwrap() {
+        if candidate.advance(state, 1380).unwrap() {
             assert!(
                 done || client
                     .authenticate(Instant::now(), Duration::from_secs(4))
                     .unwrap()
             );
             client.establish(1380);
-            candidate.admit(slots, 1380).unwrap();
+            candidate.admit(state, 1380).unwrap();
             return client;
         }
         std::thread::sleep(Duration::from_millis(1));
@@ -447,10 +436,10 @@ fn admit(slots: &Slots, key: &AuthKey) -> Connection {
 #[test]
 fn authenticated_admission_and_takeover_preserve_exact_data_and_ignore_incomplete_candidates() {
     let key = AuthKey([7; 32]);
-    let slots = candidates(&key);
-    let mut entry = admit(&slots, &key);
-    assert!(slots[0].lock().unwrap().pending.is_none());
-    let mut exit = slots[1].lock().unwrap().pending.take().unwrap();
+    let state = candidates(&key);
+    let mut entry = admit(&state, &key);
+    let (id, mut exit) = state.lock().unwrap().admitted.pop_front().unwrap();
+    assert_eq!(id, 1);
     let (tun, consumer) = UnixDatagram::pair().unwrap();
     tun.set_nonblocking(true).unwrap();
     consumer.set_nonblocking(true).unwrap();
@@ -481,10 +470,11 @@ fn authenticated_admission_and_takeover_preserve_exact_data_and_ignore_incomplet
         timeout: Duration::from_secs(4),
     };
     let prior = exit.last_rx;
-    assert!(!incomplete.advance(&slots, 1380).unwrap());
+    assert!(!incomplete.advance(&state, 1380).unwrap());
     assert_eq!(exit.last_rx, prior);
-    let _new_entry = admit(&slots, &key);
-    let replacement = slots[1].lock().unwrap().pending.take().unwrap();
+    let _new_entry = admit(&state, &key);
+    let (rep_id, replacement) = state.lock().unwrap().admitted.pop_front().unwrap();
+    assert_eq!(rep_id, 1);
     drop(exit);
     drop(replacement);
     let mut buf = [0; 1];
@@ -562,7 +552,7 @@ fn eof_and_illegal_established_control_close_the_stream() {
 #[test]
 fn key_reload_invalidates_pending_authentication_before_admission() {
     let key = AuthKey([7; 32]);
-    let slots = candidates(&key);
+    let state = candidates(&key);
     let (a, b) = pair();
     let now = Instant::now();
     let mut client = conn(a, now);
@@ -576,21 +566,21 @@ fn key_reload_invalidates_pending_authentication_before_admission() {
     };
     client.tx.flush(&mut client.socket).unwrap();
     for _ in 0..100 {
-        candidate.advance(&slots, 1380).unwrap();
+        candidate.advance(&state, 1380).unwrap();
         if candidate.identity.is_some() {
             break;
         }
         std::thread::sleep(Duration::from_millis(1));
     }
     assert!(candidate.identity.is_some());
-    slots[1].lock().unwrap().epoch += 1;
+    state.lock().unwrap().epoch += 1;
     for _ in 0..100 {
         client
             .authenticate(Instant::now(), Duration::from_secs(4))
             .unwrap();
-        if candidate.advance(&slots, 1380).unwrap() {
-            assert!(candidate.admit(&slots, 1380).is_err());
-            assert!(slots[1].lock().unwrap().pending.is_none());
+        if candidate.advance(&state, 1380).unwrap() {
+            assert!(candidate.admit(&state, 1380).is_err());
+            assert!(state.lock().unwrap().admitted.is_empty());
             return;
         }
         std::thread::sleep(Duration::from_millis(1));

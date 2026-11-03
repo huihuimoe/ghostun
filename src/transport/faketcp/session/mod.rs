@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 #[cfg(test)]
 mod tests;
 
-use super::auth::{self, Auth, EntryStep, ExitStep, HELLO_LEN, PROOF_LEN};
+use super::auth::{self, Auth, EntryStep, ExitStep, FINISHED_LEN, HELLO_LEN, PROOF_LEN};
 use super::frame::{self, flags, TcpMeta, MAX_OVERHEAD};
 use crate::config::{AuthKey, Config, Mode};
 use crate::net::{ipv4, ipv6, OuterFamily};
@@ -24,6 +24,21 @@ pub enum State {
     SynSent,
     Authenticating,
     Established,
+}
+
+#[derive(Clone, Copy)]
+pub struct Promoted {
+    pub worker: usize,
+    pub local: SocketAddr,
+    pub peer: SocketAddr,
+    pub req_seq: u32,
+    pub req_ack: u32,
+    pub req_len: usize,
+    pub iss: u32,
+    pub irs: u32,
+    pub snd_nxt: u32,
+    pub rcv_nxt: u32,
+    pub finished: [u8; FINISHED_LEN],
 }
 
 #[derive(Clone, Debug)]
@@ -77,11 +92,17 @@ pub trait Sink {
 /// keeping one-way bulk transfers inside the firewall's tracked TCP window.
 pub const ACK_THRESHOLD: u32 = 1 << 20;
 pub const SYN_RETRY: Duration = Duration::from_secs(1);
-const WINDOW: u16 = 65535;
+pub(super) const WINDOW: u16 = 65535;
 const IDLE: Duration = Duration::from_secs(3600);
 
 #[inline]
-fn emit(scratch: &mut [u8], meta: &TcpMeta, payload: &[u8], id: u16, out: &mut impl Sink) {
+pub(super) fn emit(
+    scratch: &mut [u8],
+    meta: &TcpMeta,
+    payload: &[u8],
+    id: u16,
+    out: &mut impl Sink,
+) {
     let overhead = OuterFamily::of(meta.src.ip()).overhead();
     scratch[overhead..overhead + payload.len()].copy_from_slice(payload);
     let len = frame::write_headers(scratch, meta, payload.len(), id);
@@ -92,6 +113,7 @@ pub struct Session {
     cfg: SessionConfig,
     auth: Auth,
     state: State,
+    established_only: bool,
     generation: u64,
     local: SocketAddr,
     peer: Option<SocketAddr>,
@@ -130,6 +152,7 @@ impl Session {
             cfg,
             auth,
             state: State::Closed,
+            established_only: false,
             generation: 0,
             local,
             peer,
@@ -146,6 +169,48 @@ impl Session {
             nonce: 0,
             scratch: [0; MAX_OVERHEAD + PROOF_LEN],
         })
+    }
+
+    pub fn new_exit_established(
+        cfg: SessionConfig,
+        promo: &Promoted,
+        now: Instant,
+        seed: u64,
+        out: &mut impl Sink,
+    ) -> io::Result<Self> {
+        let auth = Auth::new(&cfg.auth_key, Mode::Entry, now, cfg.dead_timeout)?;
+        let mut session = Session {
+            cfg,
+            auth,
+            state: State::Closed,
+            established_only: true,
+            generation: 0,
+            local: promo.local,
+            peer: Some(promo.peer),
+            iss: promo.iss,
+            irs: promo.irs,
+            snd_nxt: promo.snd_nxt,
+            rcv_nxt: promo.rcv_nxt,
+            unacked: 0,
+            last_rx: now,
+            next_ping: now,
+            next_syn: now,
+            ip_id: seed as u16,
+            rng: seed ^ 0x9e37_79b9_7f4a_7c15,
+            nonce: 0,
+            scratch: [0; MAX_OVERHEAD + PROOF_LEN],
+        };
+        session.established(now);
+        let req = TcpMeta {
+            src: promo.peer,
+            dst: promo.local,
+            seq: promo.req_seq,
+            ack: promo.req_ack,
+            flags: flags::PSH | flags::ACK,
+            window: WINDOW,
+        };
+        session.reply_auth(&req, promo.req_len, &promo.finished, out);
+        Ok(session)
     }
 
     #[cfg(test)]
@@ -353,7 +418,7 @@ impl Session {
             return None;
         }
         if m.flags & flags::SYN != 0 {
-            if m.flags & flags::ACK == 0 && payload.is_empty() {
+            if !self.established_only && m.flags & flags::ACK == 0 && payload.is_empty() {
                 self.accept_syn(now, m, out);
             }
             return None;
@@ -362,7 +427,9 @@ impl Session {
             return None;
         }
         if payload.first() == Some(&auth::CONTROL) {
-            self.on_auth_request(now, m, payload, out);
+            if !self.established_only {
+                self.on_auth_request(now, m, payload, out);
+            }
             return None;
         }
         if !from_peer {
@@ -636,7 +703,7 @@ impl Session {
         self.generation = self.generation.wrapping_add(1);
         let iss = self.next_isn();
         let snd_nxt = iss.wrapping_add(1);
-        if let Err(e) = self.auth.begin_entry(snd_nxt) {
+        if let Err(e) = self.auth.begin_entry(self.cfg.worker, snd_nxt) {
             log::error!("worker {}: authentication randomness: {e}", self.cfg.worker);
             self.close(out);
             self.next_syn = now + SYN_RETRY;

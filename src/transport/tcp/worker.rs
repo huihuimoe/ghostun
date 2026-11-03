@@ -2,11 +2,9 @@
 
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::auth::{Handshake, Params};
-use super::listener::{Listener, Slots};
 use super::{can_io, Connection, BATCH, ROUNDS};
 use crate::config::{Config, Mode};
 use crate::sys::{self, poll, poll_ms, pollfd, READ_READY};
@@ -31,23 +29,27 @@ pub struct Worker {
     cfg: Config,
     mtu: u16,
     tun: OwnedFd,
-    slots: Option<Slots>,
+    initial: Option<Connection>,
 }
 
 impl Worker {
-    pub fn new(
-        id: usize,
-        cfg: Config,
-        mtu: u16,
-        tun: OwnedFd,
-        listener: Option<&Listener>,
-    ) -> Self {
+    pub fn new_entry(id: usize, cfg: Config, mtu: u16, tun: OwnedFd) -> Self {
         Self {
             id,
             cfg,
             mtu,
             tun,
-            slots: listener.map(|l| Arc::clone(&l.slots)),
+            initial: None,
+        }
+    }
+
+    pub fn new_exit(id: usize, cfg: Config, mtu: u16, tun: OwnedFd, conn: Connection) -> Self {
+        Self {
+            id,
+            cfg,
+            mtu,
+            tun,
+            initial: Some(conn),
         }
     }
 
@@ -58,21 +60,24 @@ impl Worker {
         let mut generation = 0;
         let mut wait = false;
         let mut attached = false;
-        let mut connection: Option<Connection> = None;
+        let mut connection = self.initial.take();
+        if let Some(c) = &connection {
+            log::info!("worker {id}: established {c}");
+            control::sync_tun_queue(id, self.tun.as_fd(), &mut attached, true);
+        }
         let mut retry_at = Instant::now();
         let mut backoff = Backoff { failures: 0 };
         let mut packet = vec![0; self.mtu as usize + 1];
-        if let Some(slots) = &self.slots {
-            slots[id].lock().unwrap().wake = ctrl.wake_fd().as_raw_fd();
-        }
-        let mut check_slot = true;
         let mut fds = [
             pollfd(-1, 0),
             pollfd(-1, 0),
             pollfd(ctrl.wake_fd().as_raw_fd(), libc::POLLIN),
         ];
-        while !stop.load(Ordering::Relaxed) {
-            check_slot |= sys::poll_wake(fds[2], ctrl.wake_fd());
+        while !stop.load(Ordering::Relaxed) && !ctrl.is_stopped() {
+            sys::poll_wake(fds[2], ctrl.wake_fd());
+            if ctrl.is_stopped() {
+                break;
+            }
             if let Some((gen, reload)) = ctrl.take_reload(generation) {
                 wait &= !connection.as_ref().is_some_and(|c| c.auth.is_none());
                 if cpu != reload.cpu {
@@ -84,30 +89,11 @@ impl Worker {
                     connection = None;
                     fds[1] = pollfd(-1, 0);
                     retry_at = Instant::now();
-                    if let Some(slots) = &self.slots {
-                        let mut slot = slots[id].lock().unwrap();
-                        slot.key = reload.tunables.auth_key.clone();
-                        slot.epoch += 1;
-                        slot.pending = None;
-                    }
-                }
-                if let Some(slots) = &self.slots {
-                    slots[id].lock().unwrap().timeout = reload.tunables.dead_timeout;
                 }
                 self.cfg.tunables = reload.tunables;
                 generation = gen;
-            }
-            if check_slot {
-                check_slot = false;
-                if let Some(slots) = &self.slots {
-                    if let Some(new) = slots[id].lock().unwrap().pending.take() {
-                        if let Some(old) = &connection {
-                            log::info!("worker {id}: authenticated takeover, closing {old}");
-                        }
-                        log::info!("worker {id}: established {new}");
-                        connection = Some(new);
-                        fds[1] = pollfd(-1, 0);
-                    }
+                if self.cfg.mode == Mode::Exit && connection.is_none() {
+                    break;
                 }
             }
             let mut now = Instant::now();
@@ -119,7 +105,6 @@ impl Worker {
                         &self.cfg.tunables.auth_key,
                         Params {
                             worker: id as u16,
-                            conns: self.cfg.conns,
                             mtu: self.mtu,
                         },
                     )?;
@@ -181,6 +166,8 @@ impl Worker {
                     fds[1] = pollfd(-1, 0);
                     if self.cfg.mode == Mode::Entry {
                         retry_at = self.retry(&mut backoff, stable);
+                    } else {
+                        break;
                     }
                 }
             }
@@ -222,7 +209,7 @@ impl Worker {
                     fds[0].events |= libc::POLLOUT;
                 }
             }
-            if stop.load(Ordering::Relaxed) {
+            if stop.load(Ordering::Relaxed) || ctrl.is_stopped() {
                 break;
             }
             let timeout = if busy {

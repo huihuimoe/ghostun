@@ -7,13 +7,13 @@ use std::time::{Duration, Instant};
 
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
-use zerocopy::byteorder::network_endian::U64;
+use zerocopy::byteorder::network_endian::{U16, U64};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 type HmacSha256 = Hmac<Sha256>;
 
 use super::frame::TcpMeta;
-use crate::config::{AuthKey, Mode};
+use crate::config::{AuthKey, Mode, MAX_CONNS};
 use crate::sys;
 
 pub const CONTROL: u8 = 3;
@@ -38,6 +38,7 @@ struct Header {
 #[repr(C)]
 struct Hello {
     header: Header,
+    worker: U16,
     nonce: [u8; NONCE_LEN],
 }
 
@@ -47,6 +48,7 @@ struct Hello {
 struct ChallengeTranscript {
     ticket: U64,
     issued_ms: U64,
+    worker: U16,
     entry_nonce: [u8; NONCE_LEN],
     exit_nonce: [u8; NONCE_LEN],
 }
@@ -86,7 +88,7 @@ struct Finished {
 pub const HELLO_LEN: usize = mem::size_of::<Hello>();
 const CHALLENGE_LEN: usize = mem::size_of::<Challenge>();
 pub const PROOF_LEN: usize = mem::size_of::<Proof>();
-const FINISHED_LEN: usize = mem::size_of::<Finished>();
+pub const FINISHED_LEN: usize = mem::size_of::<Finished>();
 
 const ENTRY_BYTES: u32 = (HELLO_LEN + PROOF_LEN) as u32;
 pub(crate) const EXIT_BYTES: u32 = (CHALLENGE_LEN + FINISHED_LEN) as u32;
@@ -103,7 +105,8 @@ struct Isns {
 struct Server {
     cookie_key: HmacSha256,
     next_ticket: u64,
-    accepted: u64,
+    accepted: Box<[u64; MAX_CONNS]>,
+    completions: Box<[Option<Completion>; MAX_CONNS]>,
 }
 
 struct EntryState {
@@ -113,6 +116,7 @@ struct EntryState {
     warned: bool,
 }
 
+#[derive(Clone, Copy)]
 struct Completion {
     request: TcpMeta,
     proof: [u8; PROOF_LEN],
@@ -126,6 +130,7 @@ pub enum EntryStep {
 }
 
 pub struct Promotion {
+    pub worker: usize,
     pub iss: u32,
     pub irs: u32,
     pub snd_nxt: u32,
@@ -144,7 +149,6 @@ pub struct Auth {
     key: HmacSha256,
     server: Option<Server>,
     entry: Option<EntryState>,
-    completion: Option<Completion>,
     origin: Instant,
     timeout: Duration,
 }
@@ -167,7 +171,8 @@ impl Auth {
                 cookie_key: HmacSha256::new_from_slice(&secret)
                     .expect("HMAC accepts a 32-byte key"),
                 next_ticket: 0,
-                accepted: 0,
+                accepted: Box::new([0; MAX_CONNS]),
+                completions: Box::new([None; MAX_CONNS]),
             })
         } else {
             None
@@ -176,7 +181,6 @@ impl Auth {
             key: HmacSha256::new_from_slice(&key.0).expect("HMAC accepts a 32-byte key"),
             server,
             entry: None,
-            completion: None,
             origin: now,
             timeout,
         })
@@ -189,13 +193,16 @@ impl Auth {
 
     pub fn reset(&mut self) {
         self.entry = None;
-        self.completion = None;
+        if let Some(server) = &mut self.server {
+            server.completions.fill(None);
+        }
     }
 
-    pub fn begin_entry(&mut self, seq: u32) -> io::Result<()> {
+    pub fn begin_entry(&mut self, worker: u16, seq: u32) -> io::Result<()> {
         let mut frame = [0; PROOF_LEN];
         let hello = Hello::mut_from_bytes(&mut frame[..HELLO_LEN]).expect("Hello buffer");
         hello.header = header(HELLO);
+        hello.worker.set(worker);
         sys::random(&mut hello.nonce)?;
         self.entry = Some(EntryState {
             frame,
@@ -230,6 +237,7 @@ impl Auth {
             if m.seq != irs.wrapping_add(1)
                 || m.ack != snd_nxt
                 || challenge.header != header(CHALLENGE)
+                || challenge.body.transcript.worker != hello.worker
                 || challenge.body.transcript.entry_nonce != hello.nonce
             {
                 return None;
@@ -285,12 +293,20 @@ impl Auth {
                 None => ExitStep::Ignore,
             });
         }
-        if let Some(c) = self
-            .completion
-            .as_ref()
-            .filter(|c| established && c.request == *m && payload == &c.proof[..])
+        if let Some(proof) = Proof::ref_from_bytes(payload)
+            .ok()
+            .filter(|proof| proof.header == header(PROOF))
         {
-            return Ok(ExitStep::Finished(c.finished));
+            let worker = usize::from(proof.body.transcript.worker.get());
+            if let Some(c) = self
+                .server
+                .as_ref()
+                .and_then(|s| s.completions.get(worker))
+                .and_then(Option::as_ref)
+                .filter(|c| established && c.request == *m && payload == &c.proof[..])
+            {
+                return Ok(ExitStep::Finished(c.finished));
+            }
         }
         Ok(match self.accept(now, m, payload) {
             Some(promotion) => ExitStep::Promote(promotion),
@@ -327,6 +343,10 @@ impl Auth {
         meta: &TcpMeta,
         hello: &Hello,
     ) -> io::Result<Option<[u8; CHALLENGE_LEN]>> {
+        let worker = hello.worker.get();
+        if usize::from(worker) >= MAX_CONNS {
+            return Ok(None);
+        }
         let isns = Isns {
             entry: meta.seq.wrapping_sub(1),
             exit: meta.ack.wrapping_sub(1),
@@ -353,6 +373,7 @@ impl Auth {
         challenge.body.transcript.ticket.set(ticket);
         let issued_ms = now.saturating_duration_since(self.origin).as_millis() as u64;
         challenge.body.transcript.issued_ms.set(issued_ms);
+        challenge.body.transcript.worker.set(worker);
         challenge.body.transcript.entry_nonce = hello.nonce;
         sys::random(&mut challenge.body.transcript.exit_nonce)?;
         challenge.body.cookie = cookie_mac(
@@ -392,8 +413,12 @@ impl Auth {
         if proof.header != header(PROOF) {
             return None;
         }
+        let worker = usize::from(proof.body.transcript.worker.get());
+        if worker >= MAX_CONNS {
+            return None;
+        }
         let ticket = proof.body.transcript.ticket.get();
-        if ticket <= self.server.as_ref()?.accepted {
+        if ticket <= self.server.as_ref()?.accepted[worker] {
             return None;
         }
         let issued = proof.body.transcript.issued_ms.get();
@@ -426,13 +451,15 @@ impl Auth {
         message.header = header(FINISHED);
         message.ticket.set(ticket);
         message.tag = self.sign(FINISHED_DOMAIN, isns, transcript);
-        self.server.as_mut()?.accepted = ticket;
-        self.completion = Some(Completion {
+        let server = self.server.as_mut()?;
+        server.accepted[worker] = ticket;
+        server.completions[worker] = Some(Completion {
             request: *meta,
             proof: proof.as_bytes().try_into().unwrap(),
             finished,
         });
         Some(Promotion {
+            worker,
             iss: isns.exit,
             irs: isns.entry,
             snd_nxt: isns.exit.wrapping_add(1 + EXIT_BYTES),
