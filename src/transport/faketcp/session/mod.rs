@@ -9,9 +9,9 @@ use std::time::{Duration, Instant};
 mod tests;
 
 use super::auth::{self, Auth, EntryStep, ExitStep, FINISHED_LEN, HELLO_LEN, PROOF_LEN};
-use super::frame::{self, flags, TcpMeta, MAX_OVERHEAD};
+use super::frame::{self, MAX_OVERHEAD, TcpMeta, flags};
 use crate::config::{AuthKey, Config, Mode};
-use crate::net::{ipv4, ipv6, OuterFamily};
+use crate::net::{OuterFamily, ipv4, ipv6};
 use crate::transport::control::Backoff;
 use crate::transport::keepalive::{self, Keepalive};
 

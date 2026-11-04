@@ -10,9 +10,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::auth::{self, Handshake};
-use super::{invalid, Connection, BATCH};
+use super::{BATCH, Connection, invalid};
 use crate::config::{AuthKey, Config, MAX_CONNS};
-use crate::sys::{self, poll, poll_ms, pollfd, READ_READY};
+use crate::sys::{self, READ_READY, poll, poll_ms, pollfd};
 use crate::transport::control;
 
 pub const MAX_CANDIDATES: usize = MAX_CONNS;
@@ -163,11 +163,14 @@ impl Listener {
                                 continue;
                             }
                             match Connection::new(socket, peer, now, self.tcp_notsent) {
-                                Ok(conn) => candidates.push(Candidate {
-                                    conn,
-                                    identity: None,
-                                    timeout: self.state.lock().unwrap().timeout,
-                                }),
+                                Ok(conn) => {
+                                    let timeout = self.state.lock().unwrap().timeout;
+                                    candidates.push(Candidate {
+                                        conn,
+                                        identity: None,
+                                        timeout,
+                                    });
+                                }
                                 Err(e) => log::debug!("candidate setup ({peer}): {e}"),
                             }
                         }

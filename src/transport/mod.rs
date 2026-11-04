@@ -8,14 +8,14 @@ mod tcp;
 
 use std::net::{IpAddr, SocketAddr};
 use std::os::fd::{OwnedFd, RawFd};
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::thread::JoinHandle;
 
-use crate::config::{Config, Mode, Transport, MAX_CONNS};
+use crate::config::{Config, MAX_CONNS, Mode, Transport};
 use crate::sys;
 use control::{
-    candidate_cpus, Control, CoreTable, ExitWorkerGuard, Reload, RollingReload, StopOnDrop,
+    Control, CoreTable, ExitWorkerGuard, Reload, RollingReload, StopOnDrop, candidate_cpus,
 };
 
 /// Per-remote outer route and connection count on Entry.
@@ -93,7 +93,9 @@ pub fn start(
     main_wake: RawFd,
 ) -> Result<Running, String> {
     if cfg.transport == Transport::Tcp && cfg.base_port_explicit {
-        log::warn!("tcp transport: explicitly configured base_port is ignored; kernel assigns source ports");
+        log::warn!(
+            "tcp transport: explicitly configured base_port is ignored; kernel assigns source ports"
+        );
     }
     let default_cpus = sys::usable_cpus();
     let mut core_table = CoreTable::new(candidate_cpus(cfg, &default_cpus));
@@ -424,16 +426,15 @@ impl Running {
             }
             None => {}
         }
-        if let Some(gen) = self.exit_reload_gen {
-            if self
+        if let Some(generation) = self.exit_reload_gen
+            && self
                 .exit_workers
                 .iter()
                 .flatten()
-                .all(|s| s.ctrl.is_step_complete(gen))
-            {
-                log::info!("configuration reload complete (generation {gen})");
-                self.exit_reload_gen = None;
-            }
+                .all(|s| s.ctrl.is_step_complete(generation))
+        {
+            log::info!("configuration reload complete (generation {generation})");
+            self.exit_reload_gen = None;
         }
     }
 
@@ -458,10 +459,10 @@ impl Running {
                 log::error!("worker panicked");
             }
         }
-        if let Some(thread) = self.listener_thread {
-            if thread.join().is_err() {
-                log::error!("listener panicked");
-            }
+        if let Some(thread) = self.listener_thread
+            && thread.join().is_err()
+        {
+            log::error!("listener panicked");
         }
     }
 }

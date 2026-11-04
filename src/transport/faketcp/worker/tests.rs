@@ -89,8 +89,7 @@ fn sync_reload(
 }
 
 #[test]
-fn rolling_reload_rotates_established_workers_sequentially_and_rolls_back_without_resetting_sibling(
-) {
+fn rolling_reload_rotates_workers_sequentially_and_rolls_back() {
     let now = Instant::now();
     let cpus_1 = vec![Some(1), Some(1)];
     let cpus_default = vec![Some(0), Some(1)];

@@ -3,7 +3,7 @@
 use std::net::{IpAddr, SocketAddr};
 
 use super::frame::flags;
-use crate::net::{ipv4, ipv6, tcp, OuterFamily};
+use crate::net::{OuterFamily, ipv4, ipv6, tcp};
 
 const ACCEPT: u32 = u32::MAX;
 const OFF_DATA_OFFSET: u32 = 12;
@@ -169,7 +169,7 @@ pub fn exit_worker_filter(local: SocketAddr, peer: SocketAddr) -> Vec<libc::sock
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::faketcp::frame::{flags, frame_with_options, write_headers, TcpMeta};
+    use crate::transport::faketcp::frame::{TcpMeta, flags, frame_with_options, write_headers};
     use std::net::{Ipv4Addr, SocketAddrV4};
 
     const B: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 7), 443);

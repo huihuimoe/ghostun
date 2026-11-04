@@ -3,7 +3,7 @@
 use std::io;
 
 use netlink_packet_core::{
-    NetlinkMessage, NetlinkPayload, NlasIterator, NLM_F_ACK, NLM_F_ACK_TLVS, NLM_F_REQUEST,
+    NLM_F_ACK, NLM_F_ACK_TLVS, NLM_F_REQUEST, NetlinkMessage, NetlinkPayload, NlasIterator,
 };
 use netlink_packet_netfilter::nftables::NfTablesMessage;
 use netlink_packet_netfilter::none::ControlMessage;
@@ -41,10 +41,10 @@ impl Batch {
         let local = socket.bind_auto()?;
         let kernel = SocketAddr::new(0, 0);
         socket.set_cap_ack(true)?;
-        if let Err(error) = socket.set_ext_ack(true) {
-            if error.raw_os_error() != Some(libc::ENOPROTOOPT) {
-                return Err(error);
-            }
+        if let Err(error) = socket.set_ext_ack(true)
+            && error.raw_os_error() != Some(libc::ENOPROTOOPT)
+        {
+            return Err(error);
         }
         let mut pending = vec![false; self.messages.len() + 1];
         pending[2..self.messages.len()].fill(true);

@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::auth::{Handshake, Params};
-use super::frame::{Receive, PING, TX_LIMIT};
+use super::frame::{PING, Receive, TX_LIMIT};
 use super::listener::{Candidate, ExitState, SharedExitState};
 use super::queue::SendQueue;
 use super::*;
@@ -232,20 +232,22 @@ fn writes_preserve_frames_across_partial_prefixes_and_would_block() {
         assert!(tx.push(&p));
         packets.push(p);
     }
-    assert!(tx
-        .push_in_place(1380, |dst| {
+    assert!(
+        tx.push_in_place(1380, |dst| {
             let p = packet(5);
             dst[..p.len()].copy_from_slice(&p);
             Ok(Some(p.len()))
         })
-        .unwrap());
+        .unwrap()
+    );
     packets.push(packet(5));
-    assert!(tx
-        .push_in_place(1380, |dst| {
+    assert!(
+        tx.push_in_place(1380, |dst| {
             dst[..4].copy_from_slice(&[0xff; 4]);
             Err(invalid("bad"))
         })
-        .is_err());
+        .is_err()
+    );
     tx.flush(&mut writer).unwrap();
     assert_eq!(tx.bytes(), 0);
     let mut input = &writer.bytes[..];
@@ -314,12 +316,14 @@ fn send_blocks_preserve_framing_under_sustained_backpressure() {
         queue.flush(&mut writer).unwrap();
         assert_eq!(writer.bytes.len(), 70001);
         for index in 200..250u8 {
-            assert!(queue
-                .push_in_place(1200, |buffer| {
-                    buffer[..1200].fill(index);
-                    Ok(Some(1200))
-                })
-                .unwrap());
+            assert!(
+                queue
+                    .push_in_place(1200, |buffer| {
+                        buffer[..1200].fill(index);
+                        Ok(Some(1200))
+                    })
+                    .unwrap()
+            );
             expected.push(vec![index; 1200]);
         }
         writer.budget = 60100;
@@ -379,9 +383,10 @@ fn attempt_deadline_is_absolute_and_jitter_backoff_resets_only_after_stability()
     let start = Instant::now();
     let mut c = conn(a, start);
     c.auth = Some(Handshake::entry(&key, params()).unwrap().0);
-    assert!(c
-        .authenticate(start + Duration::from_secs(4), Duration::from_secs(4))
-        .is_err());
+    assert!(
+        c.authenticate(start + Duration::from_secs(4), Duration::from_secs(4))
+            .is_err()
+    );
     let mut b = Backoff::default();
     for base in [1, 2, 4, 8, 15, 30, 30, 30] {
         let d = b.delay(0, false);

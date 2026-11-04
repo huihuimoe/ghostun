@@ -5,8 +5,8 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use netlink_packet_core::{
-    NetlinkMessage, NetlinkPayload, NLM_F_ACK, NLM_F_CREATE, NLM_F_DUMP, NLM_F_DUMP_INTR,
-    NLM_F_EXCL, NLM_F_MULTIPART, NLM_F_REQUEST,
+    NLM_F_ACK, NLM_F_CREATE, NLM_F_DUMP, NLM_F_DUMP_INTR, NLM_F_EXCL, NLM_F_MULTIPART,
+    NLM_F_REQUEST, NetlinkMessage, NetlinkPayload,
 };
 use netlink_packet_route::address::{
     AddressAttribute, AddressHeaderFlags, AddressMessage, AddressScope,

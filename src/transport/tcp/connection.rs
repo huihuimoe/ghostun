@@ -3,10 +3,10 @@ use std::os::fd::{AsFd, OwnedFd};
 use std::time::{Duration, Instant};
 use std::{fmt, io};
 
-use super::auth::{Handshake, AUTH_MAX};
-use super::frame::{self, Receive, PING, PONG};
+use super::auth::{AUTH_MAX, Handshake};
+use super::frame::{self, PING, PONG, Receive};
 use super::queue::SendQueue;
-use super::{can_io, BATCH, ROUNDS};
+use super::{BATCH, ROUNDS, can_io};
 use crate::sys::{self, READ_READY, WRITE_READY};
 use crate::transport::keepalive::{self, Keepalive};
 

@@ -4,9 +4,12 @@ use std::io;
 use std::mem::{size_of, zeroed};
 use std::net::{IpAddr, Ipv6Addr};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::ptr::read_unaligned;
 
-use super::{bind_to_device, cvt, setsockopt, SockAddr};
-use crate::net::{ipv6, OuterFamily};
+use libc::in6_pktinfo;
+
+use super::{SockAddr, bind_to_device, cvt, setsockopt};
+use crate::net::{OuterFamily, ipv6};
 
 /// fwmark on every frame ghostun sends, so the netfilter RST-suppression rule spares our own RSTs.
 pub const SOCKET_MARK: u32 = 0x6768_7374;
@@ -304,18 +307,21 @@ impl Receiver {
 
 #[inline]
 unsafe fn pktinfo_dst(msg: &libc::msghdr) -> Option<Ipv6Addr> {
-    let mut cmsg = libc::CMSG_FIRSTHDR(msg);
-    while !cmsg.is_null() {
-        if (*cmsg).cmsg_level == libc::IPPROTO_IPV6
-            && (*cmsg).cmsg_type == libc::IPV6_PKTINFO
-            && (*cmsg).cmsg_len >= libc::CMSG_LEN(size_of::<libc::in6_pktinfo>() as u32) as _
-        {
-            let info = std::ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast::<libc::in6_pktinfo>());
-            return Some(Ipv6Addr::from(info.ipi6_addr.s6_addr));
+    // SAFETY: caller guarantees msg points to a valid msghdr with initialized control buffers.
+    unsafe {
+        let mut cmsg = libc::CMSG_FIRSTHDR(msg);
+        while !cmsg.is_null() {
+            if (*cmsg).cmsg_level == libc::IPPROTO_IPV6
+                && (*cmsg).cmsg_type == libc::IPV6_PKTINFO
+                && (*cmsg).cmsg_len >= libc::CMSG_LEN(size_of::<in6_pktinfo>() as u32) as _
+            {
+                let info = read_unaligned(libc::CMSG_DATA(cmsg).cast::<in6_pktinfo>());
+                return Some(Ipv6Addr::from(info.ipi6_addr.s6_addr));
+            }
+            cmsg = libc::CMSG_NXTHDR(msg, cmsg);
         }
-        cmsg = libc::CMSG_NXTHDR(msg, cmsg);
+        None
     }
-    None
 }
 
 #[cfg(test)]

@@ -11,8 +11,8 @@ use netlink_packet_netfilter::nftables::{
     VerdictAttribute,
 };
 
-use super::batch::Batch;
 use super::NftSpec;
+use super::batch::Batch;
 use crate::config::{Mode, Transport};
 use crate::net::{Cidr, OuterFamily};
 use crate::sys::raw::SOCKET_MARK;

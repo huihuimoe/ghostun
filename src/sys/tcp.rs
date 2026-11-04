@@ -4,7 +4,7 @@ use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-use super::{bind_to_device, cvt, setsockopt, SockAddr};
+use super::{SockAddr, bind_to_device, cvt, setsockopt};
 
 pub fn set_notsent_lowat(stream: &TcpStream, bytes: u32) -> io::Result<()> {
     setsockopt(stream, libc::IPPROTO_TCP, libc::TCP_NOTSENT_LOWAT, &bytes)

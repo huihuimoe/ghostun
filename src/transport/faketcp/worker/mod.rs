@@ -11,11 +11,11 @@ use std::time::{Duration, Instant};
 
 use super::auth::{self, Auth, ExitStep, PROOF_LEN};
 use super::filter::{entry_filter, exit_listener_filter, exit_worker_filter};
-use super::frame::{self, flags, TcpMeta, MAX_OVERHEAD};
+use super::frame::{self, MAX_OVERHEAD, TcpMeta, flags};
 use super::queue::Pending;
-use super::session::{emit, Promoted, Session, SessionConfig, Sink, WINDOW};
+use super::session::{Promoted, Session, SessionConfig, Sink, WINDOW, emit};
 use super::tun_driver::TunDriver;
-use crate::config::{AuthKey, Config, Mode, MAX_CONNS};
+use crate::config::{AuthKey, Config, MAX_CONNS, Mode};
 use crate::net::OuterFamily;
 use crate::sys::{self, raw};
 use crate::transport::control::{self, Control};
@@ -408,7 +408,7 @@ fn apply_reload(
     out: &mut impl Sink,
 ) -> bool {
     let mut wait = ctrl.wait_for_established();
-    if let Some((gen, reload)) = ctrl.take_reload(*applied_gen) {
+    if let Some((generation, reload)) = ctrl.take_reload(*applied_gen) {
         if reload.cpu != *cpu {
             *cpu = reload.cpu;
             control::pin(id, *cpu);
@@ -421,7 +421,7 @@ fn apply_reload(
             reload.tunables.dead_timeout,
             out,
         ) || prior_wait;
-        *applied_gen = gen;
+        *applied_gen = generation;
     }
     wait
 }
@@ -632,12 +632,12 @@ impl Worker {
                                     driver.reset();
                                     generation = session.generation();
                                 }
-                                if let Some(inner) = inner {
-                                    if !driver.write(inner) {
-                                        log::debug!(
-                                            "worker {id}: TUN queue full; dropping new data packet"
-                                        );
-                                    }
+                                if let Some(inner) = inner
+                                    && !driver.write(inner)
+                                {
+                                    log::debug!(
+                                        "worker {id}: TUN queue full; dropping new data packet"
+                                    );
                                 }
                             }
                             m == raw::BATCH

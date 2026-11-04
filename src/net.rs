@@ -127,11 +127,7 @@ pub enum OuterFamily {
 impl OuterFamily {
     #[inline(always)]
     pub const fn of(ip: IpAddr) -> Self {
-        if ip.is_ipv4() {
-            Self::Ipv4
-        } else {
-            Self::Ipv6
-        }
+        if ip.is_ipv4() { Self::Ipv4 } else { Self::Ipv6 }
     }
 
     /// Outer IP plus TCP header bytes in front of each tunneled packet.

@@ -10,7 +10,7 @@ use std::time::Duration;
 use argh::{FromArgValue, FromArgs};
 use serde::Deserialize;
 
-use crate::net::{ipv4, ipv6, Cidr, OuterFamily};
+use crate::net::{Cidr, OuterFamily, ipv4, ipv6};
 
 /// Linux `IFF_MULTI_QUEUE` TUN devices allow at most `MAX_TAP_QUEUES` (256) open queue
 /// descriptors, and Exit reserves one detached anchor descriptor to keep the interface alive;
@@ -238,7 +238,9 @@ impl Config {
         let mtu = self.tun_mtu.unwrap_or(available);
         let minimum = self.inner_min_mtu();
         if mtu < minimum || mtu > available {
-            return Err(format!("TUN MTU {mtu} must be within {minimum}..={available} for outer MTU {outer_mtu} and {overhead}-byte encapsulation"));
+            return Err(format!(
+                "TUN MTU {mtu} must be within {minimum}..={available} for outer MTU {outer_mtu} and {overhead}-byte encapsulation"
+            ));
         }
         Ok(mtu)
     }
@@ -526,10 +528,10 @@ fn build_config(cli: Cli, running_conns: Option<u16>) -> Result<Config, String> 
     if mode == Mode::Entry && outer_family.is_some_and(|f| f != OuterMode::Mixed) {
         return Err("entry accepts only explicit `outer_family = mixed`; otherwise it uses the remote address family".into());
     }
-    if let (Some(explicit), Some(inferred)) = (outer_family, listen_family) {
-        if explicit != OuterMode::from(inferred) {
-            return Err("`outer_family` conflicts with `listen` address family; mixed requires a bare listen port".into());
-        }
+    if let (Some(explicit), Some(inferred)) = (outer_family, listen_family)
+        && explicit != OuterMode::from(inferred)
+    {
+        return Err("`outer_family` conflicts with `listen` address family; mixed requires a bare listen port".into());
     }
     let outer_family = outer_family
         .or_else(|| remote_mode(&remote))

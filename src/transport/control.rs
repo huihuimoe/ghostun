@@ -57,10 +57,10 @@ impl CoreTable {
     }
 
     pub fn release(&mut self, cpu: Option<usize>) {
-        if let Some(target) = cpu {
-            if let Some((_, count)) = self.cores.iter_mut().find(|(c, _)| *c == target) {
-                *count = count.saturating_sub(1);
-            }
+        if let Some(target) = cpu
+            && let Some((_, count)) = self.cores.iter_mut().find(|(c, _)| *c == target)
+        {
+            *count = count.saturating_sub(1);
         }
     }
 }
@@ -241,10 +241,10 @@ impl RollingReload {
 }
 
 pub fn pin(id: usize, cpu: Option<usize>) {
-    if let Some(target) = cpu {
-        if let Err(e) = sys::pin_to_cpu(target) {
-            log::warn!("worker {id}: cannot pin to CPU: {e}");
-        }
+    if let Some(target) = cpu
+        && let Err(e) = sys::pin_to_cpu(target)
+    {
+        log::warn!("worker {id}: cannot pin to CPU: {e}");
     }
 }
 

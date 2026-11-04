@@ -51,11 +51,13 @@ fn malformed_replacement(spec: &NftSpec, table: &str) -> batch::Batch {
             attributes: vec![
                 RuleAttribute::Table(table.into()),
                 RuleAttribute::Chain("output".into()),
-                RuleAttribute::Expressions(vec![Expressions::Other {
-                    expression_type: "rt".into(),
-                    attributes: vec![],
-                }
-                .into()]),
+                RuleAttribute::Expressions(vec![
+                    Expressions::Other {
+                        expression_type: "rt".into(),
+                        attributes: vec![],
+                    }
+                    .into(),
+                ]),
             ],
         }),
         NLM_F_CREATE,

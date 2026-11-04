@@ -380,9 +380,11 @@ fn legitimate_replacement_survives_unrelated_attempts_and_old_proof_replays() {
         2,
         "verified replacement must release the old firewall tuple"
     );
-    assert!(resets
-        .iter()
-        .all(|f| parsed(f).meta.dst == parsed(&original.syn).meta.src));
+    assert!(
+        resets
+            .iter()
+            .all(|f| parsed(f).meta.dst == parsed(&original.syn).meta.src)
+    );
     let finished = promoted.pop().unwrap();
     replacement.on_outer(now, &finished, &mut wire);
     wire.take();
@@ -429,18 +431,20 @@ fn unauthenticated_candidates_cannot_replace_or_keep_an_active_peer_alive() {
     }
     let mut invalid = parsed(&proof).payload.to_vec();
     invalid[180] ^= 1;
-    assert!(pair
-        .exit
-        .on_outer(now, &frame(parsed(&proof).meta, &invalid), &mut wire)
-        .is_none());
-    assert!(pair
-        .exit
-        .on_outer(
-            now,
-            &frame(parsed(&exchange.hello).meta, &[0x45; 20]),
-            &mut wire
-        )
-        .is_none());
+    assert!(
+        pair.exit
+            .on_outer(now, &frame(parsed(&proof).meta, &invalid), &mut wire)
+            .is_none()
+    );
+    assert!(
+        pair.exit
+            .on_outer(
+                now,
+                &frame(parsed(&exchange.hello).meta, &[0x45; 20]),
+                &mut wire
+            )
+            .is_none()
+    );
     let after = encap(&mut pair.exit, &[0x60; 40], 40).unwrap();
     assert_eq!(parsed(&after).meta.dst, before.dst);
     assert_eq!(parsed(&after).meta.seq, before.seq.wrapping_add(7));
@@ -498,17 +502,19 @@ fn invalid_or_reflected_proofs_cannot_authorize_either_role() {
         malformed.push(body);
     }
     for body in malformed {
-        assert!(pair
-            .exit
-            .on_outer(pair.t, &frame(request.meta, &body), &mut wire)
-            .is_none());
+        assert!(
+            pair.exit
+                .on_outer(pair.t, &frame(request.meta, &body), &mut wire)
+                .is_none()
+        );
         assert!(wire.take().is_empty());
         assert!(encap(&mut pair.exit, &[0x60; 40], 40).is_none());
     }
-    assert!(pair
-        .exit
-        .on_outer(pair.t, &frame(request.meta, &[0x45; 20]), &mut wire)
-        .is_none());
+    assert!(
+        pair.exit
+            .on_outer(pair.t, &frame(request.meta, &[0x45; 20]), &mut wire)
+            .is_none()
+    );
     wire.take();
     pair.exit.on_outer(pair.t, &proof, &mut wire);
     let finished = wire.take().remove(0);
@@ -547,10 +553,11 @@ fn mismatched_keys_deny_forwarding_in_both_directions() {
     assert_eq!(pair.entry.state(), State::Closed);
     wire.take();
     pair.entry.on_tick(pair.entry.next_deadline(), &mut wire);
-    assert!(wire
-        .take()
-        .iter()
-        .any(|f| parsed(f).meta.flags == flags::SYN));
+    assert!(
+        wire.take()
+            .iter()
+            .any(|f| parsed(f).meta.flags == flags::SYN)
+    );
 }
 
 #[test]
@@ -672,10 +679,11 @@ fn ping_is_answered_with_pong_echoing_nonce() {
     let pong_payload = parsed(&pong[0]).payload;
     assert_eq!(pong_payload[0], CTRL_PONG);
     assert_eq!(pong_payload[1..], payload[1..]);
-    assert!(p
-        .entry
-        .on_outer(p.t, &pong[0], &mut Wire::default())
-        .is_none());
+    assert!(
+        p.entry
+            .on_outer(p.t, &pong[0], &mut Wire::default())
+            .is_none()
+    );
 }
 
 #[test]
@@ -1077,9 +1085,11 @@ fn reload_updates_timers_in_place_and_rotates_session_on_key_change() {
     ));
     assert!(!p.exit.is_established());
     let exit_rst = w.take();
-    assert!(exit_rst
-        .iter()
-        .all(|f| parsed(f).meta.flags & flags::RST != 0));
+    assert!(
+        exit_rst
+            .iter()
+            .all(|f| parsed(f).meta.flags & flags::RST != 0)
+    );
     for f in &exit_rst {
         p.entry.on_outer(p.t, f, &mut w);
     }

@@ -84,10 +84,10 @@ impl Guard {
 
 impl Drop for Guard {
     fn drop(&mut self) {
-        if self.armed {
-            if let Err(e) = delete_table(&self.table) {
-                log::error!("removing nftables table {}: {e}", self.table);
-            }
+        if self.armed
+            && let Err(e) = delete_table(&self.table)
+        {
+            log::error!("removing nftables table {}: {e}", self.table);
         }
     }
 }

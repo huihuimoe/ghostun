@@ -4,7 +4,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use zerocopy::FromBytes;
 
-use crate::net::{self, ipv4, ipv6, tcp, OuterFamily};
+use crate::net::{self, OuterFamily, ipv4, ipv6, tcp};
 
 pub const MAX_OVERHEAD: usize = ipv6::HDR_LEN + tcp::HDR_LEN;
 

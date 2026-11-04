@@ -6,9 +6,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use super::auth::{Handshake, Params};
-use super::{can_io, Connection, BATCH, ROUNDS};
+use super::{BATCH, Connection, ROUNDS, can_io};
 use crate::config::{Config, Mode};
-use crate::sys::{self, poll, poll_ms, pollfd, READ_READY};
+use crate::sys::{self, READ_READY, poll, poll_ms, pollfd};
 use crate::transport::control::{self, Backoff};
 
 pub struct Worker {
@@ -68,7 +68,7 @@ impl Worker {
             if ctrl.is_stopped() {
                 break;
             }
-            if let Some((gen, reload)) = ctrl.take_reload(generation) {
+            if let Some((new_gen, reload)) = ctrl.take_reload(generation) {
                 wait &= !connection.as_ref().is_some_and(|c| c.auth.is_none());
                 if cpu != reload.cpu {
                     cpu = reload.cpu;
@@ -81,7 +81,7 @@ impl Worker {
                     retry_at = Instant::now();
                 }
                 self.cfg.tunables = reload.tunables;
-                generation = gen;
+                generation = new_gen;
                 if self.cfg.mode == Mode::Exit && connection.is_none() {
                     break;
                 }

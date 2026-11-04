@@ -6,7 +6,7 @@ use std::io;
 use std::mem;
 use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 
-use super::queue::{Pending, BYTE_LIMIT};
+use super::queue::{BYTE_LIMIT, Pending};
 use crate::sys;
 use crate::sys::uring::{self, Cqe, Ring, Sqe};
 

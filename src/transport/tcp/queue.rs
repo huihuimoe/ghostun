@@ -47,10 +47,11 @@ impl SendQueue {
 
     #[inline]
     fn tail(&mut self, space: usize) -> &mut SendBlock {
-        if let Some(block) = self.blocks.back_mut() {
-            if block.head == block.tail && block.bytes.len() < space {
-                block.bytes.resize(space, 0);
-            }
+        if let Some(block) = self.blocks.back_mut()
+            && block.head == block.tail
+            && block.bytes.len() < space
+        {
+            block.bytes.resize(space, 0);
         }
         if self
             .blocks

@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use crate::config::{Config, Mode};
 use crate::netfilter;
 use crate::sys::{self, route};
-use crate::transport::{self, budget, EntryRoute, Outer};
+use crate::transport::{self, EntryRoute, Outer, budget};
 
 static STOP: AtomicBool = AtomicBool::new(false);
 static RELOAD: AtomicBool = AtomicBool::new(false);
@@ -52,10 +52,9 @@ fn resolve_outer(cfg: &Config) -> Result<Outer, String> {
                 .iface
                 .clone()
                 .or_else(|| route::default_route_dev(family).ok())
+                && !devs.contains(&dev)
             {
-                if !devs.contains(&dev) {
-                    devs.push(dev);
-                }
+                devs.push(dev);
             }
         }
     }
