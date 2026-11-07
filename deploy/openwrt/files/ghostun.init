@@ -1,0 +1,316 @@
+#!/bin/sh /etc/rc.common
+# Copyright (C) 2025 huihuimoe
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+START=95
+STOP=10
+USE_PROCD=1
+
+PROG=/usr/bin/ghostun
+RUN_DIR=/var/etc/ghostun
+
+log_err() {
+	logger -t "ghostun[$1]" -p daemon.err "$2"
+}
+
+toml_escape() {
+	printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+is_uint() {
+	case "$1" in
+		''|*[!0-9]*) return 1 ;;
+		*) return 0 ;;
+	esac
+}
+
+resolve_iface() {
+	local raw="$1"
+	local dev=""
+
+	[ -z "$raw" ] && return 0
+
+	if [ -d "/sys/class/net/$raw" ]; then
+		printf '%s' "$raw"
+		return 0
+	fi
+
+	if [ -f /lib/functions/network.sh ]; then
+		. /lib/functions/network.sh
+		network_get_device dev "$raw" 2>/dev/null
+		if [ -n "$dev" ]; then
+			printf '%s' "$dev"
+			return 0
+		fi
+	fi
+
+	printf '%s' "$raw"
+}
+
+append_inline_remote() {
+	local val="$1"
+	local addr conns
+
+	[ -z "$val" ] && return 0
+
+	case "$val" in
+		*,*)
+			addr="${val%,*}"
+			conns="${val##*,}"
+			;;
+		*)
+			addr="$val"
+			conns=""
+			;;
+	esac
+
+	[ -z "$addr" ] && return 0
+
+	if [ -n "$conns" ] && ! is_uint "$conns"; then
+		log_err "$CURR_INSTANCE" "invalid remote conns '$conns' in '$val'"
+		REMOTE_ERR=1
+		return 1
+	fi
+
+	printf '\n[[entry.remote]]\n' >> "$CURR_TMP_CONF"
+	printf 'address = "%s"\n' "$(toml_escape "$addr")" >> "$CURR_TMP_CONF"
+	if [ -n "$conns" ]; then
+		printf 'conns = %s\n' "$conns" >> "$CURR_TMP_CONF"
+	fi
+
+	REMOTE_COUNT=$((REMOTE_COUNT + 1))
+	TOPOLOGY_REMOTES="${TOPOLOGY_REMOTES}${addr},${conns:-default};"
+}
+
+collect_remote_section() {
+	local cfg="$1"
+	local inst enabled addr conns
+
+	config_get inst "$cfg" instance
+	[ "$inst" = "$CURR_INSTANCE" ] || return 0
+
+	config_get_bool enabled "$cfg" enabled 1
+	[ "$enabled" -eq 0 ] && return 0
+
+	config_get addr "$cfg" address
+	config_get conns "$cfg" conns
+
+	if [ -z "$addr" ]; then
+		log_err "$CURR_INSTANCE" "remote section '$cfg' is missing option address"
+		REMOTE_ERR=1
+		return 1
+	fi
+
+	if [ -n "$conns" ] && ! is_uint "$conns"; then
+		log_err "$CURR_INSTANCE" "remote section '$cfg' has invalid conns '$conns'"
+		REMOTE_ERR=1
+		return 1
+	fi
+
+	printf '\n[[entry.remote]]\n' >> "$CURR_TMP_CONF"
+	printf 'address = "%s"\n' "$(toml_escape "$addr")" >> "$CURR_TMP_CONF"
+	if [ -n "$conns" ]; then
+		printf 'conns = %s\n' "$conns" >> "$CURR_TMP_CONF"
+	fi
+
+	REMOTE_COUNT=$((REMOTE_COUNT + 1))
+	TOPOLOGY_REMOTES="${TOPOLOGY_REMOTES}${addr},${conns:-default};"
+}
+
+start_instance() {
+	local cfg="$1"
+	local enabled config_file log_level
+	local mode auth_key transport tcp_notsent tun_name
+	local no_ipv6 tun_mtu ping_interval dead_timeout no_netfilter
+	local outer_family base_port listen no_masq
+	local tun_ipv4 tun_ipv6 outer_mtu iface resolved_iface cpus
+	local conf_file tmp_conf topology_spec
+
+	config_get_bool enabled "$cfg" enabled 0
+	[ "$enabled" -eq 0 ] && return 0
+
+	config_get log_level "$cfg" log_level "info"
+	config_get config_file "$cfg" config_file
+
+	if [ -n "$config_file" ]; then
+		if [ ! -f "$config_file" ]; then
+			log_err "$cfg" "custom config_file '$config_file' does not exist"
+			return 1
+		fi
+		procd_open_instance "$cfg"
+		procd_set_param command "$PROG" --config "$config_file"
+		procd_set_param env RUST_LOG="$log_level"
+		procd_set_param file "$config_file"
+		procd_set_param reload_signal HUP
+		procd_set_param respawn "${respawn_threshold:-3600}" "${respawn_timeout:-5}" "${respawn_retry:-5}"
+		procd_set_param stdout 1
+		procd_set_param stderr 1
+		procd_close_instance
+		return 0
+	fi
+
+	config_get mode "$cfg" mode
+	config_get auth_key "$cfg" auth_key
+	config_get transport "$cfg" transport
+	config_get tcp_notsent "$cfg" tcp_notsent
+	config_get tun_name "$cfg" tun_name
+	config_get_bool no_ipv6 "$cfg" no_ipv6 0
+	config_get tun_mtu "$cfg" tun_mtu
+	config_get ping_interval "$cfg" ping_interval
+	config_get dead_timeout "$cfg" dead_timeout
+	config_get_bool no_netfilter "$cfg" no_netfilter 0
+
+	config_get outer_family "$cfg" outer_family
+	config_get base_port "$cfg" base_port
+	config_get listen "$cfg" listen
+	config_get_bool no_masq "$cfg" no_masq 0
+	config_get tun_ipv4 "$cfg" tun_ipv4
+	config_get tun_ipv6 "$cfg" tun_ipv6
+	config_get outer_mtu "$cfg" outer_mtu
+	config_get iface "$cfg" iface
+	config_get cpus "$cfg" cpus
+
+	case "$mode" in
+		entry|exit) ;;
+		*)
+			log_err "$cfg" "option mode must be 'entry' or 'exit' (got '$mode')"
+			return 1
+			;;
+	esac
+
+	if [ -z "$auth_key" ]; then
+		log_err "$cfg" "option auth_key is required"
+		return 1
+	fi
+
+	for num_opt in \
+		"tcp_notsent:$tcp_notsent" \
+		"tun_mtu:$tun_mtu" \
+		"ping_interval:$ping_interval" \
+		"dead_timeout:$dead_timeout" \
+		"base_port:$base_port" \
+		"outer_mtu:$outer_mtu"
+	do
+		local opt_name="${num_opt%%:*}"
+		local opt_val="${num_opt#*:}"
+		if [ -n "$opt_val" ] && ! is_uint "$opt_val"; then
+			log_err "$cfg" "option $opt_name must be an unsigned integer (got '$opt_val')"
+			return 1
+		fi
+	done
+
+	resolved_iface="$(resolve_iface "$iface")"
+
+	mkdir -p "$RUN_DIR"
+	chmod 0700 "$RUN_DIR"
+	conf_file="$RUN_DIR/$cfg.toml"
+	tmp_conf="$RUN_DIR/.$cfg.toml.tmp.$$"
+
+	umask 077
+	: > "$tmp_conf"
+
+	{
+		printf '# Auto-generated by /etc/init.d/ghostun for instance %s\n' "$cfg"
+		printf '[global]\n'
+		printf 'mode = "%s"\n' "$(toml_escape "$mode")"
+		printf 'auth_key = "%s"\n' "$(toml_escape "$auth_key")"
+		[ -n "$transport" ] && printf 'transport = "%s"\n' "$(toml_escape "$transport")"
+		[ -n "$tcp_notsent" ] && printf 'tcp_notsent = %s\n' "$tcp_notsent"
+		[ -n "$tun_name" ] && printf 'tun_name = "%s"\n' "$(toml_escape "$tun_name")"
+		[ "$no_ipv6" -eq 1 ] && printf 'no_ipv6 = true\n' || printf 'no_ipv6 = false\n'
+		[ -n "$tun_mtu" ] && printf 'tun_mtu = %s\n' "$tun_mtu"
+		[ -n "$ping_interval" ] && printf 'ping_interval = %s\n' "$ping_interval"
+		[ -n "$dead_timeout" ] && printf 'dead_timeout = %s\n' "$dead_timeout"
+		[ "$no_netfilter" -eq 1 ] && printf 'no_netfilter = true\n' || printf 'no_netfilter = false\n'
+		printf '\n'
+	} >> "$tmp_conf"
+
+	TOPOLOGY_REMOTES=""
+
+	if [ "$mode" = "entry" ]; then
+		{
+			printf '[entry]\n'
+			[ -n "$outer_family" ] && printf 'outer_family = "%s"\n' "$(toml_escape "$outer_family")"
+			[ -n "$base_port" ] && printf 'base_port = %s\n' "$base_port"
+			[ -n "$tun_ipv4" ] && printf 'tun_ipv4 = "%s"\n' "$(toml_escape "$tun_ipv4")"
+			[ -n "$tun_ipv6" ] && printf 'tun_ipv6 = "%s"\n' "$(toml_escape "$tun_ipv6")"
+			[ -n "$outer_mtu" ] && printf 'outer_mtu = %s\n' "$outer_mtu"
+			[ -n "$resolved_iface" ] && printf 'iface = "%s"\n' "$(toml_escape "$resolved_iface")"
+			[ -n "$cpus" ] && printf 'cpus = "%s"\n' "$(toml_escape "$cpus")"
+		} >> "$tmp_conf"
+
+		CURR_INSTANCE="$cfg"
+		CURR_TMP_CONF="$tmp_conf"
+		REMOTE_COUNT=0
+		REMOTE_ERR=0
+
+		config_list_foreach "$cfg" remote append_inline_remote
+		config_foreach collect_remote_section remote
+
+		if [ "$REMOTE_ERR" -ne 0 ]; then
+			rm -f "$tmp_conf"
+			return 1
+		fi
+
+		if [ "$REMOTE_COUNT" -eq 0 ]; then
+			log_err "$cfg" "entry mode requires at least one remote (via 'list remote' or 'config remote')"
+			rm -f "$tmp_conf"
+			return 1
+		fi
+	else
+		if [ -z "$listen" ]; then
+			log_err "$cfg" "exit mode requires option listen"
+			rm -f "$tmp_conf"
+			return 1
+		fi
+
+		{
+			printf '[exit]\n'
+			if is_uint "$listen"; then
+				printf 'listen = %s\n' "$listen"
+			else
+				printf 'listen = "%s"\n' "$(toml_escape "$listen")"
+			fi
+			[ -n "$outer_family" ] && printf 'outer_family = "%s"\n' "$(toml_escape "$outer_family")"
+			[ "$no_masq" -eq 1 ] && printf 'no_masq = true\n' || printf 'no_masq = false\n'
+			[ -n "$tun_ipv4" ] && printf 'tun_ipv4 = "%s"\n' "$(toml_escape "$tun_ipv4")"
+			[ -n "$tun_ipv6" ] && printf 'tun_ipv6 = "%s"\n' "$(toml_escape "$tun_ipv6")"
+			[ -n "$outer_mtu" ] && printf 'outer_mtu = %s\n' "$outer_mtu"
+			[ -n "$resolved_iface" ] && printf 'iface = "%s"\n' "$(toml_escape "$resolved_iface")"
+			[ -n "$cpus" ] && printf 'cpus = "%s"\n' "$(toml_escape "$cpus")"
+		} >> "$tmp_conf"
+	fi
+
+	mv -f "$tmp_conf" "$conf_file"
+	chmod 0600 "$conf_file"
+
+	# Track non-SIGHUP-reloadable fields in procd instance data so procd restarts
+	# the daemon when topology changes, while sending SIGHUP when only auth_key,
+	# cpus, ping_interval, or dead_timeout change.
+	topology_spec="mode=${mode};transport=${transport};tcp_notsent=${tcp_notsent};tun_name=${tun_name};no_ipv6=${no_ipv6};tun_mtu=${tun_mtu};no_netfilter=${no_netfilter};outer_family=${outer_family};base_port=${base_port};listen=${listen};no_masq=${no_masq};tun_ipv4=${tun_ipv4};tun_ipv6=${tun_ipv6};outer_mtu=${outer_mtu};iface=${resolved_iface};remotes=${TOPOLOGY_REMOTES}"
+
+	procd_open_instance "$cfg"
+	procd_set_param command "$PROG" --config "$conf_file"
+	procd_set_param env RUST_LOG="$log_level"
+	procd_set_param file "$conf_file"
+	procd_set_param data topology="$topology_spec"
+	procd_set_param reload_signal HUP
+	procd_set_param respawn "${respawn_threshold:-3600}" "${respawn_timeout:-5}" "${respawn_retry:-5}"
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	[ -n "$resolved_iface" ] && procd_set_param netdev "$resolved_iface"
+	procd_close_instance
+}
+
+start_service() {
+	config_load ghostun
+	config_foreach start_instance instance
+}
+
+reload_service() {
+	start
+}
+
+service_triggers() {
+	procd_add_reload_trigger "ghostun" "network"
+}

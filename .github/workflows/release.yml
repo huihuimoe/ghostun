@@ -44,11 +44,12 @@ jobs:
               exit 1
             fi
             sed -i "0,/^version = \".*\"/s//version = \"${ver}\"/" Cargo.toml
+            sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=${ver}/" deploy/openwrt/Makefile
             cargo update --workspace
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            if ! git diff --quiet Cargo.toml Cargo.lock; then
-              git add Cargo.toml Cargo.lock
+            if ! git diff --quiet Cargo.toml Cargo.lock deploy/openwrt/Makefile; then
+              git add Cargo.toml Cargo.lock deploy/openwrt/Makefile
               git commit -m "chore(release): ${tag}"
               git push origin "HEAD:${GITHUB_REF_NAME}"
             fi
@@ -84,6 +85,23 @@ jobs:
           mkdir -p dist
           install -m 0755 target/x86_64-unknown-linux-musl/release/ghostun dist/ghostun-linux-amd64
           install -m 0755 target/aarch64-unknown-linux-musl/release/ghostun dist/ghostun-linux-arm64
+      - name: Build OpenWrt 25.10+ APK packages
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          ver="${TAG#v}"
+          uid="$(id -u)"
+          gid="$(id -g)"
+          docker run --rm --ulimit nofile=1024:65536 \
+            -v "$PWD":/work -w /work \
+            alpine:3.23 sh -euc "
+              apk --version
+              ./deploy/openwrt/build-apk.sh dist/ghostun-linux-amd64 '${ver}' x86_64 dist
+              for arch in aarch64_generic aarch64_cortex-a53 aarch64_cortex-a72; do
+                ./deploy/openwrt/build-apk.sh dist/ghostun-linux-arm64 '${ver}' \"\${arch}\" dist
+              done
+              chown ${uid}:${gid} dist/*.apk
+            "
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
@@ -92,6 +110,7 @@ jobs:
           files: |
             dist/ghostun-linux-amd64
             dist/ghostun-linux-arm64
+            dist/*.apk
 
   build-image:
     needs: prepare
