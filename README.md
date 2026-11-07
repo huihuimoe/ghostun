@@ -161,6 +161,22 @@ systemctl enable --now ghostun-entry
 
 Use `exit.toml` and `deploy/ghostun-exit.service` on the Exit host.
 
+### OpenWrt (25.10+)
+
+Install the matching `.apk` package (`x86_64`, `aarch64_generic`, `aarch64_cortex-a53`, or `aarch64_cortex-a72`) from [GitHub Releases](https://github.com/huihuimoe/ghostun/releases), or build from source with [`deploy/openwrt/Makefile`](deploy/openwrt/Makefile):
+
+```sh
+apk add --allow-untrusted ./ghostun_*_$(cat /etc/apk/arch).apk
+uci set ghostun.entry0.enabled='1'
+uci set ghostun.entry0.auth_key="$(ghostun genkey)"
+uci set ghostun.@remote[0].address='198.51.100.1:9000'
+uci commit ghostun
+/etc/init.d/ghostun enable
+/etc/init.d/ghostun start
+```
+
+See [`deploy/openwrt/files/ghostun.config`](deploy/openwrt/files/ghostun.config) for all UCI options. `/etc/init.d/ghostun reload` sends `SIGHUP` when only reloadable settings (`auth_key`, `cpus`, `ping_interval`, `dead_timeout`) change and automatically restarts the instance when topology changes.
+
 ### Podman Quadlet
 
 Quadlet units in [`deploy/`](deploy/):

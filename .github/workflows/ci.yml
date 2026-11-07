@@ -31,6 +31,8 @@ jobs:
       - name: Check test scripts, formatting, lints, and unit tests
         run: |
           bash -n tests/e2e/*.sh
+          sh -n deploy/openwrt/files/ghostun.init
+          sh -n deploy/openwrt/build-apk.sh
           python3 -c 'import ast, pathlib; [ast.parse(p.read_text()) for p in pathlib.Path("tests/e2e").glob("*.py")]'
           cargo fmt --check
           cargo clippy --locked --all-targets -- -D warnings
