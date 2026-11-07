@@ -125,7 +125,7 @@ $FAKEROOT_CMD apk mkpkg \
 	--info "license:AGPL-3.0-or-later" \
 	--info "origin:feeds/base/net/ghostun" \
 	--info "url:https://github.com/huihuimoe/ghostun" \
-	--info "depends:libc kmod-tun kmod-nft-core kmod-nft-raw kmod-nft-nat" \
+	--info "depends:libc kmod-tun kmod-nft-core kmod-nft-nat" \
 	--script "post-install:$ADIR/post-install" \
 	--script "post-upgrade:$ADIR/post-upgrade" \
 	--script "pre-deinstall:$ADIR/pre-deinstall" \

@@ -60,26 +60,25 @@ append_inline_remote() {
 			;;
 		*)
 			addr="$val"
-			conns=""
+			conns="1"
 			;;
 	esac
 
 	[ -z "$addr" ] && return 0
+	conns="${conns:-1}"
 
-	if [ -n "$conns" ] && ! is_uint "$conns"; then
-		log_err "$CURR_INSTANCE" "invalid remote conns '$conns' in '$val'"
+	if ! is_uint "$conns" || [ "$conns" -lt 1 ]; then
+		log_err "$CURR_INSTANCE" "invalid remote conns '$conns' in '$val' (must be >= 1)"
 		REMOTE_ERR=1
 		return 1
 	fi
 
 	printf '\n[[entry.remote]]\n' >> "$CURR_TMP_CONF"
 	printf 'address = "%s"\n' "$(toml_escape "$addr")" >> "$CURR_TMP_CONF"
-	if [ -n "$conns" ]; then
-		printf 'conns = %s\n' "$conns" >> "$CURR_TMP_CONF"
-	fi
+	printf 'conns = %s\n' "$conns" >> "$CURR_TMP_CONF"
 
 	REMOTE_COUNT=$((REMOTE_COUNT + 1))
-	TOPOLOGY_REMOTES="${TOPOLOGY_REMOTES}${addr},${conns:-default};"
+	TOPOLOGY_REMOTES="${TOPOLOGY_REMOTES}${addr},${conns};"
 }
 
 collect_remote_section() {
@@ -93,7 +92,8 @@ collect_remote_section() {
 	[ "$enabled" -eq 0 ] && return 0
 
 	config_get addr "$cfg" address
-	config_get conns "$cfg" conns
+	config_get conns "$cfg" conns "1"
+	conns="${conns:-1}"
 
 	if [ -z "$addr" ]; then
 		log_err "$CURR_INSTANCE" "remote section '$cfg' is missing option address"
@@ -101,20 +101,18 @@ collect_remote_section() {
 		return 1
 	fi
 
-	if [ -n "$conns" ] && ! is_uint "$conns"; then
-		log_err "$CURR_INSTANCE" "remote section '$cfg' has invalid conns '$conns'"
+	if ! is_uint "$conns" || [ "$conns" -lt 1 ]; then
+		log_err "$CURR_INSTANCE" "remote section '$cfg' has invalid conns '$conns' (must be >= 1)"
 		REMOTE_ERR=1
 		return 1
 	fi
 
 	printf '\n[[entry.remote]]\n' >> "$CURR_TMP_CONF"
 	printf 'address = "%s"\n' "$(toml_escape "$addr")" >> "$CURR_TMP_CONF"
-	if [ -n "$conns" ]; then
-		printf 'conns = %s\n' "$conns" >> "$CURR_TMP_CONF"
-	fi
+	printf 'conns = %s\n' "$conns" >> "$CURR_TMP_CONF"
 
 	REMOTE_COUNT=$((REMOTE_COUNT + 1))
-	TOPOLOGY_REMOTES="${TOPOLOGY_REMOTES}${addr},${conns:-default};"
+	TOPOLOGY_REMOTES="${TOPOLOGY_REMOTES}${addr},${conns};"
 }
 
 start_instance() {
@@ -124,7 +122,8 @@ start_instance() {
 	local no_ipv6 tun_mtu ping_interval dead_timeout no_netfilter
 	local outer_family base_port listen no_masq
 	local tun_ipv4 tun_ipv6 outer_mtu iface resolved_iface cpus
-	local conf_file tmp_conf topology_spec
+	local conf_file topo_file tmp_conf topology_spec
+	local conf_changed=0 topo_unchanged=0
 
 	config_get_bool enabled "$cfg" enabled 0
 	[ "$enabled" -eq 0 ] && return 0
@@ -204,6 +203,7 @@ start_instance() {
 	mkdir -p "$RUN_DIR"
 	chmod 0700 "$RUN_DIR"
 	conf_file="$RUN_DIR/$cfg.toml"
+	topo_file="$RUN_DIR/$cfg.topology"
 	tmp_conf="$RUN_DIR/.$cfg.toml.tmp.$$"
 
 	umask 077
@@ -281,20 +281,34 @@ start_instance() {
 		} >> "$tmp_conf"
 	fi
 
+	# Track non-SIGHUP-reloadable fields in $topo_file (watched via procd `file`
+	# without `reload_signal`) so procd restarts the daemon when topology changes,
+	# while reload_service sends SIGHUP when only reloadable fields (auth_key,
+	# cpus, ping_interval, dead_timeout) change in $conf_file.
+	topology_spec="mode=${mode};transport=${transport};tcp_notsent=${tcp_notsent};tun_name=${tun_name};no_ipv6=${no_ipv6};tun_mtu=${tun_mtu};no_netfilter=${no_netfilter};outer_family=${outer_family};base_port=${base_port};listen=${listen};no_masq=${no_masq};tun_ipv4=${tun_ipv4};tun_ipv6=${tun_ipv6};outer_mtu=${outer_mtu};iface=${resolved_iface};remotes=${TOPOLOGY_REMOTES}"
+
+	if [ -f "$conf_file" ] && ! cmp -s "$tmp_conf" "$conf_file"; then
+		conf_changed=1
+	fi
+
+	if [ -f "$topo_file" ] && [ "$(cat "$topo_file" 2>/dev/null)" = "$topology_spec" ]; then
+		topo_unchanged=1
+	fi
+
 	mv -f "$tmp_conf" "$conf_file"
 	chmod 0600 "$conf_file"
 
-	# Track non-SIGHUP-reloadable fields in procd instance data so procd restarts
-	# the daemon when topology changes, while sending SIGHUP when only auth_key,
-	# cpus, ping_interval, or dead_timeout change.
-	topology_spec="mode=${mode};transport=${transport};tcp_notsent=${tcp_notsent};tun_name=${tun_name};no_ipv6=${no_ipv6};tun_mtu=${tun_mtu};no_netfilter=${no_netfilter};outer_family=${outer_family};base_port=${base_port};listen=${listen};no_masq=${no_masq};tun_ipv4=${tun_ipv4};tun_ipv6=${tun_ipv6};outer_mtu=${outer_mtu};iface=${resolved_iface};remotes=${TOPOLOGY_REMOTES}"
+	if [ "$topo_unchanged" -eq 0 ]; then
+		printf '%s\n' "$topology_spec" > "$topo_file"
+		chmod 0600 "$topo_file"
+	elif [ "$conf_changed" -eq 1 ]; then
+		HUP_INSTANCES="${HUP_INSTANCES:+$HUP_INSTANCES }$cfg"
+	fi
 
 	procd_open_instance "$cfg"
 	procd_set_param command "$PROG" --config "$conf_file"
 	procd_set_param env RUST_LOG="$log_level"
-	procd_set_param file "$conf_file"
-	procd_set_param data topology="$topology_spec"
-	procd_set_param reload_signal HUP
+	procd_set_param file "$topo_file"
 	procd_set_param respawn "${respawn_threshold:-3600}" "${respawn_timeout:-5}" "${respawn_retry:-5}"
 	procd_set_param stdout 1
 	procd_set_param stderr 1
@@ -308,7 +322,14 @@ start_service() {
 }
 
 reload_service() {
-	start
+	local inst
+	HUP_INSTANCES=""
+	rc_procd start_service "$@"
+	for inst in $HUP_INSTANCES; do
+		if procd_running ghostun "$inst"; then
+			procd_send_signal ghostun "$inst" HUP
+		fi
+	done
 }
 
 service_triggers() {

@@ -25,7 +25,7 @@ define Package/ghostun
   SUBMENU:=VPN
   TITLE:=L3 tunnel with FakeTCP and relay-compatible TCP transports
   URL:=https://github.com/huihuimoe/ghostun
-  DEPENDS:=$(RUST_ARCH_DEPENDS) +kmod-tun +kmod-nft-core +kmod-nft-raw +kmod-nft-nat
+  DEPENDS:=$(RUST_ARCH_DEPENDS) +kmod-tun +kmod-nft-core +kmod-nft-nat
 endef
 
 define Package/ghostun/description
@@ -39,7 +39,8 @@ define Package/ghostun/conffiles
 endef
 
 define Package/ghostun/install
-	$( call RustBinPackageInstall,$(1) )
+	$(INSTALL_DIR) $(1)/usr/bin
+	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/usr/bin/ghostun $(1)/usr/bin/
 	$(INSTALL_DIR) $(1)/etc/init.d
 	$(INSTALL_BIN) ./files/ghostun.init $(1)/etc/init.d/ghostun
 	$(INSTALL_DIR) $(1)/etc/config

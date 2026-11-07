@@ -19,7 +19,8 @@ test:
   script:
     - rustup component add rustfmt clippy
     - bash -n tests/e2e/netns.sh tests/e2e/ipv6-disabled.sh
-    - sh -n deploy/openwrt/files/ghostun.init deploy/openwrt/build-apk.sh
+    - sh -n deploy/openwrt/files/ghostun.init
+    - sh -n deploy/openwrt/build-apk.sh
     - cargo fmt --check
     - cargo clippy --locked --all-targets -- -D warnings
     - cargo test --locked
