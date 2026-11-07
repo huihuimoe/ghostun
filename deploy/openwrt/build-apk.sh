@@ -91,7 +91,7 @@ cat > "$ADIR/post-upgrade" <<'EOF'
 #!/bin/sh
 [ -n "${IPKG_INSTROOT:-}" ] && exit 0
 if [ -x /etc/init.d/ghostun ] && /etc/init.d/ghostun enabled 2>/dev/null; then
-	/etc/init.d/ghostun reload >/dev/null 2>&1 || true
+	/etc/init.d/ghostun restart >/dev/null 2>&1 || true
 fi
 exit 0
 EOF

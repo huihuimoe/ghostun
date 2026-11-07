@@ -140,7 +140,6 @@ start_instance() {
 		procd_set_param command "$PROG" --config "$config_file"
 		procd_set_param env RUST_LOG="$log_level"
 		procd_set_param file "$config_file"
-		procd_set_param reload_signal HUP
 		procd_set_param respawn "${respawn_threshold:-3600}" "${respawn_timeout:-5}" "${respawn_retry:-5}"
 		procd_set_param stdout 1
 		procd_set_param stderr 1
