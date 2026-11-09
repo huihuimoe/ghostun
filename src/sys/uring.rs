@@ -222,11 +222,15 @@ impl Ring {
         Ok(())
     }
 
-    pub fn submit(&mut self) -> io::Result<()> {
+    pub fn submit(&mut self) -> io::Result<bool> {
+        let offsets = &self.params.sq.fields;
+        let head = self.sq.atomic(offsets[0]).load(Ordering::Acquire);
+        let tail = self.sq.atomic(offsets[1]).load(Ordering::Acquire);
+        if head == tail {
+            return Ok(false);
+        }
         loop {
-            let offsets = &self.params.sq.fields;
             let head = self.sq.atomic(offsets[0]).load(Ordering::Acquire);
-            let tail = self.sq.atomic(offsets[1]).load(Ordering::Acquire);
             // GETEVENTS with min_complete=0 runs pending task work without blocking.
             // SAFETY: this owned ring uses the normal (non-SQPOLL) submission ABI.
             let result = unsafe {
@@ -249,7 +253,7 @@ impl Ring {
             }
             let consumed = self.sq.atomic(offsets[0]).load(Ordering::Acquire);
             if consumed == tail {
-                return Ok(());
+                return Ok(true);
             }
             if result == 0 {
                 return Err(io::ErrorKind::WouldBlock.into());

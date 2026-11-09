@@ -23,6 +23,7 @@ pub struct TunDriver<'a> {
     pending: Pending<()>,
     stride: usize,
     recovered: VecDeque<Vec<u8>>,
+    batch: [(usize, usize); BUFFERS],
 }
 
 struct Fast {
@@ -30,6 +31,7 @@ struct Fast {
     buffers: Box<[UnsafeCell<u8>]>,
     slots: usize,
     ready: VecDeque<(usize, usize)>,
+    recycle: Vec<(usize, usize)>,
     completions: Vec<Cqe>,
     reading: bool,
     writes: usize,
@@ -86,6 +88,7 @@ impl Fast {
             buffers: (0..slots * stride).map(|_| UnsafeCell::new(0)).collect(),
             slots,
             ready: VecDeque::with_capacity(BUFFERS),
+            recycle: Vec::with_capacity(4),
             completions: Vec::with_capacity(512),
             reading: false,
             writes: 0,
@@ -96,6 +99,16 @@ impl Fast {
         fast.provide(0, slots, stride)?;
         fast.ring.submit()?;
         Ok(fast)
+    }
+
+    fn recycle(&mut self, index: usize) {
+        if let Some((start, count)) = self.recycle.last_mut()
+            && *start + *count == index
+        {
+            *count += 1;
+        } else {
+            self.recycle.push((index, 1));
+        }
     }
 
     fn provide(&mut self, index: usize, count: usize, stride: usize) -> io::Result<()> {
@@ -181,28 +194,7 @@ impl Fast {
         incompatible.map_or(Ok(()), Err)
     }
 
-    fn drive(
-        &mut self,
-        fd: RawFd,
-        pending: &mut Pending<()>,
-        stride: usize,
-        attached: bool,
-        read_allowed: bool,
-    ) -> io::Result<()> {
-        self.collect(pending, stride, false)?;
-        if !read_allowed && self.reading && !self.canceling {
-            // SAFETY: cancellation references only the stable READ request tag.
-            unsafe {
-                self.ring.push(Sqe {
-                    opcode: 14,
-                    fd: -1,
-                    addr: READ,
-                    user_data: CANCEL,
-                    ..Sqe::default()
-                })?;
-            }
-            self.canceling = true;
-        }
+    fn arm_read(&mut self, fd: RawFd, attached: bool, read_allowed: bool) -> io::Result<bool> {
         if attached
             && read_allowed
             && !self.reading
@@ -222,6 +214,37 @@ impl Fast {
                 })?;
             }
             self.reading = true;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn drive(
+        &mut self,
+        fd: RawFd,
+        pending: &mut Pending<()>,
+        stride: usize,
+        attached: bool,
+        read_allowed: bool,
+    ) -> io::Result<()> {
+        self.collect(pending, stride, false)?;
+        for index in 0..self.recycle.len() {
+            let (start, count) = self.recycle[index];
+            self.provide(start, count, stride)?;
+        }
+        self.recycle.clear();
+        if !read_allowed && self.reading && !self.canceling {
+            // SAFETY: cancellation references only the stable READ request tag.
+            unsafe {
+                self.ring.push(Sqe {
+                    opcode: 14,
+                    fd: -1,
+                    addr: READ,
+                    user_data: CANCEL,
+                    ..Sqe::default()
+                })?;
+            }
+            self.canceling = true;
         }
         if attached && !self.blocked && self.writes == 0 && !pending.packets.is_empty() {
             self.writes = pending.packets.len().min(BUFFERS);
@@ -247,7 +270,13 @@ impl Fast {
                 }
             }
         }
-        self.ring.submit()
+        while {
+            self.arm_read(fd, attached, read_allowed)?;
+            self.ring.submit()?
+        } {
+            self.collect(pending, stride, false)?;
+        }
+        Ok(())
     }
 
     fn stop(&mut self, pending: &mut Pending<()>, stride: usize) {
@@ -301,6 +330,7 @@ impl<'a> TunDriver<'a> {
             pending: Pending::default(),
             stride,
             recovered: VecDeque::new(),
+            batch: [(0, 0); BUFFERS],
         }
     }
 
@@ -379,7 +409,7 @@ impl<'a> TunDriver<'a> {
             return Ok(None);
         };
         let result = if len <= output.len() {
-            // SAFETY: this CQE-owned slot is not returned to the kernel until provide below.
+            // SAFETY: this CQE-owned slot is not returned to the kernel until drive flushes recycle.
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     fast.buffers.as_ptr().add(index * self.stride).cast::<u8>(),
@@ -394,8 +424,61 @@ impl<'a> TunDriver<'a> {
                 "oversized TUN packet",
             ))
         };
-        fast.provide(index, 1, self.stride)?;
+        fast.recycle(index);
         result
+    }
+
+    pub fn read_batch<'b>(
+        &'b mut self,
+        scratch: &'b mut [u8],
+        scratch_stride: usize,
+        established: bool,
+        pending: &Pending<()>,
+    ) -> (
+        usize,
+        impl ExactSizeIterator<Item = &'b [u8]> + Clone + use<'b>,
+    ) {
+        let (reserved_bytes, reserved_slots) = self.read_budget();
+        let fast_mode = self.recovered.is_empty() && self.fast.is_some();
+        let mut reads = 0;
+        let mut count = 0;
+        let mut bytes = 0;
+        while reads < BUFFERS
+            && pending.room_for(
+                bytes + scratch_stride + reserved_bytes,
+                count + 1 + reserved_slots,
+            )
+        {
+            let next = if fast_mode {
+                let fast = self.fast.as_mut().unwrap();
+                fast.ready
+                    .pop_front()
+                    .inspect(|&(index, _)| fast.recycle(index))
+            } else {
+                let slot = &mut scratch[count * scratch_stride..(count + 1) * scratch_stride];
+                self.read(slot).ok().flatten().map(|len| (count, len))
+            };
+            let Some((index, len)) = next else {
+                break;
+            };
+            reads += 1;
+            if established {
+                self.batch[count] = (index, len);
+                bytes += len;
+                count += 1;
+            }
+        }
+        let (base, slot_stride) = match &self.fast {
+            Some(fast) if fast_mode => (fast.buffers.as_ptr().cast::<u8>(), self.stride),
+            _ => (scratch.as_ptr(), scratch_stride),
+        };
+        let frames = self.batch[..count].iter().map(move |&(index, len)| {
+            // SAFETY: `index * slot_stride + len` lies within `fast.buffers` (in the fast path,
+            // where recycled slots are not returned to the kernel until `Fast::drive`) or within
+            // `scratch` (in the poll/recovery path), and `&'b mut self` / `scratch` stay borrowed.
+            unsafe { std::slice::from_raw_parts(base.add(index * slot_stride), len) }
+        });
+        (reads, frames)
     }
 
     pub fn write(&mut self, packet: &[u8]) -> bool {

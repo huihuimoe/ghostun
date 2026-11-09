@@ -683,6 +683,9 @@ impl Worker {
                 if !raw_ready && !tun_ready {
                     break;
                 }
+                let read_allowed = out.room(&driver, stride, 1);
+                driver.service(attached, read_allowed);
+                tun_ready = (tun_ready || driver.has_reads()) && read_allowed;
             }
             busy = raw_ready || tun_ready;
             if now >= session.next_deadline() {

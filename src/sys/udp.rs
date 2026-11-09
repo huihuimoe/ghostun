@@ -400,7 +400,6 @@ pub struct Receiver {
     pub lens: [usize; BATCH],
     _iovs: Box<[libc::iovec]>,
     hdrs: Box<[libc::mmsghdr]>,
-    used: usize,
 }
 
 impl Receiver {
@@ -411,7 +410,6 @@ impl Receiver {
             lens: [0; BATCH],
             _iovs: (0..BATCH).map(|_| unsafe { zeroed() }).collect(),
             hdrs: (0..BATCH).map(|_| unsafe { zeroed() }).collect(),
-            used: BATCH,
         };
         for k in 0..BATCH {
             rx._iovs[k] = libc::iovec {
@@ -433,16 +431,8 @@ impl Receiver {
         &mut self.bufs
     }
 
-    fn reset(&mut self) {
-        for hdr in &mut self.hdrs[..self.used] {
-            hdr.msg_len = 0;
-            hdr.msg_hdr.msg_flags = 0;
-        }
-    }
-
     /// Truncated frames have length zero.
     pub fn receive(&mut self, fd: BorrowedFd<'_>) -> io::Result<usize> {
-        self.reset();
         // SAFETY: boxed buffers and descriptors remain live and fixed.
         let m = unsafe {
             libc::recvmmsg(
@@ -453,12 +443,11 @@ impl Receiver {
                 std::ptr::null_mut(),
             )
         };
-        self.used = 0;
         if m < 0 {
             return Err(io::Error::last_os_error());
         }
-        self.used = m as usize;
-        for k in 0..self.used {
+        let used = m as usize;
+        for k in 0..used {
             let hdr = &self.hdrs[k];
             self.lens[k] = if hdr.msg_hdr.msg_flags & libc::MSG_TRUNC != 0 {
                 0
@@ -466,7 +455,7 @@ impl Receiver {
                 hdr.msg_len as usize
             };
         }
-        Ok(self.used)
+        Ok(used)
     }
 }
 

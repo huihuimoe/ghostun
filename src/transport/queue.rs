@@ -13,6 +13,7 @@ pub struct Packet<T> {
 
 pub struct Pending<T> {
     pub packets: VecDeque<Packet<T>>,
+    free: Vec<Vec<u8>>,
     bytes: usize,
     data: usize,
     controls: usize,
@@ -22,6 +23,7 @@ impl<T> Default for Pending<T> {
     fn default() -> Self {
         Self {
             packets: VecDeque::new(),
+            free: Vec::new(),
             bytes: 0,
             data: 0,
             controls: 0,
@@ -52,8 +54,10 @@ impl<T> Pending<T> {
             self.bytes += bytes.len();
             self.data += 1;
         }
+        let mut buf = self.free.pop().unwrap_or_default();
+        buf.extend_from_slice(bytes);
         self.packets.push_back(Packet {
-            bytes: bytes.to_vec(),
+            bytes: buf,
             metadata,
             control,
         });
@@ -61,7 +65,10 @@ impl<T> Pending<T> {
     }
 
     pub fn pop(&mut self) {
-        drop(self.take_front());
+        if let Some(mut packet) = self.take_front() {
+            packet.bytes.clear();
+            self.free.push(packet.bytes);
+        }
     }
 
     pub fn take_front(&mut self) -> Option<Packet<T>> {
@@ -79,10 +86,9 @@ impl<T> Pending<T> {
     }
 
     pub fn clear(&mut self) {
-        self.packets.clear();
-        self.bytes = 0;
-        self.data = 0;
-        self.controls = 0;
+        while !self.packets.is_empty() {
+            self.pop();
+        }
     }
 }
 

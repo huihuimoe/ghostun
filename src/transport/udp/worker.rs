@@ -636,30 +636,18 @@ impl Worker {
                     break;
                 }
                 if tun_ready && out.room(&driver, stride, 1) {
-                    let mut reads = 0;
-                    let mut count = 0;
-                    let mut bytes = 0;
-                    while reads < udp::BATCH && out.room(&driver, bytes + stride, count + 1) {
-                        let slot = &mut rx.buffers_mut()[count * stride..(count + 1) * stride];
-                        let Ok(Some(n)) = driver.read(slot) else {
-                            break;
-                        };
-                        reads += 1;
-                        if session.is_established() {
-                            rx.lens[count] = n;
-                            bytes += n;
-                            count += 1;
-                        }
-                    }
-                    if count > 0 {
-                        out.data(
-                            &mut sender,
-                            rx.lens[..count]
-                                .iter()
-                                .enumerate()
-                                .map(|(k, &n)| &rx.buffers()[k * stride..k * stride + n]),
+                    let reads = {
+                        let (reads, frames) = driver.read_batch(
+                            rx.buffers_mut(),
+                            stride,
+                            session.is_established(),
+                            &out.pending,
                         );
-                    }
+                        if frames.len() > 0 {
+                            out.data(&mut sender, frames);
+                        }
+                        reads
+                    };
                     tun_ready = reads == udp::BATCH && out.room(&driver, stride, 1);
                 } else {
                     tun_ready = false;
@@ -667,6 +655,9 @@ impl Worker {
                 if !udp_ready && !tun_ready {
                     break;
                 }
+                let read_allowed = out.room(&driver, stride, 1);
+                driver.service(attached, read_allowed);
+                tun_ready = (tun_ready || driver.has_reads()) && read_allowed;
             }
             if handoff.is_some() {
                 break;
