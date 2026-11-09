@@ -22,9 +22,37 @@ pub struct TunDriver<'a> {
     fast: Option<Box<Fast>>,
     pending: Pending<()>,
     stride: usize,
+    headroom: usize,
     recovered: VecDeque<Vec<u8>>,
     batch: [(usize, usize); BUFFERS],
 }
+
+#[derive(Clone)]
+pub struct Batch<'a> {
+    base: *const u8,
+    stride: usize,
+    items: std::slice::Iter<'a, (usize, usize)>,
+}
+
+impl<'a> Iterator for Batch<'a> {
+    type Item = &'a [u8];
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        let &(index, len) = self.items.next()?;
+        // SAFETY: `index * self.stride + len` lies within `fast.buffers` (in the fast path,
+        // where recycled slots are not returned to the kernel until `Fast::drive`) or within
+        // `scratch` (in the poll/recovery path), and both stay borrowed for `'a`.
+        Some(unsafe { std::slice::from_raw_parts(self.base.add(index * self.stride), len) })
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.items.size_hint()
+    }
+}
+
+impl ExactSizeIterator for Batch<'_> {}
 
 struct Fast {
     ring: Ring,
@@ -80,7 +108,7 @@ fn available() -> io::Result<()> {
 }
 
 impl Fast {
-    fn new(stride: usize) -> io::Result<Self> {
+    fn new(stride: usize, headroom: usize) -> io::Result<Self> {
         available()?;
         let slots = BUFFERS.min(BYTE_LIMIT / 2 / stride).max(1);
         let mut fast = Self {
@@ -96,7 +124,7 @@ impl Fast {
             blocked: false,
             canceling: false,
         };
-        fast.provide(0, slots, stride)?;
+        fast.provide(0, slots, stride, headroom)?;
         fast.ring.submit()?;
         Ok(fast)
     }
@@ -111,28 +139,41 @@ impl Fast {
         }
     }
 
-    fn provide(&mut self, index: usize, count: usize, stride: usize) -> io::Result<()> {
-        // SAFETY: the UnsafeCell pool stays allocated until cancellation completes; these slots
-        // are either not registered yet or have been returned by a read CQE.
-        unsafe {
-            self.ring.push(Sqe {
-                opcode: uring::PROVIDE_BUFFERS,
-                fd: count as i32,
-                // UnsafeCell permits kernel writes in other slots without exclusive Rust borrows.
-                addr: self.buffers.as_ptr().wrapping_add(index * stride) as u64,
-                len: stride as u32,
-                off: index as u64,
-                buf_group: GROUP,
-                user_data: PROVIDE,
-                ..Sqe::default()
-            })
+    fn provide(
+        &mut self,
+        index: usize,
+        count: usize,
+        stride: usize,
+        headroom: usize,
+    ) -> io::Result<()> {
+        // When headroom > 0, each slot's kernel buffer is shorter than `stride`, so register
+        // slots individually to prevent `PROVIDE_BUFFERS` from stepping by `stride - headroom`
+        // or overlapping the next slot's headroom.
+        let step = if headroom == 0 { count } else { 1 };
+        for slot in (index..index + count).step_by(step) {
+            // SAFETY: the UnsafeCell pool stays allocated until cancellation completes; each
+            // `[slot * stride + headroom .. (slot + 1) * stride]` range is disjoint from every
+            // other slot and from its own `[slot * stride .. slot * stride + headroom]` prefix.
+            unsafe {
+                self.ring.push(Sqe {
+                    opcode: uring::PROVIDE_BUFFERS,
+                    fd: step as i32,
+                    addr: self.buffers[slot * stride + headroom].get() as u64,
+                    len: (stride - headroom) as u32,
+                    off: slot as u64,
+                    buf_group: GROUP,
+                    user_data: PROVIDE,
+                    ..Sqe::default()
+                })?;
+            }
         }
+        Ok(())
     }
 
     fn collect(
         &mut self,
         pending: &mut Pending<()>,
-        stride: usize,
+        max_len: usize,
         stopping: bool,
     ) -> io::Result<()> {
         self.ring.completions(&mut self.completions);
@@ -143,7 +184,7 @@ impl Fast {
                     self.reading = cqe.flags & uring::MORE != 0;
                     if cqe.flags & uring::BUFFER != 0 {
                         let index = (cqe.flags >> 16) as usize;
-                        if index >= self.slots || cqe.result as usize > stride {
+                        if index >= self.slots || cqe.result as usize > max_len {
                             incompatible = Some(io::Error::other("invalid TUN read completion"));
                         } else if cqe.result > 0 {
                             self.ready.push_back((index, cqe.result as usize));
@@ -224,13 +265,15 @@ impl Fast {
         fd: RawFd,
         pending: &mut Pending<()>,
         stride: usize,
+        headroom: usize,
         attached: bool,
         read_allowed: bool,
     ) -> io::Result<()> {
-        self.collect(pending, stride, false)?;
+        let max_len = stride - headroom;
+        self.collect(pending, max_len, false)?;
         for index in 0..self.recycle.len() {
             let (start, count) = self.recycle[index];
-            self.provide(start, count, stride)?;
+            self.provide(start, count, stride, headroom)?;
         }
         self.recycle.clear();
         if !read_allowed && self.reading && !self.canceling {
@@ -274,12 +317,12 @@ impl Fast {
             self.arm_read(fd, attached, read_allowed)?;
             self.ring.submit()?
         } {
-            self.collect(pending, stride, false)?;
+            self.collect(pending, max_len, false)?;
         }
         Ok(())
     }
 
-    fn stop(&mut self, pending: &mut Pending<()>, stride: usize) {
+    fn stop(&mut self, pending: &mut Pending<()>, max_len: usize) {
         if let Err(error) = self.ring.stop() {
             // A failed cancellation cannot prove that the kernel released these allocations.
             // Retain only possibly borrowed buffers rather than free or replay uncertain writes.
@@ -293,7 +336,7 @@ impl Fast {
             }
             self.writes = 0;
         } else {
-            let _ = self.collect(pending, stride, true);
+            let _ = self.collect(pending, max_len, true);
         }
     }
 }
@@ -307,8 +350,8 @@ impl Drop for Fast {
 }
 
 impl<'a> TunDriver<'a> {
-    pub fn new(fd: BorrowedFd<'a>, stride: usize) -> Self {
-        let fast = match Fast::new(stride) {
+    pub fn new(fd: BorrowedFd<'a>, stride: usize, headroom: usize) -> Self {
+        let fast = match Fast::new(stride, headroom) {
             Ok(fast) => {
                 log::info!("TUN io_uring fast-path enabled");
                 Some(Box::new(fast))
@@ -318,17 +361,18 @@ impl<'a> TunDriver<'a> {
                 None
             }
         };
-        let mut driver = Self::poll(fd, stride);
+        let mut driver = Self::poll(fd, stride, headroom);
         driver.fast = fast;
         driver
     }
 
-    fn poll(fd: BorrowedFd<'a>, stride: usize) -> Self {
+    fn poll(fd: BorrowedFd<'a>, stride: usize, headroom: usize) -> Self {
         Self {
             fd,
             fast: None,
             pending: Pending::default(),
             stride,
+            headroom,
             recovered: VecDeque::new(),
             batch: [(0, 0); BUFFERS],
         }
@@ -356,7 +400,7 @@ impl<'a> TunDriver<'a> {
         self.fast.as_ref().map_or_else(
             || {
                 (
-                    self.recovered.iter().map(Vec::len).sum(),
+                    self.recovered.iter().map(|p| self.headroom + p.len()).sum(),
                     self.recovered.len(),
                 )
             },
@@ -370,6 +414,7 @@ impl<'a> TunDriver<'a> {
                 self.fd.as_raw_fd(),
                 &mut self.pending,
                 self.stride,
+                self.headroom,
                 attached,
                 read_allowed,
             )
@@ -383,12 +428,12 @@ impl<'a> TunDriver<'a> {
     fn fallback(&mut self, error: io::Error) {
         log::info!("TUN io_uring fast-path failed ({error}), using poll fallback");
         if let Some(mut fast) = self.fast.take() {
-            fast.stop(&mut self.pending, self.stride);
+            fast.stop(&mut self.pending, self.stride - self.headroom);
             for &(index, len) in &fast.ready {
                 // SAFETY: the CQE transferred this slot to userspace; stop ended all I/O.
                 let bytes = unsafe {
                     std::slice::from_raw_parts(
-                        fast.buffers.as_ptr().add(index * self.stride).cast::<u8>(),
+                        fast.buffers[index * self.stride + self.headroom].get(),
                         len,
                     )
                 };
@@ -397,7 +442,7 @@ impl<'a> TunDriver<'a> {
         }
     }
 
-    pub fn read(&mut self, output: &mut [u8]) -> io::Result<Option<usize>> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<Option<usize>> {
         if let Some(packet) = self.recovered.pop_front() {
             output[..packet.len()].copy_from_slice(&packet);
             return Ok(Some(packet.len()));
@@ -412,7 +457,7 @@ impl<'a> TunDriver<'a> {
             // SAFETY: this CQE-owned slot is not returned to the kernel until drive flushes recycle.
             unsafe {
                 std::ptr::copy_nonoverlapping(
-                    fast.buffers.as_ptr().add(index * self.stride).cast::<u8>(),
+                    fast.buffers[index * self.stride + self.headroom].get(),
                     output.as_mut_ptr(),
                     len,
                 );
@@ -428,16 +473,13 @@ impl<'a> TunDriver<'a> {
         result
     }
 
-    pub fn read_batch<'b>(
+    pub fn read_batch<'b, M>(
         &'b mut self,
         scratch: &'b mut [u8],
         scratch_stride: usize,
-        established: bool,
-        pending: &Pending<()>,
-    ) -> (
-        usize,
-        impl ExactSizeIterator<Item = &'b [u8]> + Clone + use<'b>,
-    ) {
+        pending: &Pending<M>,
+        mut encap: impl FnMut(&mut [u8], usize) -> bool,
+    ) -> (usize, Batch<'b>) {
         let (reserved_bytes, reserved_slots) = self.read_budget();
         let fast_mode = self.recovered.is_empty() && self.fast.is_some();
         let mut reads = 0;
@@ -449,36 +491,48 @@ impl<'a> TunDriver<'a> {
                 count + 1 + reserved_slots,
             )
         {
-            let next = if fast_mode {
+            let (index, len, slot) = if fast_mode {
                 let fast = self.fast.as_mut().unwrap();
-                fast.ready
-                    .pop_front()
-                    .inspect(|&(index, _)| fast.recycle(index))
+                let Some((index, len)) = fast.ready.pop_front() else {
+                    break;
+                };
+                fast.recycle(index);
+                // SAFETY: this CQE-owned slot is not returned to the kernel until `Fast::drive`
+                // flushes `fast.recycle`, so userspace has exclusive access to its headroom + data.
+                let slot = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        fast.buffers[index * self.stride].get(),
+                        self.headroom + len,
+                    )
+                };
+                (index, len, slot)
             } else {
                 let slot = &mut scratch[count * scratch_stride..(count + 1) * scratch_stride];
-                self.read(slot).ok().flatten().map(|len| (count, len))
-            };
-            let Some((index, len)) = next else {
-                break;
+                let Some(len) = self.read(&mut slot[self.headroom..]).ok().flatten() else {
+                    break;
+                };
+                (count, len, &mut slot[..self.headroom + len])
             };
             reads += 1;
-            if established {
-                self.batch[count] = (index, len);
-                bytes += len;
+            let frame_len = slot.len();
+            if encap(slot, len) {
+                self.batch[count] = (index, frame_len);
+                bytes += frame_len;
                 count += 1;
             }
         }
-        let (base, slot_stride) = match &self.fast {
+        let (base, stride) = match &self.fast {
             Some(fast) if fast_mode => (fast.buffers.as_ptr().cast::<u8>(), self.stride),
             _ => (scratch.as_ptr(), scratch_stride),
         };
-        let frames = self.batch[..count].iter().map(move |&(index, len)| {
-            // SAFETY: `index * slot_stride + len` lies within `fast.buffers` (in the fast path,
-            // where recycled slots are not returned to the kernel until `Fast::drive`) or within
-            // `scratch` (in the poll/recovery path), and `&'b mut self` / `scratch` stay borrowed.
-            unsafe { std::slice::from_raw_parts(base.add(index * slot_stride), len) }
-        });
-        (reads, frames)
+        (
+            reads,
+            Batch {
+                base,
+                stride,
+                items: self.batch[..count].iter(),
+            },
+        )
     }
 
     pub fn write(&mut self, packet: &[u8]) -> bool {
@@ -519,9 +573,9 @@ impl<'a> TunDriver<'a> {
 
     pub fn reset(&mut self) {
         if let Some(mut fast) = self.fast.take() {
-            fast.stop(&mut self.pending, self.stride);
+            fast.stop(&mut self.pending, self.stride - self.headroom);
             // Session changes discard both completed reads and old queued writes.
-            self.fast = match Fast::new(self.stride) {
+            self.fast = match Fast::new(self.stride, self.headroom) {
                 Ok(fast) => Some(Box::new(fast)),
                 Err(error) => {
                     log::info!("TUN io_uring restart failed ({error}), using poll fallback");
@@ -537,7 +591,7 @@ impl<'a> TunDriver<'a> {
 impl Drop for TunDriver<'_> {
     fn drop(&mut self) {
         if let Some(mut fast) = self.fast.take() {
-            fast.stop(&mut self.pending, self.stride);
+            fast.stop(&mut self.pending, self.stride - self.headroom);
         }
     }
 }
@@ -554,7 +608,7 @@ mod tests {
         let (socket, peer) = UnixDatagram::pair().unwrap();
         socket.set_nonblocking(true).unwrap();
         peer.set_nonblocking(true).unwrap();
-        let mut driver = TunDriver::new(socket.as_fd(), 2048);
+        let mut driver = TunDriver::new(socket.as_fd(), 2048, 0);
         assert!(driver.fast.is_some(), "test must exercise io_uring");
         let mut buffer = [0; 2048];
         for sequence in 0u32..200 {
@@ -641,7 +695,7 @@ mod tests {
         let (writer, reader) = UnixDatagram::pair().unwrap();
         writer.set_nonblocking(true).unwrap();
         reader.set_nonblocking(true).unwrap();
-        let mut driver = TunDriver::poll(writer.as_fd(), 2048);
+        let mut driver = TunDriver::poll(writer.as_fd(), 2048, 0);
         let mut count = 0usize;
         loop {
             let packet = vec![(count % 251) as u8; 1024];

@@ -492,7 +492,7 @@ impl Worker {
         let stride = usize::from(session.mtu()).max(MIN_STRIDE);
         session.start(Instant::now(), &mut out);
         let mut generation = session.generation();
-        let mut driver = TunDriver::new(tun.as_fd(), usize::from(session.mtu()));
+        let mut driver = TunDriver::new(tun.as_fd(), usize::from(session.mtu()), 0);
         let mut attached = mode == Mode::Exit;
         let mut sender = udp::Sender::new();
         let mut rx = udp::Receiver::new(stride);
@@ -636,18 +636,13 @@ impl Worker {
                     break;
                 }
                 if tun_ready && out.room(&driver, stride, 1) {
-                    let reads = {
-                        let (reads, frames) = driver.read_batch(
-                            rx.buffers_mut(),
-                            stride,
-                            session.is_established(),
-                            &out.pending,
-                        );
-                        if frames.len() > 0 {
-                            out.data(&mut sender, frames);
-                        }
-                        reads
-                    };
+                    let established = session.is_established();
+                    let (reads, frames) =
+                        driver
+                            .read_batch(rx.buffers_mut(), stride, &out.pending, |_, _| established);
+                    if frames.len() > 0 {
+                        out.data(&mut sender, frames);
+                    }
                     tun_ready = reads == udp::BATCH && out.room(&driver, stride, 1);
                 } else {
                     tun_ready = false;

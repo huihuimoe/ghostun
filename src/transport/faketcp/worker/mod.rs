@@ -552,7 +552,7 @@ impl Worker {
         };
         session.start(Instant::now(), &mut out);
         let mut generation = session.generation();
-        let mut driver = TunDriver::new(tun.as_fd(), stride - overhead);
+        let mut driver = TunDriver::new(tun.as_fd(), stride, overhead);
         let mut attached = mode == Mode::Exit;
         let mut rx = raw::Receiver::new(family, stride);
         let mut fds = [
@@ -651,30 +651,18 @@ impl Worker {
                     };
                 }
                 if tun_ready && out.room(&driver, stride, 1) {
-                    let mut reads = 0;
-                    let mut count = 0;
-                    let mut bytes = 0;
                     let mut batch_dst = None;
-                    while reads < raw::BATCH && out.room(&driver, bytes + stride, count + 1) {
-                        let slot = &mut rx.buffers_mut()[count * stride..(count + 1) * stride];
-                        let Ok(Some(n)) = driver.read(&mut slot[overhead..]) else {
-                            break;
-                        };
-                        reads += 1;
-                        if let Some((len, dst)) = session.encap(slot, n) {
-                            rx.lens[count] = len;
-                            bytes += len;
-                            batch_dst = Some(dst);
-                            count += 1;
-                        }
-                    }
+                    let (reads, frames) =
+                        driver.read_batch(rx.buffers_mut(), stride, &out.pending, |slot, n| {
+                            if let Some((_, dst)) = session.encap(slot, n) {
+                                batch_dst = Some(dst);
+                                true
+                            } else {
+                                false
+                            }
+                        });
                     if let Some(dst) = batch_dst {
-                        out.data(
-                            rx.lens[..count]
-                                .iter()
-                                .enumerate()
-                                .map(|(k, &n)| (&rx.buffers()[k * stride..k * stride + n], dst)),
-                        );
+                        out.data(frames.map(|frame| (frame, dst)));
                     }
                     tun_ready = reads == raw::BATCH && out.room(&driver, stride, 1);
                 } else {
