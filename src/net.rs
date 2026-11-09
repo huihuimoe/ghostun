@@ -241,24 +241,32 @@ pub fn is_valid_inner_ip(p: &[u8], mtu: usize) -> bool {
     }
 }
 
+/// Adds the big-endian one's-complement sum of `data` to `acc`.
+///
+/// Words are summed in native byte order and the folded result is swapped once
+/// (RFC 1071 §2(B)): per-word big-endian loads cost ~9 shuffles per 16 bytes on
+/// baseline SSE2, which has no `pshufb`, dominating the vectorized loop.
 #[inline]
 fn sum16(data: &[u8], acc: u32) -> u32 {
-    let mut acc = u64::from(acc);
+    let mut sum = 0u64;
     let (chunks, tail) = data.as_chunks::<8>();
     for &chunk in chunks {
-        let w = u64::from_be_bytes(chunk);
-        acc += (w >> 32) + (w & 0xffff_ffff);
+        let w = u64::from_ne_bytes(chunk);
+        sum += (w >> 32) + (w & 0xffff_ffff);
     }
     let (pairs, rest) = tail.as_chunks::<2>();
     for &pair in pairs {
-        acc += u64::from(u16::from_be_bytes(pair));
+        sum += u64::from(u16::from_ne_bytes(pair));
     }
     if let [last] = rest {
-        acc += u64::from(*last) << 8;
+        sum += u64::from(u16::from_ne_bytes([*last, 0]));
     }
-    let mut s = (acc >> 32) + (acc & 0xffff_ffff);
+    let mut s = (sum >> 32) + (sum & 0xffff_ffff);
+    // Three 16-bit folds: two can still leave a carry in bit 16, which the byte swap would drop.
     s = (s >> 16) + (s & 0xffff);
-    ((s >> 16) + (s & 0xffff)) as u32
+    s = (s >> 16) + (s & 0xffff);
+    s = (s >> 16) + (s & 0xffff);
+    acc + u32::from(u16::from_be(s as u16))
 }
 
 #[inline]
@@ -313,6 +321,34 @@ pub fn tcp_checksum_ok(frame: &[u8]) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn sum16_matches_big_endian_reference() {
+        let reference = |data: &[u8], acc: u32| -> u16 {
+            let mut s = data.chunks(2).fold(u64::from(acc), |s, w| {
+                s + u64::from(u16::from_be_bytes([w[0], *w.get(1).unwrap_or(&0)]))
+            });
+            while s > 0xffff {
+                s = (s >> 16) + (s & 0xffff);
+            }
+            !(s as u16)
+        };
+        let noise: Vec<u8> = (0..1600u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        // All-ones data maximizes end-around carries through every fold.
+        for data in [noise, vec![0xff; 1600]] {
+            for len in (0..=64).chain([127, 128, 129, 1399, 1400, 1461]) {
+                for offset in 0..3 {
+                    let d = &data[offset..offset + len];
+                    assert_eq!(
+                        fold(sum16(d, 0x1_fffe)),
+                        reference(d, 0x1_fffe),
+                        "len {len} +{offset}"
+                    );
+                }
+            }
+        }
+    }
     #[test]
     fn cidr_network_clears_host_bits() {
         let v4: Cidr<Ipv4Addr> = "10.200.0.2/30".parse().unwrap();
