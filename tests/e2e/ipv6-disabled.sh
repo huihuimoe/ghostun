@@ -55,7 +55,8 @@ for _ in $(seq 20); do
     sleep 0.1
 done
 $connected || fail "default configuration did not fall back to IPv4"
-ns "$ENTRY" ping -c2 -W1 -M do -s 1432 10.200.0.2 >/dev/null || fail "full-MTU IPv4 packet"
+MAX_ICMP=$([[ $TRANSPORT == udp ]] && echo 1444 || echo 1432)
+ns "$ENTRY" ping -c2 -W1 -M do -s "$MAX_ICMP" 10.200.0.2 >/dev/null || fail "full-MTU IPv4 packet"
 for n in "$ENTRY" "$EXIT"; do
     [[ -z $(ns "$n" ip -6 -o addr show dev ghostun0) ]] || fail "$n has inner IPv6"
     ns "$n" nft list table inet ghostun_ghostun0 >/dev/null || fail "$n nft table missing"

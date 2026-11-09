@@ -85,7 +85,7 @@ jobs:
           mkdir -p dist
           install -m 0755 target/x86_64-unknown-linux-musl/release/ghostun dist/ghostun-linux-amd64
           install -m 0755 target/aarch64-unknown-linux-musl/release/ghostun dist/ghostun-linux-arm64
-      - name: Build OpenWrt 25.10+ APK packages
+      - name: Build OpenWrt 25.12 APK packages
         env:
           TAG: ${{ needs.prepare.outputs.tag }}
         run: |

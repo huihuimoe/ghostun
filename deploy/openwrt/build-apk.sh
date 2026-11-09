@@ -1,5 +1,5 @@
 #!/bin/sh
-# Build an OpenWrt 25.10+ (.apk) package from a compiled ghostun binary.
+# Build an OpenWrt 25.12 (.apk) package from a compiled ghostun binary.
 #
 # Usage:
 #   ./deploy/openwrt/build-apk.sh <binary_path> <version> <openwrt_arch> <output_dir> [pkg_release]

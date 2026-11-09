@@ -295,11 +295,11 @@ impl Listener {
                         continue;
                     }
                     let dst = UnconnectedDst { index, local, peer };
-                    match state
+                    let step = state
                         .lock()
                         .unwrap()
-                        .on_request(now, local, peer, &buf[..n])
-                    {
+                        .on_request(now, local, peer, &buf[..n]);
+                    match step {
                         Ok(ExitStep::Ignore) => {}
                         Ok(ExitStep::Challenge(c)) => {
                             send_or_queue(&sockets, &mut pending, dst, &c);

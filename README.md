@@ -163,7 +163,7 @@ systemctl enable --now ghostun-entry
 
 Use `exit.toml` and `deploy/ghostun-exit.service` on the Exit host.
 
-### OpenWrt (25.10+)
+### OpenWrt (25.12)
 
 Install the matching `.apk` package (`x86_64`, `aarch64_generic`, `aarch64_cortex-a53`, or `aarch64_cortex-a72`) from [GitHub Releases](https://github.com/huihuimoe/ghostun/releases), or build from source with [`deploy/openwrt/Makefile`](deploy/openwrt/Makefile):
 

@@ -22,11 +22,12 @@ sudo docker exec ghostun-e2e bash -c '
     done
     for family in ipv4 ipv6; do
       LOG=/src/target/e2e-faketcp-$family OUTER_FAMILY=$family bash tests/e2e/netns.sh
+      LOG=/src/target/e2e-udp-$family OUTER_FAMILY=$family bash tests/e2e/udp.sh
       for relay in 0 1; do
         LOG=/src/target/e2e-tcp-$family-$relay OUTER_FAMILY=$family RELAY=$relay bash tests/e2e/tcp.sh
       done
     done
-    for transport in faketcp tcp; do
+    for transport in faketcp tcp udp; do
       LOG=/src/target/e2e-noipv6-$transport TRANSPORT=$transport bash tests/e2e/ipv6-disabled.sh
     done'
 ```
@@ -38,7 +39,8 @@ The container needs four usable CPUs. Inspect logs under `target/` with
 - `e2e/netns.sh`: FakeTCP forwarding, authentication, firewall recovery, reload and cleanup.
 - `e2e/tcp.sh`: direct/relayed TCP, exact bidirectional IPv4/IPv6 TCP/UDP payloads,
   rejection and admission limits, takeover, restarts, blackholes, reload and cleanup.
-- `e2e/ipv6-disabled.sh`: IPv4 fallback with kernel IPv6 disabled, for both transports.
+- `e2e/udp.sh`: UDP forwarding over IPv4 and IPv6, authentication, reload and cleanup.
+- `e2e/ipv6-disabled.sh`: IPv4 fallback with kernel IPv6 disabled, for all transports.
 - The ignored `atomic_table_replacement` Rust test runs only in the container; it checks
   failed-install rollback, preservation of an existing table, replacement, and removal.
 - Rust tests cover fixed wire-format vectors, sliced packet buffers, strict message lengths,
@@ -52,7 +54,7 @@ with `EXPECT_TUN_DRIVER=poll` to check policy fallback. For that container, repl
 --security-opt seccomp="$PWD/tests/deny-io-uring.json"`;
 Docker bypasses seccomp in privileged containers.
 Run the ignored `sys::raw::tests::entry_raw_socket_binds_and_connects_both_families`
-and `transport::faketcp::tun_driver::tests::uring_recycles_buffers_and_preserves_backlog_across_runtime_fallback`
+and `transport::tun_driver::tests::uring_recycles_buffers_and_preserves_backlog_across_runtime_fallback`
 tests inside the privileged container too.
 
 To run the performance scenarios from `README.md`, run:
