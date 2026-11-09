@@ -1,6 +1,6 @@
 # ghostun
 
-`ghostun` is a lightweight Linux L3 tunnel over FakeTCP or TCP. Use TCP for routes with a terminating TCP relay.
+`ghostun` is a lightweight Linux L3 tunnel over FakeTCP, TCP, or UDP. Use TCP for routes with a terminating TCP relay; use UDP only on unrestricted paths.
 
 One binary runs in two roles:
 
@@ -26,7 +26,7 @@ flowchart TB
 
 - Linux with `CAP_NET_ADMIN` and `CAP_NET_RAW` (or root)
 - Kernel nftables support (unless `--no-netfilter` is set); no `ip` or `nft` executable is required
-- Inbound TCP allowed on the Exit `--listen` port
+- Inbound TCP (or UDP when using `--transport udp`) allowed on the Exit `--listen` port
 
 ## Build
 
@@ -70,14 +70,16 @@ ghostun --config auth.toml entry --remote '[2001:db8::10]:443' --conns 4
 
 FakeTCP is the default. For direct TCP or a terminating TCP relay, add
 `--transport tcp` on both peers and point Entry at Exit or the relay.
+For unrestricted paths (no stateful firewall blocking or ISP UDP scrubbing/throttling),
+`--transport udp` is also available (not recommended on restricted networks).
 Both peers must use the same effective `--tun-mtu`.
 Changing transport requires a restart.
 
 For dual-stack outer admission, set `--outer-family mixed` on Exit (and either configure
 both IPv4 and IPv6 endpoints in `entry.remote`, or pass `--outer-family mixed` on Entry
 when connecting over one family). Exit listens on IPv4 and IPv6 at the same port; use a
-bare `--listen` port. Both peers reserve 60 bytes of overhead, including over IPv4:
-outer MTU 1500 gives TUN MTU 1440. Each peer detects its outer egress MTUs and uses the
+bare `--listen` port. Both peers reserve IPv6 overhead (`60` bytes for FakeTCP/TCP, `48` bytes for UDP), including over IPv4:
+outer MTU 1500 gives TUN MTU 1440 (`1452` for UDP). Each peer detects its outer egress MTUs and uses the
 smallest value; set a common MTU if peer defaults differ.
 
 ```sh
@@ -122,7 +124,7 @@ ghostun [options] [entry|exit]
 
 | Flag | Default | Description |
 |---|---|---|
-| `--transport faketcp\|tcp` | `faketcp` | One outer transport per instance; restart to change |
+| `--transport faketcp\|tcp\|udp` | `faketcp` | One outer transport per instance (`udp` is for unrestricted networks only); restart to change |
 | `--tcp-notsent KIB` | `64` | TCP unsent low watermark and write batch limit in KiB; restart to change |
 | `--config PATH` | — | TOML configuration file (required for `auth_key`) |
 | `--remote IP:PORT` | — | Entry only: single Exit outer address override (use `entry.remote` in TOML for multiple endpoints) |
@@ -135,9 +137,9 @@ ghostun [options] [entry|exit]
 | `--tun-ipv6 CIDR` | `fd00:200::1/126` / `::2/126` | Inner IPv6 address (Entry / Exit) |
 | `--no-ipv6` | off | Disable inner IPv6 |
 | `--outer-mtu MTU` | egress MTU or `1500` | Outer path MTU |
-| `--tun-mtu MTU` | `outer_mtu - 40` / `- 60` | Inner TUN MTU (IPv4 / IPv6 or mixed overhead) |
+| `--tun-mtu MTU` | `outer_mtu - 40` / `- 60` (`- 28` / `- 48` for UDP) | Inner TUN MTU (IPv4 / IPv6 or mixed overhead) |
 | `--iface IFACE` | route lookup | Outer interface (Entry egress; Exit socket bind and masquerade) |
-| `--base-port PORT` | `32768` | FakeTCP Entry source-port pool; TCP warns and ignores explicit values |
+| `--base-port PORT` | `32768` | FakeTCP Entry source-port pool; TCP/UDP warn and ignore explicit values |
 | `--ping-interval SECS` | `5` | Health probe interval |
 | `--dead-timeout SECS` | `15` | Silence timeout before reconnecting |
 | `--no-netfilter` | off | Skip automatic `nftables` and `sysctl` setup |
@@ -214,7 +216,7 @@ install -m600 config.example.toml exit.toml    # set auth_key and role settings
 docker compose -f compose.exit.yml up -d
 ```
 
-FakeTCP automatically probes the TUN io_uring fast path on Linux 6.7+ and falls
+FakeTCP and UDP automatically probe the TUN io_uring fast path on Linux 6.7+ and fall
 back to poll when unsupported or denied. No configuration is needed.
 [Docker's default seccomp policy](https://docs.docker.com/engine/security/seccomp/)
 blocks io_uring; Podman follows its installed policy. The deployment templates
@@ -282,7 +284,7 @@ stateful firewall, outer MTU 1420, eight parallel iperf3 streams, two workers pe
 
 ## Operational notes
 
-- **MTU:** Outer headers take 40 bytes over IPv4 and 60 bytes over IPv6. If your path MTU is lower than the NIC MTU (for example PPPoE `1492` or cloud VPC `1420`) and large transfers stall while ping works, set `--outer-mtu`.
+- **MTU:** Outer headers take 40 bytes over IPv4 and 60 bytes over IPv6 for FakeTCP/TCP (28 and 48 bytes for UDP). If your path MTU is lower than the NIC MTU (for example PPPoE `1492` or cloud VPC `1420`) and large transfers stall while ping works, set `--outer-mtu`.
 - **Firewall rules:** `ghostun` manages its own nftables table and removes it on shutdown. Both transports use inner MSS clamping and Exit masquerade; FakeTCP also bypasses conntrack and suppresses kernel RSTs. Use `--no-masq` on Exit to omit masquerade while keeping the rest, or `--no-netfilter` to skip all `nftables` and `sysctl` changes.
 - **Security:** The shared key authenticates connections. Traffic is not encrypted or protected against modification; use encryption in your proxy. TCP also carries inner UDP, but loss can delay all flows sharing an outer connection.
 - **Reload:** Send `SIGHUP` to reload the key, health timers or CPU affinity. Coordinate key changes on both peers. Transport and topology changes require restart.

@@ -546,7 +546,7 @@ mod tests {
         }
         assert_eq!(received, 200);
         assert!(driver.pending.packets.is_empty());
-        assert!(driver.pending.room(super::super::queue::BYTE_LIMIT));
+        assert!(driver.pending.room(BYTE_LIMIT));
         assert_eq!(
             peer.recv(&mut buffer).unwrap_err().kind(),
             io::ErrorKind::WouldBlock

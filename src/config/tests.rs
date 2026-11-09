@@ -32,34 +32,30 @@ fn with_raw_file(name: &str, toml: &str, args: &[&str]) -> Result<Config, String
 #[test]
 fn transport_defaults_precedence_and_validation() {
     assert_eq!(entry(&[]).unwrap().transport, Transport::Faketcp);
-    let tcp = with_file(
-        "tcp",
-        "transport = 'tcp'\n[entry]\nbase_port = 1",
-        &["entry", "--remote", "192.0.2.1:443"],
-    )
-    .unwrap();
-    assert_eq!(tcp.transport, Transport::Tcp);
-    assert!(tcp.base_port_explicit);
+    for (name, expected) in [("tcp", Transport::Tcp), ("udp", Transport::Udp)] {
+        let cfg = with_file(
+            name,
+            &format!("transport = '{name}'\n[entry]\nbase_port = 1"),
+            &["entry", "--remote", "192.0.2.1:443"],
+        )
+        .unwrap();
+        assert_eq!(cfg.transport, expected);
+        assert!(cfg.base_port_explicit);
+    }
     assert_eq!(
         with_file(
             "override-transport",
             "transport = 'tcp'",
-            &[
-                "entry",
-                "--remote",
-                "192.0.2.1:443",
-                "--transport",
-                "faketcp"
-            ]
+            &["entry", "--remote", "192.0.2.1:443", "--transport", "udp"]
         )
         .unwrap()
         .transport,
-        Transport::Faketcp
+        Transport::Udp
     );
     assert!(
         with_file(
             "bad-transport",
-            "transport = 'udp'",
+            "transport = 'quic'",
             &["entry", "--remote", "192.0.2.1:443"]
         )
         .is_err()
@@ -708,13 +704,30 @@ fn mixed_preserves_policy_but_entry_opens_only_the_remote_family() {
 
 #[test]
 fn mtu_validation_uses_outer_family_and_detected_mtu() {
-    for (family, overhead) in [("ipv4", 40), ("ipv6", 60), ("mixed", 60)] {
-        let mut c = parse(&["exit", "--listen", "443", "--outer-family", family]).unwrap();
-        assert_eq!(c.resolve_tun_mtu(1500).unwrap(), 1500 - overhead);
-        assert_eq!(c.resolve_tun_mtu(1280 + overhead).unwrap(), 1280);
-        assert!(c.resolve_tun_mtu(1279 + overhead).is_err());
-        c.tun_mtu = Some(1441);
-        assert!(c.resolve_tun_mtu(1440 + overhead).is_err());
+    for (family, tcp_overhead, udp_overhead) in
+        [("ipv4", 40, 28), ("ipv6", 60, 48), ("mixed", 60, 48)]
+    {
+        for (transport, overhead) in [
+            ("faketcp", tcp_overhead),
+            ("tcp", tcp_overhead),
+            ("udp", udp_overhead),
+        ] {
+            let mut c = parse(&[
+                "exit",
+                "--listen",
+                "443",
+                "--outer-family",
+                family,
+                "--transport",
+                transport,
+            ])
+            .unwrap();
+            assert_eq!(c.resolve_tun_mtu(1500).unwrap(), 1500 - overhead);
+            assert_eq!(c.resolve_tun_mtu(1280 + overhead).unwrap(), 1280);
+            assert!(c.resolve_tun_mtu(1279 + overhead).is_err());
+            c.tun_mtu = Some(1441);
+            assert!(c.resolve_tun_mtu(1440 + overhead).is_err());
+        }
     }
     assert!(
         parse(&[

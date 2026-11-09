@@ -4,6 +4,7 @@ pub mod raw;
 pub mod route;
 pub mod tcp;
 pub mod tun;
+pub mod udp;
 pub mod uring;
 
 use std::fs::File;

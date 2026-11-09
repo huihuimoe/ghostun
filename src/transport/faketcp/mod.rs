@@ -3,9 +3,7 @@
 mod auth;
 mod filter;
 mod frame;
-mod queue;
 mod session;
-mod tun_driver;
 mod worker;
 
 pub use worker::{Listener, SharedExitState, Worker};

@@ -12,7 +12,10 @@ mode = "entry"
 # auth_key = "<64 hexadecimal characters>"
 
 # Outer transport; both peers must use the same value.
-# Use "faketcp" for direct paths, or "tcp" when going through a terminating TCP relay.
+# - "faketcp" (default): raw-socket FakeTCP for direct paths across stateful firewalls.
+# - "tcp": kernel TCP for paths through a terminating TCP relay.
+# - "udp": kernel UDP; NOT recommended on restricted networks—use only on unrestricted
+#   paths without firewall blocking or ISP UDP scrubbing/throttling.
 transport = "faketcp"
 
 # TCP only: unsent write limit in KiB. Consider 128 on >1 Gbit/s links.

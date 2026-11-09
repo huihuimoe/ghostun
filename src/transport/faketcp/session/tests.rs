@@ -1,7 +1,7 @@
 use super::*;
 use crate::net::{ipv4_header_checksum_ok, tcp_checksum_ok};
 use crate::transport::faketcp::frame::{Parsed, SYN_FRAME_LEN};
-use crate::transport::faketcp::queue::Pending;
+use crate::transport::queue::Pending;
 use std::net::Ipv4Addr;
 
 const ENTRY_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));

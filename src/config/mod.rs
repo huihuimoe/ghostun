@@ -30,6 +30,7 @@ pub enum Transport {
     #[default]
     Faketcp,
     Tcp,
+    Udp,
 }
 
 /// Configured outer policy; sockets and packets always use a concrete `OuterFamily`.
@@ -229,7 +230,7 @@ impl Config {
     }
 
     pub fn resolve_tun_mtu(&self, outer_mtu: u32) -> Result<u32, String> {
-        let overhead = self.outer_family.overhead() as u32;
+        let overhead = crate::transport::overhead(self.transport, self.outer_family) as u32;
         let min_outer = self.outer_family.min_mtu();
         if !(min_outer..=65535).contains(&outer_mtu) {
             return Err(format!("outer MTU must be within {min_outer}..=65535"));
@@ -266,7 +267,7 @@ impl Config {
 #[derive(Clone, Debug, Default, PartialEq, FromArgs)]
 #[argh(
     name = "ghostun",
-    description = "L3 tunnel over FakeTCP or relay-compatible TCP.",
+    description = "L3 tunnel over FakeTCP, relay-compatible TCP, or UDP.",
     help_triggers("-h", "--help", "help")
 )]
 struct Cli {
@@ -276,7 +277,7 @@ struct Cli {
     /// TOML configuration file; CLI flags override its values
     #[argh(option, arg_name = "PATH")]
     config: Option<PathBuf>,
-    /// outer transport: faketcp or tcp [default: faketcp]
+    /// outer transport: faketcp, tcp, or udp [default: faketcp]
     #[argh(option)]
     transport: Option<Transport>,
     /// TCP unsent low watermark and write batch in KiB; restart to change [default: 64]
@@ -312,7 +313,7 @@ struct Cli {
     /// outer path MTU [default: egress interface MTU, fallback 1500]
     #[argh(option, arg_name = "MTU")]
     outer_mtu: Option<u32>,
-    /// inner TUN MTU [default: outer MTU - 40 for IPv4, - 60 for IPv6]
+    /// inner TUN MTU [default: outer MTU - 40/- 60 for FakeTCP/TCP, - 28/- 48 for UDP]
     #[argh(option, arg_name = "MTU")]
     tun_mtu: Option<u32>,
     /// outer egress interface [default: from routing table]
@@ -685,7 +686,7 @@ fn validate(c: &Config) -> Result<(), String> {
         c.resolve_tun_mtu(m)?;
     } else if let Some(m) = c.tun_mtu {
         let min = c.inner_min_mtu();
-        let max = 65535 - c.outer_family.overhead() as u32;
+        let max = 65535 - crate::transport::overhead(c.transport, c.outer_family) as u32;
         if m < min || m > max {
             return Err(format!("`tun_mtu` must be within {min}..={max}"));
         }

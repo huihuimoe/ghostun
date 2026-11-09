@@ -12,13 +12,13 @@ use std::time::{Duration, Instant};
 use super::auth::{self, Auth, ExitStep, PROOF_LEN};
 use super::filter::{entry_filter, exit_listener_filter, exit_worker_filter};
 use super::frame::{self, MAX_OVERHEAD, TcpMeta, flags};
-use super::queue::Pending;
 use super::session::{Promoted, Session, SessionConfig, Sink, WINDOW, emit};
-use super::tun_driver::TunDriver;
 use crate::config::{AuthKey, Config, MAX_CONNS, Mode};
 use crate::net::OuterFamily;
 use crate::sys::{self, raw};
 use crate::transport::control::{self, Control};
+use crate::transport::queue::Pending;
+use crate::transport::tun_driver::TunDriver;
 #[cfg(test)]
 mod tests;
 

@@ -4,7 +4,10 @@ pub mod budget;
 mod control;
 mod faketcp;
 mod keepalive;
+mod queue;
 mod tcp;
+mod tun_driver;
+mod udp;
 
 use std::net::{IpAddr, SocketAddr};
 use std::os::fd::{OwnedFd, RawFd};
@@ -12,11 +15,23 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::thread::JoinHandle;
 
-use crate::config::{Config, MAX_CONNS, Mode, Transport};
+use crate::config::{Config, MAX_CONNS, Mode, OuterMode, Transport};
 use crate::sys;
 use control::{
     Control, CoreTable, ExitWorkerGuard, Reload, RollingReload, StopOnDrop, candidate_cpus,
 };
+
+/// Bytes reserved before an inner packet, including the concrete outer protocol header.
+pub const fn overhead(transport: Transport, family: OuterMode) -> usize {
+    let ip = match family {
+        OuterMode::Ipv4 => crate::net::ipv4::HDR_LEN,
+        OuterMode::Ipv6 | OuterMode::Mixed => crate::net::ipv6::HDR_LEN,
+    };
+    ip + match transport {
+        Transport::Udp => udp::OVERHEAD,
+        Transport::Faketcp | Transport::Tcp => crate::net::tcp::HDR_LEN,
+    }
+}
 
 /// Per-remote outer route and connection count on Entry.
 pub struct EntryRoute {
@@ -36,6 +51,7 @@ pub struct Outer {
 enum Start {
     Fake(Box<faketcp::Worker>),
     Tcp(Box<tcp::Worker>),
+    Udp(Box<udp::Worker>),
 }
 
 impl Start {
@@ -43,6 +59,7 @@ impl Start {
         match self {
             Self::Fake(worker) => worker.run(stop, ctrl),
             Self::Tcp(worker) => worker.run(stop, ctrl),
+            Self::Udp(worker) => worker.run(stop, ctrl),
         }
     }
 }
@@ -50,6 +67,7 @@ impl Start {
 enum ExitDispatcher {
     Fake(faketcp::SharedExitState),
     Tcp(tcp::SharedExitState),
+    Udp(udp::SharedExitState),
 }
 
 struct ExitSlot {
@@ -92,9 +110,10 @@ pub fn start(
     stop: &'static AtomicBool,
     main_wake: RawFd,
 ) -> Result<Running, String> {
-    if cfg.transport == Transport::Tcp && cfg.base_port_explicit {
+    if cfg.transport != Transport::Faketcp && cfg.base_port_explicit {
         log::warn!(
-            "tcp transport: explicitly configured base_port is ignored; kernel assigns source ports"
+            "{:?} transport: explicitly configured base_port is ignored; kernel assigns source ports",
+            cfg.transport
         );
     }
     let default_cpus = sys::usable_cpus();
@@ -110,6 +129,14 @@ pub fn start(
                 let i = starts.len();
                 let tun = tuns.next().expect("TUN queue per entry connection");
                 starts.push(match cfg.transport {
+                    Transport::Udp => Start::Udp(Box::new(udp::Worker::new_entry(
+                        i,
+                        cfg,
+                        route,
+                        tun_mtu as u16,
+                        tun,
+                        seed,
+                    )?)),
                     Transport::Tcp => Start::Tcp(Box::new(tcp::Worker::new_entry(
                         i,
                         cfg.clone(),
@@ -167,6 +194,15 @@ pub fn start(
 
     let anchor_tun = tuns.into_iter().next();
     let (exit_dispatcher, listener_wake, listener_thread) = match cfg.transport {
+        Transport::Udp => {
+            let listener = udp::Listener::bind(cfg, tun_mtu as u16, main_wake)?;
+            let wake = listener.wake_fd();
+            let state = Arc::clone(&listener.state);
+            let thread = listener
+                .spawn(stop, main_wake)
+                .expect("spawning UDP accept thread");
+            (ExitDispatcher::Udp(state), wake, thread)
+        }
         Transport::Tcp => {
             let listener = tcp::Listener::bind(cfg, tun_mtu as u16, main_wake)
                 .map_err(|e| format!("tcp listener: {e}"))?;
@@ -315,6 +351,15 @@ impl Running {
         let cpus_changed = self.cfg.tunables.cpus != cfg.tunables.cpus;
         self.cfg = cfg.clone();
         match &self.exit_dispatcher {
+            Some(ExitDispatcher::Udp(state)) => {
+                let mut s = state.lock().unwrap();
+                if key_changed {
+                    s.key = cfg.tunables.auth_key.clone();
+                    s.epoch += 1;
+                    s.admitted.clear();
+                }
+                s.timeout = cfg.tunables.dead_timeout;
+            }
             Some(ExitDispatcher::Tcp(state)) => {
                 let mut s = state.lock().unwrap();
                 if key_changed {
@@ -384,6 +429,29 @@ impl Running {
         }
         self.reap_exited_workers();
         match self.exit_dispatcher.as_ref() {
+            Some(ExitDispatcher::Udp(state)) => {
+                let state = Arc::clone(state);
+                loop {
+                    let next = state.lock().unwrap().admitted.pop_front();
+                    let Some(promo) = next else { break };
+                    let id = promo.worker;
+                    let tuple = Some((promo.local, promo.peer));
+                    let peer_label = format!("{} <-> {}", promo.local, promo.peer);
+                    let worker_state = Arc::clone(&state);
+                    self.spawn_exit_slot(id, tuple, peer_label, |this, tun| {
+                        udp::Worker::new_exit(
+                            id,
+                            &this.cfg,
+                            this.tun_mtu as u16,
+                            tun,
+                            promo,
+                            worker_state,
+                            this.seed,
+                        )
+                        .map(|w| Start::Udp(Box::new(w)))
+                    });
+                }
+            }
             Some(ExitDispatcher::Tcp(state)) => {
                 let state = Arc::clone(state);
                 loop {
