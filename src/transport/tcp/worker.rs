@@ -6,10 +6,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use super::auth::{Handshake, Params};
-use super::{BATCH, Connection, ROUNDS, can_io};
+use super::connection::TunIo;
+use super::{Connection, ROUNDS};
 use crate::config::{Config, Mode};
 use crate::sys::{self, READ_READY, poll, poll_ms, pollfd};
 use crate::transport::control::{self, Backoff};
+use crate::transport::tun_driver::TunDriver;
 
 pub struct Worker {
     id: usize,
@@ -57,16 +59,33 @@ impl Worker {
         }
         let mut retry_at = Instant::now();
         let mut backoff = Backoff::default();
-        let mut packet = vec![0; self.mtu as usize + 1];
+        let mtu = usize::from(self.mtu);
+        // Slots are exactly one MTU so read_batch's worst-case room check matches `tx.room(mtu)`;
+        // a larger stride would strand the queue between the two bounds and spin the loop.
+        let mut tun = TunIo {
+            driver: TunDriver::new(self.tun.as_fd(), mtu, 0),
+            scratch: vec![0; sys::raw::BATCH * mtu],
+            stride: mtu,
+            attached,
+        };
+        let read_allowed = |c: &Option<Connection>| {
+            c.as_ref()
+                .is_some_and(|c| c.auth.is_none() && c.tx.room(mtu))
+        };
         let mut fds = [
             pollfd(-1, 0),
             pollfd(-1, 0),
             pollfd(ctrl.wake_fd().as_raw_fd(), libc::POLLIN),
+            pollfd(-1, 0),
         ];
         while !stop.load(Ordering::Relaxed) && !ctrl.is_stopped() {
             sys::poll_wake(fds[2], ctrl.wake_fd());
             if ctrl.is_stopped() {
                 break;
+            }
+            tun.driver.service(tun.attached, read_allowed(&connection));
+            if fds[0].revents & sys::WRITE_READY != 0 {
+                tun.driver.flush();
             }
             if let Some((new_gen, reload)) = ctrl.take_reload(generation) {
                 wait &= !connection.as_ref().is_some_and(|c| c.auth.is_none());
@@ -77,6 +96,7 @@ impl Worker {
                 if self.cfg.tunables.auth_key != reload.tunables.auth_key {
                     wait |= connection.as_ref().is_some_and(|c| c.auth.is_none());
                     connection = None;
+                    tun.driver.reset();
                     fds[1] = pollfd(-1, 0);
                     retry_at = Instant::now();
                 }
@@ -133,7 +153,7 @@ impl Worker {
                     }
                 } else {
                     c.pump_io(
-                        &self.tun,
+                        &mut tun,
                         self.mtu,
                         now,
                         self.cfg.tunables.ping_interval,
@@ -153,6 +173,8 @@ impl Worker {
                         }
                     );
                     connection = None;
+                    // Queued TUN writes and completed reads belong to the dead session.
+                    tun.driver.reset();
                     fds[1] = pollfd(-1, 0);
                     if self.cfg.mode == Mode::Entry {
                         retry_at = if was_established {
@@ -167,26 +189,40 @@ impl Worker {
                 }
             }
             let established = connection.as_ref().is_some_and(|c| c.auth.is_none());
-            control::sync_tun_queue(id, self.tun.as_fd(), &mut attached, established);
+            control::sync_tun_queue(id, self.tun.as_fd(), &mut tun.attached, established);
             ctrl.report(generation, established, wait);
-            if !established && can_io(fds[0], libc::POLLIN, READ_READY) {
+            if !established && (fds[0].revents & READ_READY != 0 || tun.driver.has_reads()) {
+                // Discard packets that reached the queue before detach or session loss.
                 let mut drained = 0;
-                while drained < ROUNDS * BATCH {
-                    match sys::tun::read(self.tun.as_fd(), &mut packet) {
-                        Ok(Some(_)) => drained += 1,
-                        Ok(None) => break,
-                        Err(e) => {
-                            log::error!("worker {id}: TUN read: {e}");
-                            return;
-                        }
+                for _ in 0..ROUNDS {
+                    let (reads, _) = tun.driver.read_batch(
+                        &mut tun.scratch,
+                        tun.stride,
+                        |_, _| true,
+                        |_, _| false,
+                    );
+                    drained += reads;
+                    if reads < sys::raw::BATCH {
+                        break;
                     }
                 }
-                busy |= drained == ROUNDS * BATCH;
+                busy |= drained == ROUNDS * sys::raw::BATCH;
             }
+            // Arm the multishot read right after a fresh attach; otherwise the ring stays silent
+            // until an unrelated socket event or timer wakes the loop.
+            tun.driver.service(tun.attached, read_allowed(&connection));
+            let polled = tun.driver.read_fd() == self.tun.as_raw_fd();
+            let tun_read = if polled { libc::POLLIN } else { 0 };
+            let tun_write = if tun.driver.wants_write() {
+                libc::POLLOUT
+            } else {
+                0
+            };
             fds = [
-                pollfd(self.tun.as_raw_fd(), libc::POLLIN),
+                pollfd(self.tun.as_raw_fd(), tun_read | tun_write),
                 pollfd(-1, 0),
                 pollfd(ctrl.wake_fd().as_raw_fd(), libc::POLLIN),
+                pollfd(if polled { -1 } else { tun.driver.read_fd() }, libc::POLLIN),
             ];
             if let Some(c) = &connection {
                 fds[1] = pollfd(
@@ -198,10 +234,7 @@ impl Worker {
                     } | if c.tx.bytes() > 0 { libc::POLLOUT } else { 0 },
                 );
                 if established && !c.tx.room(self.mtu as usize) {
-                    fds[0].events = 0;
-                }
-                if c.tun_pending {
-                    fds[0].events |= libc::POLLOUT;
+                    fds[0].events &= !libc::POLLIN;
                 }
             }
             if stop.load(Ordering::Relaxed) || ctrl.is_stopped() {

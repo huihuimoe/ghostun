@@ -1,14 +1,23 @@
 use std::net::{SocketAddr, TcpStream};
-use std::os::fd::{AsFd, OwnedFd};
 use std::time::{Duration, Instant};
 use std::{fmt, io};
 
 use super::auth::{AUTH_MAX, Handshake};
-use super::frame::{self, PING, PONG, Receive};
+use super::frame::{self, FRAME_PREFIX_LEN, PING, PONG, Receive, TX_LIMIT};
 use super::queue::SendQueue;
 use super::{BATCH, ROUNDS, can_io};
 use crate::sys::{self, READ_READY, WRITE_READY};
 use crate::transport::keepalive::{self, Keepalive};
+use crate::transport::tun_driver::TunDriver;
+
+/// TUN-side state owned by a worker and lent to its current connection.
+pub struct TunIo<'a> {
+    pub driver: TunDriver<'a>,
+    /// Poll-fallback read buffer: `sys::raw::BATCH` slots of `stride` bytes.
+    pub scratch: Vec<u8>,
+    pub stride: usize,
+    pub attached: bool,
+}
 
 pub struct Connection {
     pub(super) socket: TcpStream,
@@ -110,18 +119,24 @@ impl Connection {
     #[cfg(test)]
     pub(super) fn pump(
         &mut self,
-        tun: &OwnedFd,
+        tun: &mut TunIo<'_>,
         mtu: u16,
         ping: Duration,
         dead: Duration,
     ) -> io::Result<()> {
+        // Poll-mode tests have no real readiness events, so report the TUN as always readable.
+        let tun_ready = libc::pollfd {
+            fd: -1,
+            events: 0,
+            revents: libc::POLLIN,
+        };
         self.pump_io(
             tun,
             mtu,
             Instant::now(),
             ping,
             dead,
-            &[sys::pollfd(-1, 0), sys::pollfd(-1, 0)],
+            &[tun_ready, sys::pollfd(-1, 0)],
         )
         .map(drop)
     }
@@ -129,7 +144,7 @@ impl Connection {
     #[inline]
     pub(super) fn pump_io(
         &mut self,
-        tun: &OwnedFd,
+        tun: &mut TunIo<'_>,
         mtu: u16,
         now: Instant,
         ping: Duration,
@@ -143,8 +158,8 @@ impl Connection {
                 "peer liveness timeout",
             ));
         }
-        let mut tun_r = can_io(fds[0], libc::POLLIN, READ_READY);
-        let mut tun_w = can_io(fds[0], libc::POLLOUT, WRITE_READY);
+        let mut tun_r = tun.driver.has_reads() || fds[0].revents & READ_READY != 0;
+        let mut tun_w = true;
         let mut sock_r = can_io(fds[1], libc::POLLIN, READ_READY);
         let mut sock_w = can_io(fds[1], libc::POLLOUT, WRITE_READY);
         self.flush_tx(&mut sock_w)?;
@@ -182,7 +197,7 @@ impl Connection {
                 if !tun_w {
                     break;
                 }
-                if !sys::tun::write(tun.as_fd(), self.rx.payload())? {
+                if !tun.driver.write(self.rx.payload()) {
                     tun_w = false;
                     break;
                 }
@@ -190,24 +205,35 @@ impl Connection {
                 self.tun_pending = false;
                 rx_count += 1;
             }
-            if tun_r {
-                for _ in 0..BATCH {
-                    let pushed = self.tx.push_in_place(mtu, |buf| {
-                        let Some(n) = sys::tun::read(tun.as_fd(), buf)? else {
-                            return Ok(None);
-                        };
-                        frame::validate_packet(&buf[..n], mtu)?;
-                        Ok(Some(n))
-                    })?;
-                    if !pushed {
-                        if self.tx.room(mtu) {
-                            tun_r = false;
+            if tun_r && self.tx.room(mtu) {
+                // TX_LIMIT alone bounds TCP reads: unlike udp/faketcp, completed ring reads that
+                // do not fit simply wait in the driver, so no in-flight reservation is needed.
+                let queued = self.tx.bytes();
+                let mut malformed = None;
+                let (reads, frames) = tun.driver.read_batch(
+                    &mut tun.scratch,
+                    tun.stride,
+                    |bytes, count| queued + bytes + count * FRAME_PREFIX_LEN <= TX_LIMIT,
+                    |slot, n| match frame::validate_packet(&slot[..n], mtu) {
+                        Ok(()) => true,
+                        Err(e) => {
+                            malformed = Some(e);
+                            false
                         }
-                        break;
-                    }
+                    },
+                );
+                for packet in frames {
+                    let accepted = self.tx.push(packet);
+                    debug_assert!(accepted, "read_batch room check reserves TX capacity");
                 }
+                if let Some(e) = malformed {
+                    return Err(e);
+                }
+                tun_r = reads == sys::raw::BATCH;
             }
             self.flush_tx(&mut sock_w)?;
+            tun.driver.service(tun.attached, self.tx.room(mtu));
+            tun_r |= tun.driver.has_reads();
             let rx_blocked_on_pong = self.rx.ready() && !self.tx.room(keepalive::LEN);
             let more_rx = !self.tun_pending && !rx_blocked_on_pong && (sock_r || self.rx.ready());
             let more_tx = tun_r && self.tx.room(mtu);

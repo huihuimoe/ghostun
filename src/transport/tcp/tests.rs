@@ -1,22 +1,33 @@
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::net::UnixDatagram;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::auth::{Handshake, Params};
+use super::connection::TunIo;
 use super::frame::{PING, Receive, TX_LIMIT};
 use super::listener::{Candidate, ExitState, SharedExitState};
 use super::queue::SendQueue;
 use super::*;
 use crate::config::{AuthKey, MAX_CONNS};
 use crate::transport::control::Backoff;
+use crate::transport::tun_driver::TunDriver;
 
 fn params() -> Params {
     Params {
         worker: 1,
         mtu: 1380,
+    }
+}
+/// Poll-mode driver so tests do not depend on host io_uring support.
+fn tun_io(fd: &OwnedFd) -> TunIo<'_> {
+    TunIo {
+        driver: TunDriver::poll(fd.as_fd(), 1380, 0),
+        scratch: vec![0; crate::sys::raw::BATCH * 1380],
+        stride: 1380,
+        attached: true,
     }
 }
 fn pair() -> (TcpStream, TcpStream) {
@@ -228,26 +239,10 @@ fn writes_preserve_frames_across_partial_prefixes_and_would_block() {
     tx.flush(&mut writer).unwrap();
     assert_eq!(writer.bytes.len(), 67, "one frame and half the next prefix");
     assert_eq!(tx.bytes(), total - 67);
-    for p in [packet(3), packet(4)] {
+    for p in [packet(3), packet(4), packet(5)] {
         assert!(tx.push(&p));
         packets.push(p);
     }
-    assert!(
-        tx.push_in_place(1380, |dst| {
-            let p = packet(5);
-            dst[..p.len()].copy_from_slice(&p);
-            Ok(Some(p.len()))
-        })
-        .unwrap()
-    );
-    packets.push(packet(5));
-    assert!(
-        tx.push_in_place(1380, |dst| {
-            dst[..4].copy_from_slice(&[0xff; 4]);
-            Err(invalid("bad"))
-        })
-        .is_err()
-    );
     tx.flush(&mut writer).unwrap();
     assert_eq!(tx.bytes(), 0);
     let mut input = &writer.bytes[..];
@@ -316,15 +311,9 @@ fn send_blocks_preserve_framing_under_sustained_backpressure() {
         queue.flush(&mut writer).unwrap();
         assert_eq!(writer.bytes.len(), 70001);
         for index in 200..250u8 {
-            assert!(
-                queue
-                    .push_in_place(1200, |buffer| {
-                        buffer[..1200].fill(index);
-                        Ok(Some(1200))
-                    })
-                    .unwrap()
-            );
-            expected.push(vec![index; 1200]);
+            let packet = vec![index; 1200];
+            assert!(queue.push(&packet));
+            expected.push(packet);
         }
         writer.budget = 60100;
         queue.flush(&mut writer).unwrap();
@@ -347,10 +336,6 @@ fn send_blocks_preserve_framing_under_sustained_backpressure() {
             reader.clear();
         }
         assert!(input.is_empty());
-        // Failed direct reads with changing maxima must not leave empty blocks before real data.
-        for max in [100, 2000, 65000] {
-            assert!(!queue.push_in_place(max, |_| Ok(None)).unwrap());
-        }
         assert!(queue.push(b"last"));
         let mut output = Vec::new();
         queue.flush(&mut output).unwrap();
@@ -449,13 +434,19 @@ fn authenticated_admission_and_takeover_preserve_exact_data_and_ignore_incomplet
     tun.set_nonblocking(true).unwrap();
     consumer.set_nonblocking(true).unwrap();
     let tun = OwnedFd::from(tun);
+    let mut io = tun_io(&tun);
     let p = packet(9);
     entry.tx.push(&p);
     entry.tx.flush(&mut entry.socket).unwrap();
     let mut delivered = false;
     for _ in 0..100 {
-        exit.pump(&tun, 1380, Duration::from_secs(1), Duration::from_secs(4))
-            .unwrap();
+        exit.pump(
+            &mut io,
+            1380,
+            Duration::from_secs(1),
+            Duration::from_secs(4),
+        )
+        .unwrap();
         let mut data = [0; 2048];
         if let Ok(n) = consumer.recv(&mut data) {
             assert_eq!(&data[..n], p);
@@ -496,7 +487,7 @@ fn authenticated_admission_and_takeover_preserve_exact_data_and_ignore_incomplet
 }
 
 #[test]
-fn blocked_tun_retains_one_frame_then_delivers_in_order_after_resume() {
+fn blocked_tun_queues_frames_then_delivers_in_order_after_resume() {
     let (mut sender, receiver) = pair();
     let mut c = conn(receiver, Instant::now());
     c.establish(1380);
@@ -506,31 +497,33 @@ fn blocked_tun_retains_one_frame_then_delivers_in_order_after_resume() {
     let filler = vec![99; 64];
     while tun.send(&filler).is_ok() {}
     let tun = OwnedFd::from(tun);
+    let mut io = tun_io(&tun);
     let packets = [packet(10), packet(20)];
     let mut tx = SendQueue::new(crate::transport::budget::TCP_NOTSENT as usize);
     for p in &packets {
         tx.push(p);
     }
     tx.flush(&mut sender).unwrap();
-    for _ in 0..100 {
-        c.pump(&tun, 1380, Duration::from_secs(5), Duration::from_secs(15))
-            .unwrap();
-        if c.tun_pending {
-            break;
-        }
+    for _ in 0..10 {
+        c.pump(
+            &mut io,
+            1380,
+            Duration::from_secs(5),
+            Duration::from_secs(15),
+        )
+        .unwrap();
         std::thread::sleep(Duration::from_millis(1));
     }
-    assert!(c.tun_pending);
-    assert_eq!(c.rx.payload(), packets[0]);
+    assert!(io.driver.wants_write());
+    assert!(!c.tun_pending);
     let mut buf = [0; 2048];
     while consumer.recv(&mut buf).is_ok() {}
-    c.pump(&tun, 1380, Duration::from_secs(5), Duration::from_secs(15))
-        .unwrap();
+    io.driver.flush();
     for p in &packets {
         let n = consumer.recv(&mut buf).unwrap();
         assert_eq!(&buf[..n], p);
     }
-    assert!(!c.tun_pending);
+    assert!(!io.driver.wants_write());
 }
 
 #[test]
@@ -541,10 +534,16 @@ fn eof_and_illegal_established_control_close_the_stream() {
     let (tun, _consumer) = UnixDatagram::pair().unwrap();
     tun.set_nonblocking(true).unwrap();
     let tun = OwnedFd::from(tun);
+    let mut io = tun_io(&tun);
     sender.write_all(&[0, 1, 3]).unwrap();
     for _ in 0..100 {
-        if c.pump(&tun, 1380, Duration::from_secs(5), Duration::from_secs(15))
-            .is_err()
+        if c.pump(
+            &mut io,
+            1380,
+            Duration::from_secs(5),
+            Duration::from_secs(15),
+        )
+        .is_err()
         {
             return;
         }
@@ -601,18 +600,29 @@ fn partial_bytes_do_not_refresh_end_to_end_liveness() {
     let (tun, _consumer) = UnixDatagram::pair().unwrap();
     tun.set_nonblocking(true).unwrap();
     let tun = OwnedFd::from(tun);
+    let mut io = tun_io(&tun);
     let prior = c.last_rx;
     peer.write_all(&[0, 9, PING, 0]).unwrap();
     for _ in 0..10 {
-        c.pump(&tun, 1380, Duration::from_secs(1), Duration::from_secs(4))
-            .unwrap();
+        c.pump(
+            &mut io,
+            1380,
+            Duration::from_secs(1),
+            Duration::from_secs(4),
+        )
+        .unwrap();
         assert_eq!(c.last_rx, prior);
         std::thread::sleep(Duration::from_millis(1));
     }
     peer.write_all(&[0; 7]).unwrap();
     for _ in 0..100 {
-        c.pump(&tun, 1380, Duration::from_secs(1), Duration::from_secs(4))
-            .unwrap();
+        c.pump(
+            &mut io,
+            1380,
+            Duration::from_secs(1),
+            Duration::from_secs(4),
+        )
+        .unwrap();
         if c.last_rx > prior {
             return;
         }
@@ -663,6 +673,7 @@ fn slow_tcp_receiver_backpressures_tun_at_the_transmit_bound_then_delivers_exact
         tun.set_nonblocking(true).unwrap();
         producer.set_nonblocking(true).unwrap();
         let tun = OwnedFd::from(tun);
+        let mut io = tun_io(&tun);
         let p = packet(23);
         let mut sent = 0;
         for _ in 0..1000 {
@@ -673,8 +684,13 @@ fn slow_tcp_receiver_backpressures_tun_at_the_transmit_bound_then_delivers_exact
                     break;
                 }
             }
-            c.pump(&tun, 1380, Duration::from_secs(30), Duration::from_secs(60))
-                .unwrap();
+            c.pump(
+                &mut io,
+                1380,
+                Duration::from_secs(30),
+                Duration::from_secs(60),
+            )
+            .unwrap();
             assert!(c.tx.bytes() <= TX_LIMIT);
             let mut unsent = 0i32;
             // SAFETY: SIOCOUTQNSD returns unsent bytes into a writable int for this TCP socket.
@@ -695,8 +711,13 @@ fn slow_tcp_receiver_backpressures_tun_at_the_transmit_bound_then_delivers_exact
         let mut rx = Receive::new(1380);
         let deadline = Instant::now() + Duration::from_secs(5);
         while received < sent && Instant::now() < deadline {
-            c.pump(&tun, 1380, Duration::from_secs(30), Duration::from_secs(60))
-                .unwrap();
+            c.pump(
+                &mut io,
+                1380,
+                Duration::from_secs(30),
+                Duration::from_secs(60),
+            )
+            .unwrap();
             while rx.read(&mut peer).unwrap() {
                 assert_eq!(rx.payload(), p);
                 received += 1;

@@ -59,9 +59,8 @@ impl SendQueue {
             .is_none_or(|b| b.bytes.len() - b.tail < space)
         {
             let mut block = self.free.pop().unwrap_or_default();
-            // Leave a whole queue budget before the largest contiguous direct-read reservation.
-            // A full block therefore holds at least TX_LIMIT committed bytes; at most two such
-            // blocks can be live, even when a maximum-MTU read returns a tiny packet.
+            // Leave a whole queue budget before the largest possible frame. A full block
+            // therefore holds at least TX_LIMIT committed bytes, so at most two blocks are live.
             let size = if self.established {
                 TX_LIMIT + usize::from(u16::MAX) + FRAME_PREFIX_LEN + 1
             } else {
@@ -90,27 +89,6 @@ impl SendQueue {
         block.tail += frame;
         self.bytes += frame;
         true
-    }
-
-    #[inline]
-    pub fn push_in_place<F>(&mut self, max: usize, f: F) -> io::Result<bool>
-    where
-        F: FnOnce(&mut [u8]) -> io::Result<Option<usize>>,
-    {
-        if !self.room(max) {
-            return Ok(false);
-        }
-        let block = self.tail(max + FRAME_PREFIX_LEN + 1);
-        let payload_start = block.tail + FRAME_PREFIX_LEN;
-        let Some(len) = f(&mut block.bytes[payload_start..payload_start + max + 1])? else {
-            return Ok(false);
-        };
-        assert!((1..=max).contains(&len));
-        block.bytes[block.tail..block.tail + FRAME_PREFIX_LEN]
-            .copy_from_slice(&(len as u16).to_be_bytes());
-        block.tail += FRAME_PREFIX_LEN + len;
-        self.bytes += FRAME_PREFIX_LEN + len;
-        Ok(true)
     }
 
     #[inline]
@@ -154,18 +132,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn large_mtu_tiny_reads_keep_retained_storage_bounded() {
+    fn tiny_frames_keep_retained_storage_bounded() {
         let mut queue = SendQueue::new(crate::transport::budget::TCP_NOTSENT as usize);
         queue.grow();
         for _ in 0..3 {
             let mut packets = 0;
-            while queue
-                .push_in_place(65000, |buffer| {
-                    buffer[..40].fill(7);
-                    Ok(Some(40))
-                })
-                .unwrap()
-            {
+            while queue.push(&[7; 40]) {
                 packets += 1;
             }
             assert!(packets > 1000);

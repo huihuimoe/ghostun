@@ -366,7 +366,7 @@ impl<'a> TunDriver<'a> {
         driver
     }
 
-    fn poll(fd: BorrowedFd<'a>, stride: usize, headroom: usize) -> Self {
+    pub(crate) fn poll(fd: BorrowedFd<'a>, stride: usize, headroom: usize) -> Self {
         Self {
             fd,
             fast: None,
@@ -473,24 +473,21 @@ impl<'a> TunDriver<'a> {
         result
     }
 
-    pub fn read_batch<'b, M>(
+    /// `room(bytes, count)` must report whether the caller can still accept a batch of `count`
+    /// frames totalling `bytes`; each check already includes one more worst-case slot. Callers
+    /// that must absorb every in-flight ring read add `read_budget()` themselves.
+    pub fn read_batch<'b>(
         &'b mut self,
         scratch: &'b mut [u8],
         scratch_stride: usize,
-        pending: &Pending<M>,
+        room: impl Fn(usize, usize) -> bool,
         mut encap: impl FnMut(&mut [u8], usize) -> bool,
     ) -> (usize, Batch<'b>) {
-        let (reserved_bytes, reserved_slots) = self.read_budget();
         let fast_mode = self.recovered.is_empty() && self.fast.is_some();
         let mut reads = 0;
         let mut count = 0;
         let mut bytes = 0;
-        while reads < BUFFERS
-            && pending.room_for(
-                bytes + scratch_stride + reserved_bytes,
-                count + 1 + reserved_slots,
-            )
-        {
+        while reads < BUFFERS && room(bytes + scratch_stride, count + 1) {
             let (index, len, slot) = if fast_mode {
                 let fast = self.fast.as_mut().unwrap();
                 let Some((index, len)) = fast.ready.pop_front() else {

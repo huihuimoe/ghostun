@@ -652,15 +652,23 @@ impl Worker {
                 }
                 if tun_ready && out.room(&driver, stride, 1) {
                     let mut batch_dst = None;
-                    let (reads, frames) =
-                        driver.read_batch(rx.buffers_mut(), stride, &out.pending, |slot, n| {
+                    let (reserved_bytes, reserved_slots) = driver.read_budget();
+                    let (reads, frames) = driver.read_batch(
+                        rx.buffers_mut(),
+                        stride,
+                        |bytes, count| {
+                            out.pending
+                                .room_for(bytes + reserved_bytes, count + reserved_slots)
+                        },
+                        |slot, n| {
                             if let Some((_, dst)) = session.encap(slot, n) {
                                 batch_dst = Some(dst);
                                 true
                             } else {
                                 false
                             }
-                        });
+                        },
+                    );
                     if let Some(dst) = batch_dst {
                         out.data(frames.map(|frame| (frame, dst)));
                     }

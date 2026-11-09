@@ -637,9 +637,16 @@ impl Worker {
                 }
                 if tun_ready && out.room(&driver, stride, 1) {
                     let established = session.is_established();
-                    let (reads, frames) =
-                        driver
-                            .read_batch(rx.buffers_mut(), stride, &out.pending, |_, _| established);
+                    let (reserved_bytes, reserved_slots) = driver.read_budget();
+                    let (reads, frames) = driver.read_batch(
+                        rx.buffers_mut(),
+                        stride,
+                        |bytes, count| {
+                            out.pending
+                                .room_for(bytes + reserved_bytes, count + reserved_slots)
+                        },
+                        |_, _| established,
+                    );
                     if frames.len() > 0 {
                         out.data(&mut sender, frames);
                     }
