@@ -49,7 +49,7 @@ pub mod ipv4 {
         ip.checksum.set(0);
         ip.src = src.octets();
         ip.dst = dst.octets();
-        let csum = super::fold(super::sum16(ip.as_bytes(), 0));
+        let csum = super::fold(super::sum16(ip.as_bytes()));
         ip.checksum.set(csum);
     }
 }
@@ -241,62 +241,61 @@ pub fn is_valid_inner_ip(p: &[u8], mtu: usize) -> bool {
     }
 }
 
-/// Adds the big-endian one's-complement sum of `data` to `acc`.
+/// Native-byte-order one's-complement sum of `data` before folding to 16 bits.
 ///
-/// Words are summed in native byte order and the folded result is swapped once
+/// Words are summed in native byte order and [`fold`] swaps the folded result once
 /// (RFC 1071 §2(B)): per-word big-endian loads cost ~9 shuffles per 16 bytes on
 /// baseline SSE2, which has no `pshufb`, dominating the vectorized loop.
 #[inline]
-fn sum16(data: &[u8], acc: u32) -> u32 {
+fn sum16(data: &[u8]) -> u64 {
     let mut sum = 0u64;
-    let (chunks, tail) = data.as_chunks::<8>();
+    let (chunks, mut tail) = data.as_chunks::<8>();
     for &chunk in chunks {
         let w = u64::from_ne_bytes(chunk);
         sum += (w >> 32) + (w & 0xffff_ffff);
     }
-    let (pairs, rest) = tail.as_chunks::<2>();
-    for &pair in pairs {
-        sum += u64::from(u16::from_ne_bytes(pair));
+    if let Some((&w, rest)) = tail.split_first_chunk::<4>() {
+        sum += u64::from(u32::from_ne_bytes(w));
+        tail = rest;
     }
-    if let [last] = rest {
-        sum += u64::from(u16::from_ne_bytes([*last, 0]));
+    if let Some((&w, rest)) = tail.split_first_chunk::<2>() {
+        sum += u64::from(u16::from_ne_bytes(w));
+        tail = rest;
     }
+    if let [last] = *tail {
+        sum += u64::from(u16::from_ne_bytes([last, 0]));
+    }
+    sum
+}
+
+#[inline]
+fn fold(sum: u64) -> u16 {
     let mut s = (sum >> 32) + (sum & 0xffff_ffff);
     // Three 16-bit folds: two can still leave a carry in bit 16, which the byte swap would drop.
     s = (s >> 16) + (s & 0xffff);
     s = (s >> 16) + (s & 0xffff);
     s = (s >> 16) + (s & 0xffff);
-    acc + u32::from(u16::from_be(s as u16))
-}
-
-#[inline]
-fn fold(mut acc: u32) -> u16 {
-    acc = (acc & 0xffff) + (acc >> 16);
-    acc = (acc & 0xffff) + (acc >> 16);
-    !(acc as u16)
-}
-
-#[inline]
-fn tcp_pseudo_sum(frame: &[u8], ihl: usize, tcp_len: usize) -> u32 {
-    let addresses = if frame[0] >> 4 == ipv4::VERSION {
-        &frame[ipv4::OFF_SRC..ipv4::OFF_DST + 4]
-    } else {
-        &frame[ipv6::OFF_SRC..ipv6::OFF_DST + 16]
-    };
-    let acc = sum16(addresses, 0) + u32::from(libc::IPPROTO_TCP as u16) + tcp_len as u32;
-    sum16(&frame[ihl..ihl + tcp_len], acc)
+    !u16::from_be(s as u16)
 }
 
 /// Checksum of the TCP segment at `frame[ihl..ihl + tcp_len]`, including the IP pseudo-header.
 #[inline]
 pub fn tcp_checksum(frame: &[u8], ihl: usize, tcp_len: usize) -> u16 {
-    fold(tcp_pseudo_sum(frame, ihl, tcp_len))
+    let addr_sum = if frame[0] >> 4 == ipv4::VERSION {
+        sum16(&frame[ipv4::OFF_SRC..ipv4::OFF_DST + 4])
+    } else {
+        sum16(&frame[ipv6::OFF_SRC..ipv6::OFF_DST + 16])
+    };
+    let pseudo = addr_sum
+        + u64::from((libc::IPPROTO_TCP as u16).to_be())
+        + u64::from((tcp_len as u16).to_be());
+    fold(pseudo + sum16(&frame[ihl..ihl + tcp_len]))
 }
 
 #[cfg(test)]
 pub fn ipv4_header_checksum_ok(frame: &[u8]) -> bool {
     let ihl = usize::from(frame[0] & 0x0f) * 4;
-    fold(sum16(&frame[..ihl], 0)) == 0
+    fold(sum16(&frame[..ihl])) == 0
 }
 
 #[cfg(test)]
@@ -341,7 +340,7 @@ mod tests {
                 for offset in 0..3 {
                     let d = &data[offset..offset + len];
                     assert_eq!(
-                        fold(sum16(d, 0x1_fffe)),
+                        fold(sum16(d) + u64::from(0x1_fffeu32.to_be())),
                         reference(d, 0x1_fffe),
                         "len {len} +{offset}"
                     );
