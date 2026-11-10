@@ -2,9 +2,8 @@
 use std::io;
 use std::mem::{self, size_of};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 
-pub const PROVIDE_BUFFERS: u8 = 31;
 pub const READ_MULTISHOT: u8 = 49;
 pub const WRITE: u8 = 23;
 pub const BUFFER_SELECT: u8 = 1 << 5;
@@ -67,13 +66,21 @@ struct Mapping {
 
 impl Mapping {
     fn new(fd: RawFd, len: usize, offset: libc::off_t) -> io::Result<Self> {
-        // SAFETY: the ring fd and kernel-returned size describe the requested shared mapping.
+        Self::map(libc::MAP_SHARED, fd, len, offset)
+    }
+
+    fn anonymous(len: usize) -> io::Result<Self> {
+        Self::map(libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, len, 0)
+    }
+
+    fn map(flags: libc::c_int, fd: RawFd, len: usize, offset: libc::off_t) -> io::Result<Self> {
+        // SAFETY: a null hint lets the kernel place a fresh mapping; it aliases no Rust memory.
         let ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
                 len,
                 libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
+                flags,
                 fd,
                 offset,
             )
@@ -101,6 +108,45 @@ impl Drop for Mapping {
         unsafe {
             libc::munmap(self.ptr.cast(), self.len);
         }
+    }
+}
+
+const BUF_ENTRY: usize = 16;
+/// The shared tail occupies the last two bytes of entry 0 (`io_uring_buf_ring`).
+const BUF_TAIL: usize = 14;
+
+/// Provided-buffer ring (`IORING_REGISTER_PBUF_RING`). Returning a buffer is a userspace
+/// store; it needs no SQE and each entry carries its own address and length.
+pub struct BufRing {
+    map: Mapping,
+    mask: u16,
+    tail: u16,
+}
+
+impl BufRing {
+    /// Queues one buffer; the kernel sees it after `publish`.
+    ///
+    /// # Safety
+    /// `addr..addr + len` must stay kernel-writable until a CQE returns `id` or the ring stops,
+    /// and no more buffers than the ring has entries may be outstanding.
+    pub unsafe fn push(&mut self, addr: *mut u8, len: u32, id: u16) {
+        // SAFETY: the masked index is inside the mapping. Field-wise writes leave BUF_TAIL alone.
+        unsafe {
+            let entry = self
+                .map
+                .ptr
+                .add(usize::from(self.tail & self.mask) * BUF_ENTRY);
+            entry.cast::<u64>().write(addr as u64);
+            entry.add(8).cast::<u32>().write(len);
+            entry.add(12).cast::<u16>().write(id);
+        }
+        self.tail = self.tail.wrapping_add(1);
+    }
+
+    pub fn publish(&mut self) {
+        // SAFETY: the page-aligned mapping holds the kernel UAPI tail counter at BUF_TAIL.
+        let tail = unsafe { &*self.map.ptr.add(BUF_TAIL).cast::<AtomicU16>() };
+        tail.store(self.tail, Ordering::Release);
     }
 }
 
@@ -177,7 +223,7 @@ impl Ring {
         if result < 0 {
             return Err(io::Error::last_os_error());
         }
-        for code in [PROVIDE_BUFFERS, READ_MULTISHOT, WRITE] {
+        for code in [READ_MULTISHOT, WRITE] {
             if !probe.ops[..usize::from(probe.header[1])]
                 .iter()
                 .any(|op| op.code == code && op.flags & 1 != 0)
@@ -193,6 +239,42 @@ impl Ring {
 
     pub fn fd(&self) -> RawFd {
         self.fd.as_raw_fd()
+    }
+
+    /// Registers an empty buffer ring for `group` with room for at least `buffers` entries.
+    pub fn buf_ring(&self, group: u16, buffers: usize) -> io::Result<BufRing> {
+        #[repr(C)]
+        struct Registration {
+            addr: u64,
+            entries: u32,
+            group: u16,
+            flags: u16,
+            reserved: [u64; 3],
+        }
+        let entries = buffers.next_power_of_two();
+        let mask = u16::try_from(entries - 1).map_err(|_| io::ErrorKind::InvalidInput)?;
+        let map = Mapping::anonymous(entries * BUF_ENTRY)?;
+        let registration = Registration {
+            addr: map.ptr as u64,
+            entries: entries as u32,
+            group,
+            flags: 0,
+            reserved: [0; 3],
+        };
+        // SAFETY: registration matches io_uring_buf_reg; the kernel pins the mapped ring pages.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_io_uring_register,
+                self.fd.as_raw_fd(),
+                22u32,
+                &registration,
+                1u32,
+            )
+        };
+        if result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(BufRing { map, mask, tail: 0 })
     }
 
     /// # Safety

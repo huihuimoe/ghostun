@@ -13,7 +13,6 @@ use crate::sys::uring::{self, Cqe, Ring, Sqe};
 const BUFFERS: usize = sys::raw::BATCH;
 const GROUP: u16 = 1;
 const READ: u64 = 1;
-const PROVIDE: u64 = 2;
 const CANCEL: u64 = 3;
 const WRITE_BASE: u64 = 256;
 
@@ -56,10 +55,11 @@ impl ExactSizeIterator for Batch<'_> {}
 
 struct Fast {
     ring: Ring,
+    pool: uring::BufRing,
     buffers: Box<[UnsafeCell<u8>]>,
     slots: usize,
     ready: VecDeque<(usize, usize)>,
-    recycle: Vec<(usize, usize)>,
+    recycle: Vec<usize>,
     completions: Vec<Cqe>,
     reading: bool,
     writes: usize,
@@ -111,12 +111,15 @@ impl Fast {
     fn new(stride: usize, headroom: usize) -> io::Result<Self> {
         available()?;
         let slots = BUFFERS.min(BYTE_LIMIT / 2 / stride).max(1);
+        let ring = Ring::new()?;
+        let pool = ring.buf_ring(GROUP, slots)?;
         let mut fast = Self {
-            ring: Ring::new()?,
+            ring,
+            pool,
             buffers: (0..slots * stride).map(|_| UnsafeCell::new(0)).collect(),
             slots,
             ready: VecDeque::with_capacity(BUFFERS),
-            recycle: Vec::with_capacity(4),
+            recycle: (0..slots).collect(),
             completions: Vec::with_capacity(512),
             reading: false,
             writes: 0,
@@ -124,50 +127,27 @@ impl Fast {
             blocked: false,
             canceling: false,
         };
-        fast.provide(0, slots, stride, headroom)?;
-        fast.ring.submit()?;
+        fast.release(stride, headroom);
         Ok(fast)
     }
 
-    fn recycle(&mut self, index: usize) {
-        if let Some((start, count)) = self.recycle.last_mut()
-            && *start + *count == index
-        {
-            *count += 1;
-        } else {
-            self.recycle.push((index, 1));
-        }
-    }
-
-    fn provide(
-        &mut self,
-        index: usize,
-        count: usize,
-        stride: usize,
-        headroom: usize,
-    ) -> io::Result<()> {
-        // When headroom > 0, each slot's kernel buffer is shorter than `stride`, so register
-        // slots individually to prevent `PROVIDE_BUFFERS` from stepping by `stride - headroom`
-        // or overlapping the next slot's headroom.
-        let step = if headroom == 0 { count } else { 1 };
-        for slot in (index..index + count).step_by(step) {
-            // SAFETY: the UnsafeCell pool stays allocated until cancellation completes; each
-            // `[slot * stride + headroom .. (slot + 1) * stride]` range is disjoint from every
-            // other slot and from its own `[slot * stride .. slot * stride + headroom]` prefix.
+    /// Returns recycled slots to the kernel. Each buffer starts after the slot's headroom.
+    fn release(&mut self, stride: usize, headroom: usize) {
+        for &slot in &self.recycle {
+            // SAFETY: the UnsafeCell pool stays allocated until cancellation completes; a slot
+            // is recycled only after its read CQE, so each of the `slots` buffers is queued at
+            // most once and `[slot * stride + headroom .. (slot + 1) * stride]` is disjoint
+            // from every other slot.
             unsafe {
-                self.ring.push(Sqe {
-                    opcode: uring::PROVIDE_BUFFERS,
-                    fd: step as i32,
-                    addr: self.buffers[slot * stride + headroom].get() as u64,
-                    len: (stride - headroom) as u32,
-                    off: slot as u64,
-                    buf_group: GROUP,
-                    user_data: PROVIDE,
-                    ..Sqe::default()
-                })?;
+                self.pool.push(
+                    self.buffers[slot * stride + headroom].get(),
+                    (stride - headroom) as u32,
+                    slot as u16,
+                );
             }
         }
-        Ok(())
+        self.pool.publish();
+        self.recycle.clear();
     }
 
     fn collect(
@@ -195,9 +175,6 @@ impl Fast {
                     {
                         incompatible = Some(io::Error::from_raw_os_error(-cqe.result));
                     }
-                }
-                PROVIDE if cqe.result < 0 && !(stopping && cqe.result == -libc::ECANCELED) => {
-                    incompatible = Some(io::Error::from_raw_os_error(-cqe.result));
                 }
                 CANCEL => self.canceling = false,
                 tag if (WRITE_BASE..WRITE_BASE + self.writes as u64).contains(&tag) => {
@@ -271,11 +248,7 @@ impl Fast {
     ) -> io::Result<()> {
         let max_len = stride - headroom;
         self.collect(pending, max_len, false)?;
-        for index in 0..self.recycle.len() {
-            let (start, count) = self.recycle[index];
-            self.provide(start, count, stride, headroom)?;
-        }
-        self.recycle.clear();
+        self.release(stride, headroom);
         if !read_allowed && self.reading && !self.canceling {
             // SAFETY: cancellation references only the stable READ request tag.
             unsafe {
@@ -454,7 +427,7 @@ impl<'a> TunDriver<'a> {
             return Ok(None);
         };
         let result = if len <= output.len() {
-            // SAFETY: this CQE-owned slot is not returned to the kernel until drive flushes recycle.
+            // SAFETY: this CQE-owned slot is not returned to the kernel until drive releases it.
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     fast.buffers[index * self.stride + self.headroom].get(),
@@ -469,7 +442,7 @@ impl<'a> TunDriver<'a> {
                 "oversized TUN packet",
             ))
         };
-        fast.recycle(index);
+        fast.recycle.push(index);
         result
     }
 
@@ -493,9 +466,9 @@ impl<'a> TunDriver<'a> {
                 let Some((index, len)) = fast.ready.pop_front() else {
                     break;
                 };
-                fast.recycle(index);
+                fast.recycle.push(index);
                 // SAFETY: this CQE-owned slot is not returned to the kernel until `Fast::drive`
-                // flushes `fast.recycle`, so userspace has exclusive access to its headroom + data.
+                // releases `fast.recycle`, so userspace has exclusive access to its headroom + data.
                 let slot = unsafe {
                     std::slice::from_raw_parts_mut(
                         fast.buffers[index * self.stride].get(),
