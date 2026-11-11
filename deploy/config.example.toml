@@ -8,7 +8,7 @@
 mode = "entry"
 
 # Required shared key (64 hex characters). Generate once and copy to both peers:
-#   od -An -N32 -tx1 /dev/urandom | tr -d ' \n'
+#   ghostun genkey
 # auth_key = "<64 hexadecimal characters>"
 
 # Outer transport; both peers must use the same value.

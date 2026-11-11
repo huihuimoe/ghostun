@@ -45,11 +45,7 @@ images are available at `ghcr.io/huihuimoe/ghostun:latest`.
 
 ```sh
 umask 077
-{
-    printf '[global]\nauth_key = "'
-    od -An -N32 -tx1 /dev/urandom | tr -d ' \n'
-    printf '"\n'
-} > auth.toml
+printf '[global]\nauth_key = "%s"\n' "$(ghostun genkey)" > auth.toml
 ```
 
 2. Start Exit and Entry (`--conns` is set on Entry; Exit spawns workers per connection):
@@ -120,10 +116,12 @@ exponential backoff.
 
 ```text
 ghostun [options] [entry|exit]
+ghostun genkey
 ```
 
 | Flag | Default | Description |
 |---|---|---|
+| `genkey` | — | Print a random 64-character lowercase hexadecimal `auth_key` and exit |
 | `--transport faketcp\|tcp\|udp` | `faketcp` | One outer transport per instance (`udp` is for unrestricted networks only); restart to change |
 | `--tcp-notsent KIB` | `64` | TCP unsent low watermark and write batch limit in KiB; restart to change |
 | `--config PATH` | — | TOML configuration file (required for `auth_key`) |

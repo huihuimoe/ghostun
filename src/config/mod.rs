@@ -1,7 +1,7 @@
 //! CLI flags + TOML file merged into a validated runtime configuration (CLI > TOML > defaults).
 
 use std::ffi::OsString;
-use std::fmt;
+use std::fmt::{self, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -17,11 +17,18 @@ use crate::net::{Cidr, OuterFamily, ipv4, ipv6};
 /// this also bounds Exit's per-worker slot/replay tables and TCP candidate pool.
 pub const MAX_CONNS: usize = 255;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, FromArgValue)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
     Entry,
     Exit,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, FromArgValue)]
+enum Command {
+    Entry,
+    Exit,
+    Genkey,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, FromArgValue)]
@@ -283,9 +290,9 @@ struct Cli {
     /// TCP unsent low watermark and write batch in KiB; restart to change [default: 64]
     #[argh(option, arg_name = "KIB")]
     tcp_notsent: Option<u32>,
-    /// node role: entry or exit
+    /// node role (entry or exit) or genkey to print a random auth_key
     #[argh(positional)]
-    role: Option<Mode>,
+    role: Option<Command>,
     /// exit node outer address (entry only)
     #[argh(option, arg_name = "IP:PORT")]
     remote: Option<SocketAddr>,
@@ -424,11 +431,33 @@ where
             std::process::exit(1);
         }
     });
+    if cli.role == Some(Command::Genkey) {
+        if cli
+            != (Cli {
+                role: Some(Command::Genkey),
+                ..Cli::default()
+            })
+        {
+            return Err("`genkey` does not accept any options".into());
+        }
+        println!("{}", genkey()?);
+        std::process::exit(0);
+    }
     if cli.version {
         println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
         std::process::exit(0);
     }
     build_config(cli, None)
+}
+
+fn genkey() -> Result<String, String> {
+    let mut bytes = [0u8; 32];
+    crate::platform::random(&mut bytes).map_err(|e| e.to_string())?;
+    let mut out = String::with_capacity(64);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    Ok(out)
 }
 
 fn build_config(cli: Cli, running_conns: Option<u16>) -> Result<Config, String> {
@@ -443,11 +472,15 @@ fn build_config(cli: Cli, running_conns: Option<u16>) -> Result<Config, String> 
         None => File::default(),
     };
     let global = file.global;
-    let mode = cli
-        .role
+    let cli_mode = match cli.role {
+        Some(Command::Entry) => Some(Mode::Entry),
+        Some(Command::Exit) => Some(Mode::Exit),
+        Some(Command::Genkey) | None => None,
+    };
+    let mode = cli_mode
         .or(global.mode)
         .ok_or("missing role: use `entry`/`exit` or set `global.mode` in the config file")?;
-    if cli.role.is_some() && global.mode.is_some_and(|m| m != mode) {
+    if cli_mode.is_some() && global.mode.is_some_and(|m| m != mode) {
         return Err(format!(
             "role {mode:?} conflicts with `global.mode` in the config file"
         ));

@@ -114,6 +114,28 @@ fn both_roles_require_an_auth_key() {
 }
 
 #[test]
+fn genkey_produces_valid_key_and_rejects_options() {
+    let (k1, k2) = (genkey().unwrap(), genkey().unwrap());
+    assert_ne!(
+        k1.parse::<AuthKey>().unwrap(),
+        k2.parse::<AuthKey>().unwrap()
+    );
+    assert!(k1.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')));
+    for args in [
+        &["ghostun", "genkey", "--no-ipv6"][..],
+        &["ghostun", "genkey", "-V"],
+        &["ghostun", "--config", "auth.toml", "genkey"],
+    ] {
+        assert!(
+            parse_from(args.iter().copied())
+                .unwrap_err()
+                .contains("genkey")
+        );
+    }
+    assert!(with_file("toml-genkey", "mode = 'genkey'", &[]).is_err());
+}
+
+#[test]
 fn key_validation_never_discloses_secret_material() {
     let key = "a7B9".repeat(16);
     for role in [
