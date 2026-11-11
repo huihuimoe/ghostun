@@ -8,6 +8,8 @@ use argh::FromArgValue;
 use serde::Deserialize;
 use zerocopy::FromBytes;
 
+const IPPROTO_TCP: u8 = 6;
+
 pub mod ipv4 {
     use std::mem;
     use std::net::Ipv4Addr;
@@ -45,7 +47,7 @@ pub mod ipv4 {
         ip.id.set(id);
         ip.flags_frag.set(0x4000); // DF
         ip.ttl = 64;
-        ip.protocol = libc::IPPROTO_TCP as u8;
+        ip.protocol = super::IPPROTO_TCP;
         ip.checksum.set(0);
         ip.src = src.octets();
         ip.dst = dst.octets();
@@ -84,7 +86,7 @@ pub mod ipv6 {
         let (ip, _) = Header::mut_from_prefix(buf).expect("IPv6 header buffer");
         ip.version_tc_flow.set(u32::from(VERSION) << 28);
         ip.payload_len.set(payload_len);
-        ip.next_header = libc::IPPROTO_TCP as u8;
+        ip.next_header = super::IPPROTO_TCP;
         ip.hop_limit = 64;
         ip.src = src.octets();
         ip.dst = dst.octets();
@@ -286,9 +288,8 @@ pub fn tcp_checksum(frame: &[u8], ihl: usize, tcp_len: usize) -> u16 {
     } else {
         sum16(&frame[ipv6::OFF_SRC..ipv6::OFF_DST + 16])
     };
-    let pseudo = addr_sum
-        + u64::from((libc::IPPROTO_TCP as u16).to_be())
-        + u64::from((tcp_len as u16).to_be());
+    let pseudo =
+        addr_sum + u64::from(u16::from(IPPROTO_TCP).to_be()) + u64::from((tcp_len as u16).to_be());
     fold(pseudo + sum16(&frame[ihl..ihl + tcp_len]))
 }
 

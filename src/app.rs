@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 
 use crate::config::{Config, Mode};
+#[cfg(target_os = "linux")]
 use crate::netfilter;
 use crate::platform::{self, route};
 use crate::transport::{self, EntryRoute, Outer, budget};
@@ -125,6 +126,11 @@ pub fn run(mut cfg: Config) -> Result<(), String> {
         cfg.tun_name,
     );
     // Rules go in before sockets exist so the kernel never RSTs our first handshake.
+    #[cfg(not(target_os = "linux"))]
+    if cfg.netfilter {
+        return Err("netfilter rules are only supported on Linux".into());
+    }
+    #[cfg(target_os = "linux")]
     let guard = if cfg.netfilter {
         let spec = netfilter::NftSpec::from_config(&cfg, listen_port);
         Some(netfilter::install(&spec).map_err(|e| format!("netfilter: {e}"))?)
@@ -159,6 +165,7 @@ pub fn run(mut cfg: Config) -> Result<(), String> {
     stop.store(true, Ordering::Relaxed);
     running.join();
     log::info!("shutting down");
+    #[cfg(target_os = "linux")]
     if let Some(guard) = guard {
         guard
             .remove()

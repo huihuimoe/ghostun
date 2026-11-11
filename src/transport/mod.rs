@@ -3,6 +3,7 @@
 mod auth;
 pub mod budget;
 mod control;
+#[cfg(target_os = "linux")]
 mod faketcp;
 mod keepalive;
 pub mod queue;
@@ -48,6 +49,7 @@ pub struct Outer {
 }
 
 enum Start {
+    #[cfg(target_os = "linux")]
     Fake(Box<faketcp::Worker>),
     Tcp(Box<tcp::Worker>),
     Udp(Box<udp::Worker>),
@@ -56,6 +58,7 @@ enum Start {
 impl Start {
     fn run(self, stop: &AtomicBool, ctrl: &Control) {
         match self {
+            #[cfg(target_os = "linux")]
             Self::Fake(worker) => worker.run(stop, ctrl),
             Self::Tcp(worker) => worker.run(stop, ctrl),
             Self::Udp(worker) => worker.run(stop, ctrl),
@@ -64,6 +67,7 @@ impl Start {
 }
 
 enum ExitDispatcher {
+    #[cfg(target_os = "linux")]
     Fake(faketcp::SharedExitState),
     Tcp(tcp::SharedExitState),
     Udp(udp::SharedExitState),
@@ -72,6 +76,7 @@ enum ExitDispatcher {
 impl ExitDispatcher {
     fn reload(&self, tunables: &Tunables, key_changed: bool) {
         match self {
+            #[cfg(target_os = "linux")]
             Self::Fake(state) => state
                 .lock()
                 .unwrap()
@@ -196,6 +201,11 @@ pub fn start(
                         tun_mtu as u16,
                         tun,
                     ))),
+                    #[cfg(not(target_os = "linux"))]
+                    Transport::Faketcp => {
+                        return Err("the faketcp transport is only supported on Linux".into());
+                    }
+                    #[cfg(target_os = "linux")]
                     Transport::Faketcp => Start::Fake(Box::new(faketcp::Worker::new_entry(
                         i, cfg, route, outer.mtu, tun, seed,
                     )?)),
@@ -250,6 +260,11 @@ pub fn start(
                     .expect("spawning TCP accept thread");
                 (ExitDispatcher::Tcp(state), wake, thread)
             }
+            #[cfg(not(target_os = "linux"))]
+            Transport::Faketcp => {
+                return Err("the faketcp transport is only supported on Linux".into());
+            }
+            #[cfg(target_os = "linux")]
             Transport::Faketcp => {
                 let listener = faketcp::Listener::bind(cfg, outer.mtu, seed, main_wake.clone())?;
                 let wake = listener.waker();
@@ -441,6 +456,7 @@ impl Exit {
                     });
                 }
             }
+            #[cfg(target_os = "linux")]
             ExitDispatcher::Fake(state) => {
                 let state = Arc::clone(state);
                 loop {

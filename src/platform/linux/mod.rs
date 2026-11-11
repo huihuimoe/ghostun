@@ -27,6 +27,8 @@ const WRITE_READY: i16 = libc::POLLOUT | libc::POLLERR | libc::POLLHUP;
 
 /// Packets moved per batched socket or TUN system call.
 pub const BATCH: usize = 64;
+/// Exclusive upper bound on a configurable CPU ID.
+pub const MAX_CPUS: usize = libc::CPU_SETSIZE as usize;
 const SOCKET_BUF: libc::c_int = 4 << 20;
 type CmsgBuf = [usize; 8];
 
@@ -85,11 +87,6 @@ fn cvt(ret: libc::c_int) -> io::Result<libc::c_int> {
     } else {
         Ok(ret)
     }
-}
-
-#[inline]
-pub fn random(bytes: &mut [u8]) -> io::Result<()> {
-    getrandom::fill(bytes).map_err(|_| io::Error::other("OS cryptographic randomness unavailable"))
 }
 
 /// Cross-thread wakeup that a poll loop can wait on.

@@ -653,7 +653,7 @@ fn parse_cpus(spec: &str) -> Result<Vec<usize>, String> {
             let end: usize = b
                 .parse()
                 .map_err(|_| format!("invalid CPU range {part:?} in {spec:?}"))?;
-            if start > end || end >= libc::CPU_SETSIZE as usize {
+            if start > end || end >= crate::platform::MAX_CPUS {
                 return Err(format!("invalid CPU range {part:?} in {spec:?}"));
             }
             out.extend(start..=end);
@@ -661,7 +661,7 @@ fn parse_cpus(spec: &str) -> Result<Vec<usize>, String> {
             let cpu: usize = part
                 .parse()
                 .map_err(|_| format!("invalid CPU ID {part:?} in {spec:?}"))?;
-            if cpu >= libc::CPU_SETSIZE as usize {
+            if cpu >= crate::platform::MAX_CPUS {
                 return Err(format!("invalid CPU ID {part:?} in {spec:?}"));
             }
             out.push(cpu);
