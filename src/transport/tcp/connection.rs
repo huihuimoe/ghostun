@@ -13,7 +13,7 @@ use crate::transport::tun_driver::TunDriver;
 /// TUN-side state owned by a worker and lent to its current connection.
 pub struct TunIo<'a> {
     pub driver: TunDriver<'a>,
-    /// Poll-fallback read buffer: `platform::raw::BATCH` slots of `stride` bytes.
+    /// Poll-fallback read buffer: `platform::BATCH` slots of `stride` bytes.
     pub scratch: Vec<u8>,
     pub stride: usize,
     pub attached: bool,
@@ -229,7 +229,7 @@ impl Connection {
                 if let Some(e) = malformed {
                     return Err(e);
                 }
-                tun_r = reads == platform::raw::BATCH;
+                tun_r = reads == platform::BATCH;
             }
             self.flush_tx(&mut sock_w)?;
             tun.driver.service(tun.attached, self.tx.room(mtu));

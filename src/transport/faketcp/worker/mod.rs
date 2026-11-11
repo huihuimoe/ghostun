@@ -58,7 +58,7 @@ impl RawSink<'_> {
             .pending
             .packets
             .iter()
-            .take(raw::BATCH)
+            .take(platform::BATCH)
             .take_while(|p| OuterFamily::of(p.metadata) == family)
             .count();
         let frames = self
@@ -391,7 +391,7 @@ impl Listener {
                             }
                         }
                     }
-                    if m < raw::BATCH {
+                    if m < platform::BATCH {
                         break;
                     }
                 }
@@ -643,7 +643,7 @@ impl Worker {
                                     );
                                 }
                             }
-                            m == raw::BATCH
+                            m == platform::BATCH
                         }
                         Err(e) => {
                             if e.kind() != io::ErrorKind::WouldBlock {
@@ -675,7 +675,7 @@ impl Worker {
                     if let Some(dst) = batch_dst {
                         out.data(frames.map(|frame| (frame, dst)));
                     }
-                    tun_ready = reads == raw::BATCH && out.room(&driver, stride, 1);
+                    tun_ready = reads == platform::BATCH && out.room(&driver, stride, 1);
                 } else {
                     tun_ready = false;
                 }

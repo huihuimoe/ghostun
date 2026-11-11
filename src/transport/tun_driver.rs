@@ -10,7 +10,7 @@ use super::queue::{BYTE_LIMIT, Pending};
 use crate::platform;
 use crate::platform::uring::{self, Cqe, Ring, Sqe};
 
-const BUFFERS: usize = platform::raw::BATCH;
+const BUFFERS: usize = platform::BATCH;
 const GROUP: u16 = 1;
 const READ: u64 = 1;
 const CANCEL: u64 = 3;

@@ -8,14 +8,13 @@ use std::ptr::read_unaligned;
 
 use libc::in6_pktinfo;
 
-use super::{SockAddr, bind_to_device, cvt, setsockopt};
+use super::{
+    BATCH, CmsgBuf, SockAddr, bind_to_device, cvt, send_progress, set_socket_buffers, setsockopt,
+};
 use crate::net::{OuterFamily, ipv6};
 
 /// fwmark on every frame ghostun sends, so the netfilter RST-suppression rule spares our own RSTs.
 pub const SOCKET_MARK: u32 = 0x6768_7374;
-const SOCKET_BUF: libc::c_int = 4 << 20;
-pub const BATCH: usize = 64;
-type CmsgBuf = [usize; 8];
 
 /// Non-blocking raw TCP socket with caller-supplied IP headers and per-worker cBPF steering.
 pub fn socket(
@@ -71,14 +70,7 @@ pub fn socket(
         }
     }
     setsockopt(&fd, libc::SOL_SOCKET, libc::SO_MARK, &SOCKET_MARK)?;
-    for (force, plain) in [
-        (libc::SO_RCVBUFFORCE, libc::SO_RCVBUF),
-        (libc::SO_SNDBUFFORCE, libc::SO_SNDBUF),
-    ] {
-        if setsockopt(&fd, libc::SOL_SOCKET, force, &SOCKET_BUF).is_err() {
-            setsockopt(&fd, libc::SOL_SOCKET, plain, &SOCKET_BUF)?;
-        }
-    }
+    set_socket_buffers(&fd)?;
     let prog = libc::sock_fprog {
         len: filter.len() as libc::c_ushort,
         filter: filter.as_ptr().cast_mut(),
@@ -136,7 +128,7 @@ impl Sender {
             self.hdrs[k].msg_hdr.msg_name = addr.cast_mut().cast();
             self.hdrs[k].msg_hdr.msg_namelen = len;
         }
-        send_progress(count, |sent| {
+        send_progress("raw", count, |sent| {
             // SAFETY: active descriptors point into live frames, destinations and boxed iovecs.
             let n = unsafe {
                 libc::sendmmsg(
@@ -153,24 +145,6 @@ impl Sender {
             }
         })
     }
-}
-
-/// Counts the completed prefix, including explicitly dropped non-retryable packets.
-fn send_progress(count: usize, mut send: impl FnMut(usize) -> io::Result<usize>) -> usize {
-    let mut completed = 0;
-    while completed < count {
-        match send(completed) {
-            Ok(0) => break,
-            Ok(n) => completed += n,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-            Err(e) => {
-                log::debug!("raw send: {e}; dropping packet");
-                completed += 1;
-            }
-        }
-    }
-    completed
 }
 
 #[inline]
@@ -342,7 +316,7 @@ mod tests {
         .into_iter();
         let mut positions = Vec::new();
         assert_eq!(
-            send_progress(5, |offset| {
+            send_progress("raw", 5, |offset| {
                 positions.push(offset);
                 results.next().unwrap()
             }),
@@ -352,7 +326,7 @@ mod tests {
         let mut results = [Err(io::Error::from_raw_os_error(libc::EMSGSIZE)), Ok(2)].into_iter();
         let mut positions = Vec::new();
         assert_eq!(
-            send_progress(3, |offset| {
+            send_progress("raw", 3, |offset| {
                 positions.push(offset);
                 results.next().unwrap()
             }),

@@ -11,6 +11,8 @@ use netlink_packet_netfilter::{NetfilterHeader, NetfilterMessage, NetfilterProto
 use netlink_sys::protocols::NETLINK_NETFILTER;
 use netlink_sys::{Socket, SocketAddr};
 
+use crate::platform::{invalid, retry_interrupted};
+
 pub(super) struct Batch {
     messages: Vec<NetlinkMessage<NetfilterMessage>>,
 }
@@ -102,19 +104,6 @@ fn control(message: ControlMessage) -> NetlinkMessage<NetfilterMessage> {
     );
     packet.header.flags = NLM_F_REQUEST;
     packet
-}
-
-fn invalid(message: &'static str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, message)
-}
-
-fn retry_interrupted<T>(mut operation: impl FnMut() -> io::Result<T>) -> io::Result<T> {
-    loop {
-        match operation() {
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            result => return result,
-        }
-    }
 }
 
 fn acknowledgements(mut bytes: &[u8], port: u32, pending: &mut [bool]) -> io::Result<usize> {

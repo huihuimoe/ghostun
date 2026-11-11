@@ -63,7 +63,7 @@ impl UdpSink {
         if self.pending.packets.is_empty() {
             return;
         }
-        let count = self.pending.packets.len().min(udp::BATCH);
+        let count = self.pending.packets.len().min(platform::BATCH);
         let frames = self
             .pending
             .packets
@@ -284,7 +284,7 @@ impl Listener {
                 if fds[index + 1].revents & libc::POLLIN == 0 {
                     continue;
                 }
-                for _ in 0..ROUNDS * udp::BATCH {
+                for _ in 0..ROUNDS * platform::BATCH {
                     let (n, local, peer) =
                         match udp::recv_unconnected(fd.as_fd(), *family, listen_port, &mut buf) {
                             Ok(res) => res,
@@ -625,7 +625,7 @@ impl Worker {
                                     );
                                 }
                             }
-                            m == udp::BATCH && handoff.is_none()
+                            m == platform::BATCH && handoff.is_none()
                         }
                         Err(e) => {
                             if e.kind() != io::ErrorKind::WouldBlock {
@@ -653,7 +653,7 @@ impl Worker {
                     if frames.len() > 0 {
                         out.data(&mut sender, frames);
                     }
-                    tun_ready = reads == udp::BATCH && out.room(&driver, stride, 1);
+                    tun_ready = reads == platform::BATCH && out.room(&driver, stride, 1);
                 } else {
                     tun_ready = false;
                 }

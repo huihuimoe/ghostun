@@ -19,25 +19,14 @@ use netlink_packet_route::{AddressFamily, RouteNetlinkMessage};
 use netlink_sys::protocols::NETLINK_ROUTE;
 use netlink_sys::{Socket, SocketAddr};
 
+use super::{invalid, retry_interrupted};
+
 use crate::net::{Cidr, OuterFamily};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Route {
     pub src: IpAddr,
     pub dev: String,
-}
-
-fn invalid(message: &'static str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, message)
-}
-
-fn retry_interrupted<T>(mut operation: impl FnMut() -> io::Result<T>) -> io::Result<T> {
-    loop {
-        match operation() {
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            result => return result,
-        }
-    }
 }
 
 fn request(

@@ -18,6 +18,59 @@ use std::time::Duration;
 pub const READ_READY: i16 = libc::POLLIN | libc::POLLERR | libc::POLLHUP;
 pub const WRITE_READY: i16 = libc::POLLOUT | libc::POLLERR | libc::POLLHUP;
 
+/// Packets moved per batched socket or TUN system call.
+pub const BATCH: usize = 64;
+const SOCKET_BUF: libc::c_int = 4 << 20;
+type CmsgBuf = [usize; 8];
+
+pub fn invalid(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+pub fn retry_interrupted<T>(mut operation: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    loop {
+        match operation() {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            result => return result,
+        }
+    }
+}
+
+/// Requests `SOCKET_BUF` send and receive buffers, bypassing rmem_max/wmem_max when privileged.
+fn set_socket_buffers(fd: &OwnedFd) -> io::Result<()> {
+    for (force, plain) in [
+        (libc::SO_RCVBUFFORCE, libc::SO_RCVBUF),
+        (libc::SO_SNDBUFFORCE, libc::SO_SNDBUF),
+    ] {
+        if setsockopt(fd, libc::SOL_SOCKET, force, &SOCKET_BUF).is_err() {
+            setsockopt(fd, libc::SOL_SOCKET, plain, &SOCKET_BUF)?;
+        }
+    }
+    Ok(())
+}
+
+/// Counts the completed prefix, including explicitly dropped non-retryable packets.
+fn send_progress(
+    label: &str,
+    count: usize,
+    mut send: impl FnMut(usize) -> io::Result<usize>,
+) -> usize {
+    let mut completed = 0;
+    while completed < count {
+        match send(completed) {
+            Ok(0) => break,
+            Ok(n) => completed += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(e) => {
+                log::debug!("{label} send: {e}; dropping packet");
+                completed += 1;
+            }
+        }
+    }
+    completed
+}
+
 #[inline(always)]
 fn cvt(ret: libc::c_int) -> io::Result<libc::c_int> {
     if ret < 0 {

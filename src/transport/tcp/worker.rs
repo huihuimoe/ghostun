@@ -64,7 +64,7 @@ impl Worker {
         // a larger stride would strand the queue between the two bounds and spin the loop.
         let mut tun = TunIo {
             driver: TunDriver::new(self.tun.as_fd(), mtu, 0),
-            scratch: vec![0; platform::raw::BATCH * mtu],
+            scratch: vec![0; platform::BATCH * mtu],
             stride: mtu,
             attached,
         };
@@ -203,11 +203,11 @@ impl Worker {
                         |_, _| false,
                     );
                     drained += reads;
-                    if reads < platform::raw::BATCH {
+                    if reads < platform::BATCH {
                         break;
                     }
                 }
-                busy |= drained == ROUNDS * platform::raw::BATCH;
+                busy |= drained == ROUNDS * platform::BATCH;
             }
             // Arm the multishot read right after a fresh attach; otherwise the ring stays silent
             // until an unrelated socket event or timer wakes the loop.

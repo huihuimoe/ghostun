@@ -9,12 +9,10 @@ use std::ptr::{read_unaligned, write_unaligned};
 
 use libc::{in_pktinfo, in6_pktinfo};
 
-use super::{SockAddr, bind_to_device, cvt, setsockopt};
+use super::{
+    BATCH, CmsgBuf, SockAddr, bind_to_device, cvt, send_progress, set_socket_buffers, setsockopt,
+};
 use crate::net::OuterFamily;
-
-const SOCKET_BUF: libc::c_int = 4 << 20;
-pub const BATCH: usize = 64;
-type CmsgBuf = [usize; 8];
 
 fn socket_common(family: OuterFamily, bind_dev: Option<&str>, reuse: bool) -> io::Result<OwnedFd> {
     // SAFETY: socket(2) with constant arguments; returned descriptor is owned immediately.
@@ -54,14 +52,7 @@ fn socket_common(family: OuterFamily, bind_dev: Option<&str>, reuse: bool) -> io
             )?;
         }
     }
-    for (force, plain) in [
-        (libc::SO_RCVBUFFORCE, libc::SO_RCVBUF),
-        (libc::SO_SNDBUFFORCE, libc::SO_SNDBUF),
-    ] {
-        if setsockopt(&fd, libc::SOL_SOCKET, force, &SOCKET_BUF).is_err() {
-            setsockopt(&fd, libc::SOL_SOCKET, plain, &SOCKET_BUF)?;
-        }
-    }
+    set_socket_buffers(&fd)?;
     Ok(fd)
 }
 
@@ -358,7 +349,7 @@ impl Sender {
             self.iovs[k].iov_base = frame.as_ptr().cast_mut().cast();
             self.iovs[k].iov_len = frame.len();
         }
-        send_progress(count, |sent| {
+        send_progress("udp", count, |sent| {
             // SAFETY: active descriptors point into live frames and boxed iovecs.
             let n = unsafe {
                 libc::sendmmsg(
@@ -375,23 +366,6 @@ impl Sender {
             }
         })
     }
-}
-
-fn send_progress(count: usize, mut send: impl FnMut(usize) -> io::Result<usize>) -> usize {
-    let mut completed = 0;
-    while completed < count {
-        match send(completed) {
-            Ok(0) => break,
-            Ok(n) => completed += n,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-            Err(e) => {
-                log::debug!("udp send: {e}; dropping packet");
-                completed += 1;
-            }
-        }
-    }
-    completed
 }
 
 /// Owns fixed receive buffers for batched `recvmmsg` on a connected UDP socket.
