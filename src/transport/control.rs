@@ -1,10 +1,13 @@
 //! Worker thread control, CPU affinity, TUN queue synchronization, and rolling reload coordination.
 
+use std::collections::VecDeque;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::config::{Config, Tunables};
+use std::time::Duration;
+
+use crate::config::{AuthKey, Config, Tunables};
 use crate::platform;
 
 pub struct Reload {
@@ -255,6 +258,43 @@ pub fn sync_tun_queue(id: usize, tun: BorrowedFd<'_>, attached: &mut bool, estab
             Ok(()) => *attached = established,
             Err(e) => log::warn!("worker {id}: TUN queue attach={established}: {e}"),
         }
+    }
+}
+
+/// Exit admission state shared by the listener, its workers, and the manager.
+pub struct Admission<P> {
+    pub key: AuthKey,
+    /// Bumped on every key change, so a handshake begun under the old key is never admitted.
+    pub epoch: u64,
+    pub timeout: Duration,
+    /// Authenticated peers waiting for the manager to spawn their worker.
+    pub admitted: VecDeque<P>,
+    main_wake: RawFd,
+}
+
+impl<P> Admission<P> {
+    pub fn new(key: AuthKey, timeout: Duration, main_wake: RawFd) -> Self {
+        Self {
+            key,
+            epoch: 0,
+            timeout,
+            admitted: VecDeque::new(),
+            main_wake,
+        }
+    }
+
+    pub fn reload(&mut self, tunables: &Tunables, key_changed: bool) {
+        if key_changed {
+            self.key = tunables.auth_key.clone();
+            self.epoch += 1;
+            self.admitted.clear();
+        }
+        self.timeout = tunables.dead_timeout;
+    }
+
+    pub fn admit(&mut self, peer: P) {
+        self.admitted.push_back(peer);
+        platform::eventfd_notify(self.main_wake);
     }
 }
 

@@ -1,7 +1,6 @@
 //! Exit-side accept dispatcher: authenticates bounded candidates and hands them to workers.
 //! The dispatcher never owns a TUN queue.
 
-use std::collections::VecDeque;
 use std::io;
 use std::net::{SocketAddr, TcpListener};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
@@ -11,19 +10,13 @@ use std::time::{Duration, Instant};
 
 use super::auth::{self, Handshake};
 use super::{BATCH, Connection, invalid};
-use crate::config::{AuthKey, Config, MAX_CONNS};
+use crate::config::{Config, MAX_CONNS};
 use crate::platform::{self, READ_READY, poll, poll_ms, pollfd};
-use crate::transport::control;
+use crate::transport::control::{self, Admission};
 
 pub const MAX_CANDIDATES: usize = MAX_CONNS;
 
-pub struct ExitState {
-    pub(crate) key: AuthKey,
-    pub(crate) epoch: u64,
-    pub(crate) timeout: Duration,
-    pub(crate) admitted: VecDeque<(usize, Connection)>,
-    pub(crate) main_wake: RawFd,
-}
+pub type ExitState = Admission<(usize, Connection)>;
 
 pub type SharedExitState = Arc<Mutex<ExitState>>;
 
@@ -49,13 +42,11 @@ impl Listener {
             listeners.push(listener);
         }
         let wake = platform::eventfd()?;
-        let state = Arc::new(Mutex::new(ExitState {
-            key: cfg.tunables.auth_key.clone(),
-            epoch: 0,
-            timeout: cfg.tunables.dead_timeout,
-            admitted: VecDeque::new(),
+        let state = Arc::new(Mutex::new(ExitState::new(
+            cfg.tunables.auth_key.clone(),
+            cfg.tunables.dead_timeout,
             main_wake,
-        }));
+        )));
         Ok(Self {
             listeners,
             wake,
@@ -224,16 +215,12 @@ impl Candidate {
 
     pub(super) fn admit(mut self, state: &SharedExitState, mtu: u16) -> io::Result<()> {
         let (id, epoch) = self.identity.unwrap();
-        let wake = {
-            let mut s = state.lock().unwrap();
-            if s.epoch != epoch {
-                return Err(invalid("authentication invalidated by key reload"));
-            }
-            self.conn.establish(mtu);
-            s.admitted.push_back((id, self.conn));
-            s.main_wake
-        };
-        platform::eventfd_notify(wake);
+        let mut s = state.lock().unwrap();
+        if s.epoch != epoch {
+            return Err(invalid("authentication invalidated by key reload"));
+        }
+        self.conn.establish(mtu);
+        s.admit((id, self.conn));
         Ok(())
     }
 }

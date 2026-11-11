@@ -1,22 +1,21 @@
 //! Per-core event loop pumping one TUN queue and steered raw socket through a FakeTCP [`Session`],
 //! plus the Exit handshake listener that authenticates incoming peers before workers are spawned.
 
-use std::collections::VecDeque;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use super::auth::{self, Auth, ExitStep, PROOF_LEN};
 use super::filter::{entry_filter, exit_listener_filter, exit_worker_filter};
 use super::frame::{self, MAX_OVERHEAD, TcpMeta, flags};
 use super::session::{Promoted, Session, SessionConfig, Sink, WINDOW, emit};
-use crate::config::{AuthKey, Config, MAX_CONNS, Mode};
+use crate::config::{Config, MAX_CONNS, Mode};
 use crate::net::OuterFamily;
 use crate::platform::{self, raw};
-use crate::transport::control::{self, Control};
+use crate::transport::control::{self, Admission, Control};
 use crate::transport::queue::Pending;
 use crate::transport::tun_driver::TunDriver;
 #[cfg(test)]
@@ -121,12 +120,8 @@ pub struct ActivePeer {
 }
 
 pub struct ExitState {
-    pub(crate) key: AuthKey,
-    pub(crate) epoch: u64,
-    pub(crate) timeout: Duration,
+    pub(crate) admission: Admission<Promoted>,
     pub(crate) active: Box<[Option<ActivePeer>; MAX_CONNS]>,
-    pub(crate) admitted: VecDeque<Promoted>,
-    pub(crate) main_wake: RawFd,
 }
 
 pub type SharedExitState = Arc<Mutex<ExitState>>;
@@ -161,12 +156,12 @@ impl Listener {
         )
         .map_err(|e| format!("initializing exit authentication: {e}"))?;
         let state = Arc::new(Mutex::new(ExitState {
-            key: cfg.tunables.auth_key.clone(),
-            epoch: 0,
-            timeout: cfg.tunables.dead_timeout,
+            admission: Admission::new(
+                cfg.tunables.auth_key.clone(),
+                cfg.tunables.dead_timeout,
+                main_wake,
+            ),
             active: Box::new([None; MAX_CONNS]),
-            admitted: VecDeque::new(),
-            main_wake,
         }));
         Ok(Self {
             sockets,
@@ -247,10 +242,10 @@ impl Listener {
             }
             if platform::poll_wake(fds[0], wake.as_fd()) {
                 let s = state.lock().unwrap();
-                auth.reload(&s.key, s.timeout);
-                if s.epoch != applied_epoch {
+                auth.reload(&s.admission.key, s.admission.timeout);
+                if s.admission.epoch != applied_epoch {
                     auth.reset();
-                    applied_epoch = s.epoch;
+                    applied_epoch = s.admission.epoch;
                 }
             }
             if stop.load(Ordering::Relaxed) {
@@ -347,24 +342,19 @@ impl Listener {
                                     emit(&mut scratch, &reply, &finished, ip_id, &mut out);
                                 }
                                 Ok(ExitStep::Promote(promo)) => {
-                                    let main_wake = {
-                                        let mut s = state.lock().unwrap();
-                                        s.admitted.push_back(Promoted {
-                                            worker: promo.worker,
-                                            local: meta.dst,
-                                            peer: meta.src,
-                                            req_seq: meta.seq,
-                                            req_ack: meta.ack,
-                                            req_len: p.payload.len(),
-                                            iss: promo.iss,
-                                            irs: promo.irs,
-                                            snd_nxt: promo.snd_nxt,
-                                            rcv_nxt: promo.rcv_nxt,
-                                            finished: promo.finished,
-                                        });
-                                        s.main_wake
-                                    };
-                                    platform::eventfd_notify(main_wake);
+                                    state.lock().unwrap().admission.admit(Promoted {
+                                        worker: promo.worker,
+                                        local: meta.dst,
+                                        peer: meta.src,
+                                        req_seq: meta.seq,
+                                        req_ack: meta.ack,
+                                        req_len: p.payload.len(),
+                                        iss: promo.iss,
+                                        irs: promo.irs,
+                                        snd_nxt: promo.snd_nxt,
+                                        rcv_nxt: promo.rcv_nxt,
+                                        finished: promo.finished,
+                                    });
                                 }
                                 Err(e) => log::error!("authentication randomness: {e}"),
                             }

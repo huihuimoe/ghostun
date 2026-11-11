@@ -383,13 +383,11 @@ fn attempt_deadline_is_absolute_and_jitter_backoff_resets_only_after_stability()
 }
 
 fn candidates(key: &AuthKey) -> SharedExitState {
-    Arc::new(Mutex::new(ExitState {
-        key: key.clone(),
-        epoch: 0,
-        timeout: Duration::from_secs(4),
-        admitted: std::collections::VecDeque::new(),
-        main_wake: -1,
-    }))
+    Arc::new(Mutex::new(ExitState::new(
+        key.clone(),
+        Duration::from_secs(4),
+        -1,
+    )))
 }
 
 fn admit(state: &SharedExitState, key: &AuthKey) -> Connection {

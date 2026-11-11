@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::thread::JoinHandle;
 
-use crate::config::{Config, MAX_CONNS, Mode, OuterMode, Transport};
+use crate::config::{Config, MAX_CONNS, Mode, OuterMode, Transport, Tunables};
 use crate::platform;
 use control::{
     Control, CoreTable, ExitWorkerGuard, Reload, RollingReload, StopOnDrop, candidate_cpus,
@@ -70,6 +70,24 @@ enum ExitDispatcher {
     Udp(udp::SharedExitState),
 }
 
+impl ExitDispatcher {
+    fn reload(&self, tunables: &Tunables, key_changed: bool) {
+        match self {
+            Self::Fake(state) => state
+                .lock()
+                .unwrap()
+                .admission
+                .reload(tunables, key_changed),
+            Self::Tcp(state) => state.lock().unwrap().reload(tunables, key_changed),
+            Self::Udp(state) => state
+                .lock()
+                .unwrap()
+                .admission
+                .reload(tunables, key_changed),
+        }
+    }
+}
+
 struct ExitSlot {
     ctrl: Arc<Control>,
     thread: JoinHandle<()>,
@@ -78,8 +96,8 @@ struct ExitSlot {
     peer_label: String,
 }
 
-/// Manager state owning persistent Entry workers or dynamic Exit workers and the CPU binding table.
-pub struct Running {
+/// Manager state both modes need to spawn and reload workers.
+struct Shared {
     cfg: Config,
     outer_mtu: u32,
     tun_mtu: u32,
@@ -88,17 +106,42 @@ pub struct Running {
     main_wake: RawFd,
     default_cpus: Vec<usize>,
     core_table: CoreTable,
-    entry_controls: Vec<Arc<Control>>,
-    entry_cpus: Vec<Option<usize>>,
-    entry_threads: Vec<JoinHandle<()>>,
-    rolling: Option<RollingReload>,
-    _anchor_tun: Option<OwnedFd>,
-    exit_dispatcher: Option<ExitDispatcher>,
-    listener_wake: Option<RawFd>,
-    listener_thread: Option<JoinHandle<()>>,
-    exit_workers: Vec<Option<ExitSlot>>,
-    exit_reload_gen: Option<u64>,
     generation: u64,
+}
+
+impl Shared {
+    fn reset_core_table(&mut self) {
+        self.core_table = CoreTable::new(candidate_cpus(&self.cfg, &self.default_cpus));
+    }
+}
+
+/// Persistent Entry workers, one per configured connection.
+struct Entry {
+    controls: Vec<Arc<Control>>,
+    cpus: Vec<Option<usize>>,
+    threads: Vec<JoinHandle<()>>,
+    rolling: Option<RollingReload>,
+}
+
+/// The Exit listener and the workers it admits, indexed by the peer's worker id.
+struct Exit {
+    _anchor_tun: Option<OwnedFd>,
+    dispatcher: ExitDispatcher,
+    listener_wake: RawFd,
+    listener_thread: JoinHandle<()>,
+    workers: Vec<Option<ExitSlot>>,
+    reload_gen: Option<u64>,
+}
+
+enum Role {
+    Entry(Entry),
+    Exit(Exit),
+}
+
+/// Manager state owning persistent Entry workers or dynamic Exit workers and the CPU binding table.
+pub struct Running {
+    shared: Shared,
+    role: Role,
 }
 
 /// Opens outer listener/entry sockets before spawning any thread, so a setup error leaves nothing running.
@@ -117,11 +160,21 @@ pub fn start(
         );
     }
     let default_cpus = platform::usable_cpus();
-    let mut core_table = CoreTable::new(candidate_cpus(cfg, &default_cpus));
-    let seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos() as u64);
-    if cfg.mode == Mode::Entry {
+    let mut shared = Shared {
+        cfg: cfg.clone(),
+        outer_mtu: outer.mtu,
+        tun_mtu,
+        seed: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos() as u64),
+        stop,
+        main_wake,
+        core_table: CoreTable::new(candidate_cpus(cfg, &default_cpus)),
+        default_cpus,
+        generation: 0,
+    };
+    let seed = shared.seed;
+    let role = if cfg.mode == Mode::Entry {
         let mut starts = Vec::with_capacity(tuns.len());
         let mut tuns = tuns.into_iter();
         for route in &outer.entry {
@@ -150,16 +203,19 @@ pub fn start(
                 });
             }
         }
-        let mut entry_controls = Vec::with_capacity(starts.len());
-        let mut entry_cpus = Vec::with_capacity(starts.len());
-        let mut entry_threads = Vec::with_capacity(starts.len());
+        let mut entry = Entry {
+            controls: Vec::with_capacity(starts.len()),
+            cpus: Vec::with_capacity(starts.len()),
+            threads: Vec::with_capacity(starts.len()),
+            rolling: None,
+        };
         for (i, start) in starts.into_iter().enumerate() {
-            let cpu = core_table.acquire();
+            let cpu = shared.core_table.acquire();
             let ctrl = Arc::new(Control::new(cpu, main_wake));
             let worker_ctrl = Arc::clone(&ctrl);
-            entry_cpus.push(cpu);
-            entry_controls.push(ctrl);
-            entry_threads.push(
+            entry.cpus.push(cpu);
+            entry.controls.push(ctrl);
+            entry.threads.push(
                 std::thread::Builder::new()
                     .name(format!("ghostun-w{i}"))
                     .spawn(move || {
@@ -169,100 +225,69 @@ pub fn start(
                     .expect("spawning worker thread"),
             );
         }
-        return Ok(Running {
-            cfg: cfg.clone(),
-            outer_mtu: outer.mtu,
-            tun_mtu,
-            seed,
-            stop,
-            main_wake,
-            default_cpus,
-            core_table,
-            entry_controls,
-            entry_cpus,
-            entry_threads,
-            rolling: None,
-            _anchor_tun: None,
-            exit_dispatcher: None,
-            listener_wake: None,
-            listener_thread: None,
-            exit_workers: Vec::new(),
-            exit_reload_gen: None,
-            generation: 0,
-        });
-    }
-
-    let anchor_tun = tuns.into_iter().next();
-    let (exit_dispatcher, listener_wake, listener_thread) = match cfg.transport {
-        Transport::Udp => {
-            let listener = udp::Listener::bind(cfg, tun_mtu as u16, main_wake)?;
-            let wake = listener.wake_fd();
-            let state = Arc::clone(&listener.state);
-            let thread = listener
-                .spawn(stop, main_wake)
-                .expect("spawning UDP accept thread");
-            (ExitDispatcher::Udp(state), wake, thread)
-        }
-        Transport::Tcp => {
-            let listener = tcp::Listener::bind(cfg, tun_mtu as u16, main_wake)
-                .map_err(|e| format!("tcp listener: {e}"))?;
-            let wake = listener.wake_fd();
-            let state = Arc::clone(&listener.state);
-            let thread = listener
-                .spawn(stop, main_wake)
-                .expect("spawning TCP accept thread");
-            (ExitDispatcher::Tcp(state), wake, thread)
-        }
-        Transport::Faketcp => {
-            let listener = faketcp::Listener::bind(cfg, outer.mtu, seed, main_wake)?;
-            let wake = listener.wake_fd();
-            let state = Arc::clone(&listener.state);
-            let thread = listener
-                .spawn(stop, main_wake)
-                .expect("spawning FakeTCP accept thread");
-            (ExitDispatcher::Fake(state), wake, thread)
-        }
+        Role::Entry(entry)
+    } else {
+        let anchor_tun = tuns.into_iter().next();
+        let (dispatcher, listener_wake, listener_thread) = match cfg.transport {
+            Transport::Udp => {
+                let listener = udp::Listener::bind(cfg, tun_mtu as u16, main_wake)?;
+                let wake = listener.wake_fd();
+                let state = Arc::clone(&listener.state);
+                let thread = listener
+                    .spawn(stop, main_wake)
+                    .expect("spawning UDP accept thread");
+                (ExitDispatcher::Udp(state), wake, thread)
+            }
+            Transport::Tcp => {
+                let listener = tcp::Listener::bind(cfg, tun_mtu as u16, main_wake)
+                    .map_err(|e| format!("tcp listener: {e}"))?;
+                let wake = listener.wake_fd();
+                let state = Arc::clone(&listener.state);
+                let thread = listener
+                    .spawn(stop, main_wake)
+                    .expect("spawning TCP accept thread");
+                (ExitDispatcher::Tcp(state), wake, thread)
+            }
+            Transport::Faketcp => {
+                let listener = faketcp::Listener::bind(cfg, outer.mtu, seed, main_wake)?;
+                let wake = listener.wake_fd();
+                let state = Arc::clone(&listener.state);
+                let thread = listener
+                    .spawn(stop, main_wake)
+                    .expect("spawning FakeTCP accept thread");
+                (ExitDispatcher::Fake(state), wake, thread)
+            }
+        };
+        Role::Exit(Exit {
+            _anchor_tun: anchor_tun,
+            dispatcher,
+            listener_wake,
+            listener_thread,
+            workers: (0..MAX_CONNS).map(|_| None).collect(),
+            reload_gen: None,
+        })
     };
-    Ok(Running {
-        cfg: cfg.clone(),
-        outer_mtu: outer.mtu,
-        tun_mtu,
-        seed,
-        stop,
-        main_wake,
-        default_cpus,
-        core_table,
-        entry_controls: Vec::new(),
-        entry_cpus: Vec::new(),
-        entry_threads: Vec::new(),
-        rolling: None,
-        _anchor_tun: anchor_tun,
-        exit_dispatcher: Some(exit_dispatcher),
-        listener_wake: Some(listener_wake),
-        listener_thread: Some(listener_thread),
-        exit_workers: (0..MAX_CONNS).map(|_| None).collect(),
-        exit_reload_gen: None,
-        generation: 0,
-    })
+    Ok(Running { shared, role })
 }
 
-impl Running {
-    pub fn is_reloading(&self) -> bool {
-        self.rolling.is_some() || self.exit_reload_gen.is_some()
-    }
-
-    fn reap_exited_workers(&mut self) {
-        for slot in &mut self.exit_workers {
+impl Exit {
+    fn reap_exited_workers(&mut self, cores: &mut CoreTable) {
+        for slot in &mut self.workers {
             if slot.as_ref().is_some_and(|s| s.ctrl.is_exited()) {
                 let finished = slot.take().unwrap();
                 let _ = finished.thread.join();
-                self.core_table.release(finished.cpu);
+                cores.release(finished.cpu);
             }
         }
     }
 
-    fn replace_exit_slot(&mut self, id: usize, new_tuple: Option<(SocketAddr, SocketAddr)>) {
-        if let Some(old) = self.exit_workers[id].take() {
+    fn replace_slot(
+        &mut self,
+        cores: &mut CoreTable,
+        id: usize,
+        new_tuple: Option<(SocketAddr, SocketAddr)>,
+    ) {
+        if let Some(old) = self.workers[id].take() {
             let send_rst = match (old.tuple, new_tuple) {
                 (Some(old_t), Some(new_t)) => old_t != new_t,
                 _ => true,
@@ -275,37 +300,41 @@ impl Running {
             }
             old.ctrl.stop(send_rst);
             let _ = old.thread.join();
-            self.core_table.release(old.cpu);
+            cores.release(old.cpu);
         }
     }
 
-    fn spawn_exit_slot(
+    fn spawn_slot(
         &mut self,
+        shared: &mut Shared,
         id: usize,
         tuple: Option<(SocketAddr, SocketAddr)>,
         peer_label: String,
-        build: impl FnOnce(&Self, OwnedFd) -> Result<Start, String>,
+        build: impl FnOnce(&Shared, OwnedFd) -> Result<Start, String>,
     ) {
-        self.replace_exit_slot(id, tuple);
-        let tun = match platform::tun::open_queue(&self.cfg.tun_name) {
+        self.replace_slot(&mut shared.core_table, id, tuple);
+        let tun = match platform::tun::open_queue(&shared.cfg.tun_name) {
             Ok(fd) => fd,
             Err(e) => {
-                log::error!("worker {id}: opening TUN queue {}: {e}", self.cfg.tun_name);
+                log::error!(
+                    "worker {id}: opening TUN queue {}: {e}",
+                    shared.cfg.tun_name
+                );
                 return;
             }
         };
-        let start = match build(self, tun) {
+        let start = match build(shared, tun) {
             Ok(start) => start,
             Err(e) => {
                 log::error!("worker {id}: {e}");
                 return;
             }
         };
-        let cpu = self.core_table.acquire();
-        let ctrl = Arc::new(Control::new(cpu, self.main_wake));
+        let cpu = shared.core_table.acquire();
+        let ctrl = Arc::new(Control::new(cpu, shared.main_wake));
         let worker_ctrl = Arc::clone(&ctrl);
-        let stop = self.stop;
-        let main_wake = self.main_wake;
+        let stop = shared.stop;
+        let main_wake = shared.main_wake;
         let thread = std::thread::Builder::new()
             .name(format!("ghostun-w{id}"))
             .spawn(move || {
@@ -317,7 +346,7 @@ impl Running {
                 start.run(stop, &worker_ctrl);
             })
             .expect("spawning exit worker thread");
-        self.exit_workers[id] = Some(ExitSlot {
+        self.workers[id] = Some(ExitSlot {
             ctrl,
             thread,
             cpu,
@@ -326,208 +355,194 @@ impl Running {
         });
     }
 
-    /// Starts a reload to `cfg`, superseding any reload still in progress.
-    pub fn reload(&mut self, cfg: Config) {
-        self.generation += 1;
-        log::info!("reloading configuration (generation {})", self.generation);
-        if self.cfg.mode == Mode::Entry {
-            if cfg.tunables.cpus != self.cfg.tunables.cpus {
-                self.core_table = CoreTable::new(candidate_cpus(&cfg, &self.default_cpus));
-                self.entry_cpus = (0..self.entry_controls.len())
-                    .map(|_| self.core_table.acquire())
-                    .collect();
-            }
-            self.cfg = cfg.clone();
-            self.rolling = RollingReload::start(
-                &self.entry_controls,
-                self.entry_cpus.clone(),
-                self.generation,
-                cfg.tunables,
-            );
-            return;
-        }
-
-        let key_changed = self.cfg.tunables.auth_key != cfg.tunables.auth_key;
-        let cpus_changed = self.cfg.tunables.cpus != cfg.tunables.cpus;
-        self.cfg = cfg.clone();
-        match &self.exit_dispatcher {
-            Some(ExitDispatcher::Udp(state)) => {
-                let mut s = state.lock().unwrap();
-                if key_changed {
-                    s.key = cfg.tunables.auth_key.clone();
-                    s.epoch += 1;
-                    s.admitted.clear();
-                }
-                s.timeout = cfg.tunables.dead_timeout;
-            }
-            Some(ExitDispatcher::Tcp(state)) => {
-                let mut s = state.lock().unwrap();
-                if key_changed {
-                    s.key = cfg.tunables.auth_key.clone();
-                    s.epoch += 1;
-                    s.admitted.clear();
-                }
-                s.timeout = cfg.tunables.dead_timeout;
-            }
-            Some(ExitDispatcher::Fake(state)) => {
-                let mut s = state.lock().unwrap();
-                if key_changed {
-                    s.key = cfg.tunables.auth_key.clone();
-                    s.epoch += 1;
-                    s.admitted.clear();
-                }
-                s.timeout = cfg.tunables.dead_timeout;
-            }
-            None => {}
-        }
-        if let Some(fd) = self.listener_wake {
-            platform::eventfd_notify(fd);
-        }
-        self.reap_exited_workers();
+    fn reload(&mut self, shared: &mut Shared, key_changed: bool, cpus_changed: bool) {
+        self.dispatcher.reload(&shared.cfg.tunables, key_changed);
+        platform::eventfd_notify(self.listener_wake);
+        self.reap_exited_workers(&mut shared.core_table);
         if key_changed {
-            for slot in &mut self.exit_workers {
+            for slot in &mut self.workers {
                 if let Some(old) = slot.take() {
                     old.ctrl.stop(true);
                     let _ = old.thread.join();
-                    self.core_table.release(old.cpu);
+                    shared.core_table.release(old.cpu);
                 }
             }
             if cpus_changed {
-                self.core_table = CoreTable::new(candidate_cpus(&self.cfg, &self.default_cpus));
+                shared.reset_core_table();
             }
-            self.exit_reload_gen = None;
+            self.reload_gen = None;
             log::info!(
                 "configuration reload complete (generation {})",
-                self.generation
+                shared.generation
             );
         } else {
             if cpus_changed {
-                self.core_table = CoreTable::new(candidate_cpus(&self.cfg, &self.default_cpus));
-                for slot in self.exit_workers.iter_mut().flatten() {
-                    slot.cpu = self.core_table.acquire();
+                shared.reset_core_table();
+                for slot in self.workers.iter_mut().flatten() {
+                    slot.cpu = shared.core_table.acquire();
                 }
             }
-            for slot in self.exit_workers.iter().flatten() {
+            for slot in self.workers.iter().flatten() {
                 slot.ctrl.publish(
-                    self.generation,
+                    shared.generation,
                     Reload {
-                        tunables: self.cfg.tunables.clone(),
+                        tunables: shared.cfg.tunables.clone(),
                         cpu: slot.cpu,
                     },
                 );
             }
-            self.exit_reload_gen = Some(self.generation);
-            self.advance();
+            self.reload_gen = Some(shared.generation);
+            self.advance(shared);
         }
     }
 
-    /// Reaps exited workers, spawns newly admitted Exit workers, and advances active reloads.
-    pub fn advance(&mut self) {
-        if self.cfg.mode == Mode::Entry {
-            RollingReload::advance(&self.entry_controls, &mut self.rolling);
-            return;
-        }
-        self.reap_exited_workers();
-        match self.exit_dispatcher.as_ref() {
-            Some(ExitDispatcher::Udp(state)) => {
+    fn advance(&mut self, shared: &mut Shared) {
+        self.reap_exited_workers(&mut shared.core_table);
+        match &self.dispatcher {
+            ExitDispatcher::Udp(state) => {
                 let state = Arc::clone(state);
                 loop {
-                    let next = state.lock().unwrap().admitted.pop_front();
+                    let next = state.lock().unwrap().admission.admitted.pop_front();
                     let Some(promo) = next else { break };
                     let id = promo.worker;
                     let tuple = Some((promo.local, promo.peer));
                     let peer_label = format!("{} <-> {}", promo.local, promo.peer);
                     let worker_state = Arc::clone(&state);
-                    self.spawn_exit_slot(id, tuple, peer_label, |this, tun| {
+                    self.spawn_slot(shared, id, tuple, peer_label, |shared, tun| {
                         udp::Worker::new_exit(
                             id,
-                            &this.cfg,
-                            this.tun_mtu as u16,
+                            &shared.cfg,
+                            shared.tun_mtu as u16,
                             tun,
                             promo,
                             worker_state,
-                            this.seed,
+                            shared.seed,
                         )
                         .map(|w| Start::Udp(Box::new(w)))
                     });
                 }
             }
-            Some(ExitDispatcher::Tcp(state)) => {
+            ExitDispatcher::Tcp(state) => {
                 let state = Arc::clone(state);
                 loop {
                     let next = state.lock().unwrap().admitted.pop_front();
                     let Some((id, conn)) = next else { break };
                     let peer_label = conn.to_string();
-                    self.spawn_exit_slot(id, None, peer_label, |this, tun| {
+                    self.spawn_slot(shared, id, None, peer_label, |shared, tun| {
                         Ok(Start::Tcp(Box::new(tcp::Worker::new_exit(
                             id,
-                            this.cfg.clone(),
-                            this.tun_mtu as u16,
+                            shared.cfg.clone(),
+                            shared.tun_mtu as u16,
                             tun,
                             conn,
                         ))))
                     });
                 }
             }
-            Some(ExitDispatcher::Fake(state)) => {
+            ExitDispatcher::Fake(state) => {
                 let state = Arc::clone(state);
                 loop {
-                    let next = state.lock().unwrap().admitted.pop_front();
+                    let next = state.lock().unwrap().admission.admitted.pop_front();
                     let Some(promo) = next else { break };
                     let id = promo.worker;
                     let tuple = Some((promo.local, promo.peer));
                     let peer_label = format!("{} <-> {}", promo.local, promo.peer);
                     let worker_state = Arc::clone(&state);
-                    self.spawn_exit_slot(id, tuple, peer_label, |this, tun| {
+                    self.spawn_slot(shared, id, tuple, peer_label, |shared, tun| {
                         faketcp::Worker::new_exit(
                             id,
-                            &this.cfg,
-                            this.outer_mtu,
+                            &shared.cfg,
+                            shared.outer_mtu,
                             tun,
                             promo,
                             worker_state,
-                            this.seed,
+                            shared.seed,
                         )
                         .map(|w| Start::Fake(Box::new(w)))
                     });
                 }
             }
-            None => {}
         }
-        if let Some(generation) = self.exit_reload_gen
+        if let Some(generation) = self.reload_gen
             && self
-                .exit_workers
+                .workers
                 .iter()
                 .flatten()
                 .all(|s| s.ctrl.is_step_complete(generation))
         {
             log::info!("configuration reload complete (generation {generation})");
-            self.exit_reload_gen = None;
+            self.reload_gen = None;
+        }
+    }
+}
+
+impl Running {
+    pub fn is_reloading(&self) -> bool {
+        match &self.role {
+            Role::Entry(entry) => entry.rolling.is_some(),
+            Role::Exit(exit) => exit.reload_gen.is_some(),
+        }
+    }
+
+    /// Starts a reload to `cfg`, superseding any reload still in progress.
+    pub fn reload(&mut self, cfg: Config) {
+        let shared = &mut self.shared;
+        shared.generation += 1;
+        log::info!("reloading configuration (generation {})", shared.generation);
+        let key_changed = shared.cfg.tunables.auth_key != cfg.tunables.auth_key;
+        let cpus_changed = shared.cfg.tunables.cpus != cfg.tunables.cpus;
+        shared.cfg = cfg;
+        match &mut self.role {
+            Role::Entry(entry) => {
+                if cpus_changed {
+                    shared.reset_core_table();
+                    entry.cpus = (0..entry.controls.len())
+                        .map(|_| shared.core_table.acquire())
+                        .collect();
+                }
+                entry.rolling = RollingReload::start(
+                    &entry.controls,
+                    entry.cpus.clone(),
+                    shared.generation,
+                    shared.cfg.tunables.clone(),
+                );
+            }
+            Role::Exit(exit) => exit.reload(shared, key_changed, cpus_changed),
+        }
+    }
+
+    /// Reaps exited workers, spawns newly admitted Exit workers, and advances active reloads.
+    pub fn advance(&mut self) {
+        match &mut self.role {
+            Role::Entry(entry) => RollingReload::advance(&entry.controls, &mut entry.rolling),
+            Role::Exit(exit) => exit.advance(&mut self.shared),
         }
     }
 
     /// Wakes every thread to observe `stop`, which the caller has set, and joins them.
     pub fn join(self) {
-        for ctrl in &self.entry_controls {
-            ctrl.wake();
-        }
-        for slot in self.exit_workers.iter().flatten() {
-            slot.ctrl.stop(true);
-        }
-        if let Some(fd) = self.listener_wake {
-            platform::eventfd_notify(fd);
-        }
-        for thread in self.entry_threads {
+        let (threads, listener) = match self.role {
+            Role::Entry(entry) => {
+                for ctrl in &entry.controls {
+                    ctrl.wake();
+                }
+                (entry.threads, None)
+            }
+            Role::Exit(exit) => {
+                for slot in exit.workers.iter().flatten() {
+                    slot.ctrl.stop(true);
+                }
+                platform::eventfd_notify(exit.listener_wake);
+                let threads = exit.workers.into_iter().flatten().map(|slot| slot.thread);
+                (threads.collect(), Some(exit.listener_thread))
+            }
+        };
+        for thread in threads {
             if thread.join().is_err() {
                 log::error!("worker panicked");
             }
         }
-        for slot in self.exit_workers.into_iter().flatten() {
-            if slot.thread.join().is_err() {
-                log::error!("worker panicked");
-            }
-        }
-        if let Some(thread) = self.listener_thread
+        if let Some(thread) = listener
             && thread.join().is_err()
         {
             log::error!("listener panicked");
