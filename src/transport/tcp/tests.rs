@@ -1,7 +1,5 @@
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
-use std::os::fd::{AsRawFd, OwnedFd};
-use std::os::unix::net::UnixDatagram;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -429,10 +427,7 @@ fn authenticated_admission_and_takeover_preserve_exact_data_and_ignore_incomplet
     let mut entry = admit(&state, &key);
     let (id, mut exit) = state.lock().unwrap().admitted.pop_front().unwrap();
     assert_eq!(id, 1);
-    let (tun, consumer) = UnixDatagram::pair().unwrap();
-    tun.set_nonblocking(true).unwrap();
-    consumer.set_nonblocking(true).unwrap();
-    let tun = TunQueue::from(OwnedFd::from(tun));
+    let (tun, consumer) = TunQueue::pair();
     let mut io = tun_io(&tun);
     let p = packet(9);
     entry.tx.push(&p);
@@ -490,12 +485,8 @@ fn blocked_tun_queues_frames_then_delivers_in_order_after_resume() {
     let (mut sender, receiver) = pair();
     let mut c = conn(receiver, Instant::now());
     c.establish(1380);
-    let (tun, consumer) = UnixDatagram::pair().unwrap();
-    tun.set_nonblocking(true).unwrap();
-    consumer.set_nonblocking(true).unwrap();
-    let filler = vec![99; 64];
-    while tun.send(&filler).is_ok() {}
-    let tun = TunQueue::from(OwnedFd::from(tun));
+    let (tun, consumer) = TunQueue::pair();
+    tun.fill();
     let mut io = tun_io(&tun);
     let packets = [packet(10), packet(20)];
     let mut tx = SendQueue::new(crate::transport::budget::TCP_NOTSENT as usize);
@@ -530,9 +521,7 @@ fn eof_and_illegal_established_control_close_the_stream() {
     let (mut sender, receiver) = pair();
     let mut c = conn(receiver, Instant::now());
     c.establish(1380);
-    let (tun, _consumer) = UnixDatagram::pair().unwrap();
-    tun.set_nonblocking(true).unwrap();
-    let tun = TunQueue::from(OwnedFd::from(tun));
+    let (tun, _consumer) = TunQueue::pair();
     let mut io = tun_io(&tun);
     sender.write_all(&[0, 1, 3]).unwrap();
     for _ in 0..100 {
@@ -596,9 +585,7 @@ fn partial_bytes_do_not_refresh_end_to_end_liveness() {
     let (mut peer, receiver) = pair();
     let mut c = conn(receiver, Instant::now());
     c.establish(1380);
-    let (tun, _consumer) = UnixDatagram::pair().unwrap();
-    tun.set_nonblocking(true).unwrap();
-    let tun = TunQueue::from(OwnedFd::from(tun));
+    let (tun, _consumer) = TunQueue::pair();
     let mut io = tun_io(&tun);
     let prior = c.last_rx;
     peer.write_all(&[0, 9, PING, 0]).unwrap();
@@ -630,8 +617,12 @@ fn partial_bytes_do_not_refresh_end_to_end_liveness() {
     panic!("valid complete health message did not refresh liveness")
 }
 
+// Inspects the kernel send queue through Linux-only socket options.
+#[cfg(target_os = "linux")]
 #[test]
 fn slow_tcp_receiver_backpressures_tun_at_the_transmit_bound_then_delivers_exact_data() {
+    use std::os::fd::AsRawFd;
+
     for tcp_notsent in [64 * 1024, 128 * 1024] {
         let (mut peer, receiver) = pair();
         // A large send buffer leaves the unsent watermark responsible for applying backpressure.
@@ -668,10 +659,7 @@ fn slow_tcp_receiver_backpressures_tun_at_the_transmit_bound_then_delivers_exact
         );
         assert_eq!(lowat, tcp_notsent);
         c.establish(1380);
-        let (tun, producer) = UnixDatagram::pair().unwrap();
-        tun.set_nonblocking(true).unwrap();
-        producer.set_nonblocking(true).unwrap();
-        let tun = TunQueue::from(OwnedFd::from(tun));
+        let (tun, producer) = TunQueue::pair();
         let mut io = tun_io(&tun);
         let p = packet(23);
         let mut sent = 0;

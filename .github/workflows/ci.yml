@@ -37,7 +37,7 @@ jobs:
           cargo fmt --check
           cargo clippy --locked --all-targets -- -D warnings
           cargo clippy --locked --all-targets --target x86_64-unknown-linux-musl --target aarch64-unknown-linux-musl -- -D warnings
-          cargo check --locked --target aarch64-apple-darwin
+          cargo check --locked --all-targets --target aarch64-apple-darwin
           cargo test --locked
       - name: Detect whether network E2E is needed
         id: filter

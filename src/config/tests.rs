@@ -654,8 +654,11 @@ fn mixed_preserves_policy_but_entry_opens_only_the_remote_family() {
         assert_eq!(c.socket_families(), &[family]);
         assert_eq!(c.resolve_tun_mtu(1500).unwrap(), 1440);
         assert_eq!(c.resolve_tun_mtu(1420).unwrap(), 1360);
-        let spec = crate::netfilter::NftSpec::from_config(&c, 0);
-        assert_eq!(spec.remotes, vec![remote.parse().unwrap()]);
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            crate::netfilter::NftSpec::from_config(&c, 0).remotes,
+            vec![remote.parse().unwrap()]
+        );
     }
     let dual = with_file(
         "mixed-entry-remotes",
@@ -677,6 +680,7 @@ fn mixed_preserves_policy_but_entry_opens_only_the_remote_family() {
     .unwrap();
     assert_eq!(c.outer_family, OuterMode::Mixed);
     assert_eq!(c.socket_families(), &[OuterFamily::Ipv4, OuterFamily::Ipv6]);
+    #[cfg(target_os = "linux")]
     assert_eq!(
         crate::netfilter::NftSpec::from_config(&c, 443).outer_family,
         None

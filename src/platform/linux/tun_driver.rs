@@ -581,8 +581,6 @@ impl Drop for TunDriver<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::fd::OwnedFd;
-    use std::os::unix::net::UnixDatagram;
 
     fn wait_readable(driver: &TunDriver<'_>) -> io::Result<bool> {
         crate::platform::linux::poll(
@@ -597,10 +595,7 @@ mod tests {
     #[test]
     #[ignore = "requires permitted io_uring; run in the privileged e2e container"]
     fn uring_recycles_buffers_and_preserves_backlog_across_runtime_fallback() {
-        let (socket, peer) = UnixDatagram::pair().unwrap();
-        socket.set_nonblocking(true).unwrap();
-        peer.set_nonblocking(true).unwrap();
-        let socket = TunQueue::from(OwnedFd::from(socket));
+        let (socket, peer) = TunQueue::pair();
         let mut driver = TunDriver::new(&socket, 2048, 0);
         assert!(driver.fast.is_some(), "test must exercise io_uring");
         let mut buffer = [0; 2048];
@@ -685,10 +680,7 @@ mod tests {
 
     #[test]
     fn poll_backpressure_preserves_packet_order_without_duplicates() {
-        let (writer, reader) = UnixDatagram::pair().unwrap();
-        writer.set_nonblocking(true).unwrap();
-        reader.set_nonblocking(true).unwrap();
-        let writer = TunQueue::from(OwnedFd::from(writer));
+        let (writer, reader) = TunQueue::pair();
         let mut driver = TunDriver::poll(&writer, 2048, 0);
         let mut count = 0usize;
         loop {

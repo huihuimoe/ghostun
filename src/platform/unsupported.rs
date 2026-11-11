@@ -155,6 +155,17 @@ impl TunQueue {
     }
 }
 
+#[cfg(test)]
+impl TunQueue {
+    pub fn pair() -> (Self, std::net::UdpSocket) {
+        todo!()
+    }
+
+    pub fn fill(&self) {
+        todo!()
+    }
+}
+
 pub mod tun {
     use super::*;
 
@@ -171,6 +182,11 @@ pub struct TunDriver<'a>(&'a TunQueue);
 
 impl<'a> TunDriver<'a> {
     pub fn new(queue: &'a TunQueue, stride: usize, headroom: usize) -> Self {
+        todo!()
+    }
+
+    #[cfg(test)]
+    pub fn poll(queue: &'a TunQueue, stride: usize, headroom: usize) -> Self {
         todo!()
     }
 

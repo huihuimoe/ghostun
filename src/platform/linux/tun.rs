@@ -17,9 +17,18 @@ impl AsRawFd for TunQueue {
 }
 
 #[cfg(test)]
-impl From<OwnedFd> for TunQueue {
-    fn from(fd: OwnedFd) -> Self {
-        Self(fd)
+impl TunQueue {
+    /// A stand-in queue backed by a datagram socket, plus the peer that plays the kernel side.
+    pub fn pair() -> (Self, std::os::unix::net::UnixDatagram) {
+        let (queue, peer) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        queue.set_nonblocking(true).unwrap();
+        peer.set_nonblocking(true).unwrap();
+        (Self(queue.into()), peer)
+    }
+
+    /// Writes filler packets until the queue stops accepting them.
+    pub fn fill(&self) {
+        while write(self, &[99; 64]).unwrap() {}
     }
 }
 
