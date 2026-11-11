@@ -6,14 +6,14 @@ use super::auth::{AUTH_MAX, Handshake};
 use super::frame::{self, FRAME_PREFIX_LEN, PING, PONG, Receive, TX_LIMIT};
 use super::queue::SendQueue;
 use super::{BATCH, ROUNDS, can_io};
-use crate::sys::{self, READ_READY, WRITE_READY};
+use crate::platform::{self, READ_READY, WRITE_READY};
 use crate::transport::keepalive::{self, Keepalive};
 use crate::transport::tun_driver::TunDriver;
 
 /// TUN-side state owned by a worker and lent to its current connection.
 pub struct TunIo<'a> {
     pub driver: TunDriver<'a>,
-    /// Poll-fallback read buffer: `sys::raw::BATCH` slots of `stride` bytes.
+    /// Poll-fallback read buffer: `platform::raw::BATCH` slots of `stride` bytes.
     pub scratch: Vec<u8>,
     pub stride: usize,
     pub attached: bool,
@@ -48,7 +48,7 @@ impl Connection {
     ) -> io::Result<Self> {
         socket.set_nonblocking(true)?;
         socket.set_nodelay(true)?;
-        sys::tcp::set_notsent_lowat(&socket, tcp_notsent)?;
+        platform::tcp::set_notsent_lowat(&socket, tcp_notsent)?;
         let local = socket.local_addr()?;
         Ok(Self {
             socket,
@@ -136,7 +136,7 @@ impl Connection {
             Instant::now(),
             ping,
             dead,
-            &[tun_ready, sys::pollfd(-1, 0)],
+            &[tun_ready, platform::pollfd(-1, 0)],
         )
         .map(drop)
     }
@@ -229,7 +229,7 @@ impl Connection {
                 if let Some(e) = malformed {
                     return Err(e);
                 }
-                tun_r = reads == sys::raw::BATCH;
+                tun_r = reads == platform::raw::BATCH;
             }
             self.flush_tx(&mut sock_w)?;
             tun.driver.service(tun.attached, self.tx.room(mtu));
@@ -244,7 +244,7 @@ impl Connection {
         }
         if now.duration_since(self.last_ping) >= ping && self.tx.room(keepalive::LEN) {
             let mut nonce = [0u8; 8];
-            sys::random(&mut nonce)?;
+            platform::random(&mut nonce)?;
             let msg = Keepalive::new(PING, nonce).encode();
             self.tx.push(&msg);
             self.last_ping = now;

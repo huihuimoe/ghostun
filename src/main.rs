@@ -2,7 +2,7 @@ mod app;
 mod config;
 mod net;
 mod netfilter;
-mod sys;
+mod platform;
 mod transport;
 
 use std::process::ExitCode;

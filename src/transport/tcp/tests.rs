@@ -25,7 +25,7 @@ fn params() -> Params {
 fn tun_io(fd: &OwnedFd) -> TunIo<'_> {
     TunIo {
         driver: TunDriver::poll(fd.as_fd(), 1380, 0),
-        scratch: vec![0; crate::sys::raw::BATCH * 1380],
+        scratch: vec![0; crate::platform::raw::BATCH * 1380],
         stride: 1380,
         attached: true,
     }

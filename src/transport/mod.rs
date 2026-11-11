@@ -16,7 +16,7 @@ use std::sync::atomic::AtomicBool;
 use std::thread::JoinHandle;
 
 use crate::config::{Config, MAX_CONNS, Mode, OuterMode, Transport};
-use crate::sys;
+use crate::platform;
 use control::{
     Control, CoreTable, ExitWorkerGuard, Reload, RollingReload, StopOnDrop, candidate_cpus,
 };
@@ -116,7 +116,7 @@ pub fn start(
             cfg.transport
         );
     }
-    let default_cpus = sys::usable_cpus();
+    let default_cpus = platform::usable_cpus();
     let mut core_table = CoreTable::new(candidate_cpus(cfg, &default_cpus));
     let seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -287,7 +287,7 @@ impl Running {
         build: impl FnOnce(&Self, OwnedFd) -> Result<Start, String>,
     ) {
         self.replace_exit_slot(id, tuple);
-        let tun = match sys::tun::open_queue(&self.cfg.tun_name) {
+        let tun = match platform::tun::open_queue(&self.cfg.tun_name) {
             Ok(fd) => fd,
             Err(e) => {
                 log::error!("worker {id}: opening TUN queue {}: {e}", self.cfg.tun_name);
@@ -381,7 +381,7 @@ impl Running {
             None => {}
         }
         if let Some(fd) = self.listener_wake {
-            sys::eventfd_notify(fd);
+            platform::eventfd_notify(fd);
         }
         self.reap_exited_workers();
         if key_changed {
@@ -515,7 +515,7 @@ impl Running {
             slot.ctrl.stop(true);
         }
         if let Some(fd) = self.listener_wake {
-            sys::eventfd_notify(fd);
+            platform::eventfd_notify(fd);
         }
         for thread in self.entry_threads {
             if thread.join().is_err() {

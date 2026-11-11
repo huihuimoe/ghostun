@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 use crate::config::{Config, Mode};
 use crate::netfilter;
-use crate::sys::{self, route};
+use crate::platform::{self, route};
 use crate::transport::{self, EntryRoute, Outer, budget};
 
 static STOP: AtomicBool = AtomicBool::new(false);
@@ -19,11 +19,11 @@ extern "C" fn on_signal(sig: libc::c_int) {
     } else {
         STOP.store(true, Ordering::Relaxed);
     }
-    sys::eventfd_notify(MAIN_WAKE.load(Ordering::Relaxed));
+    platform::eventfd_notify(MAIN_WAKE.load(Ordering::Relaxed));
 }
 
 fn interface_mtu(dev: &str) -> u32 {
-    sys::iface_mtu(dev).unwrap_or_else(|e| {
+    platform::iface_mtu(dev).unwrap_or_else(|e| {
         log::warn!("cannot read MTU of {dev} ({e}), assuming 1500");
         1500
     })
@@ -75,10 +75,10 @@ fn resolve_outer(cfg: &Config) -> Result<Outer, String> {
 }
 
 pub fn run(mut cfg: Config) -> Result<(), String> {
-    let main_wake = sys::eventfd().map_err(|e| format!("eventfd: {e}"))?;
+    let main_wake = platform::eventfd().map_err(|e| format!("eventfd: {e}"))?;
     let main_wake_fd = main_wake.as_raw_fd();
     MAIN_WAKE.store(main_wake_fd, Ordering::Relaxed);
-    sys::install_signal_handlers(on_signal).map_err(|e| format!("signal handlers: {e}"))?;
+    platform::install_signal_handlers(on_signal).map_err(|e| format!("signal handlers: {e}"))?;
     let outer = resolve_outer(&cfg)?;
     let tun_mtu = cfg.resolve_tun_mtu(outer.mtu)?;
     let listen_port = cfg.listen.unwrap_or(0);
@@ -86,7 +86,7 @@ pub fn run(mut cfg: Config) -> Result<(), String> {
         Mode::Entry => usize::from(cfg.conns),
         Mode::Exit => 1,
     };
-    let tuns = sys::tun::create(&cfg.tun_name, queues)
+    let tuns = platform::tun::create(&cfg.tun_name, queues)
         .map_err(|e| format!("creating TUN {}: {e}", cfg.tun_name))?;
     let ipv6 = route::configure_tun(
         &cfg.tun_name,
@@ -149,9 +149,9 @@ pub fn run(mut cfg: Config) -> Result<(), String> {
     };
 
     let mut running = transport::start(&cfg, &outer, tun_mtu, tuns, &STOP, main_wake_fd)?;
-    let mut poll_fd = [sys::pollfd(main_wake_fd, libc::POLLIN)];
+    let mut poll_fd = [platform::pollfd(main_wake_fd, libc::POLLIN)];
     while !STOP.load(Ordering::Relaxed) {
-        sys::eventfd_drain(main_wake.as_fd());
+        platform::eventfd_drain(main_wake.as_fd());
         if RELOAD.swap(false, Ordering::Relaxed) {
             match cfg.reload() {
                 Ok(next) if next == cfg && !running.is_reloading() => {
@@ -168,7 +168,7 @@ pub fn run(mut cfg: Config) -> Result<(), String> {
         if STOP.load(Ordering::Relaxed) {
             break;
         }
-        if let Err(e) = sys::poll(&mut poll_fd, -1) {
+        if let Err(e) = platform::poll(&mut poll_fd, -1) {
             log::error!("main poll: {e}");
             break;
         }

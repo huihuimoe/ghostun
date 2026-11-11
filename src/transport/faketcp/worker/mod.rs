@@ -15,7 +15,7 @@ use super::frame::{self, MAX_OVERHEAD, TcpMeta, flags};
 use super::session::{Promoted, Session, SessionConfig, Sink, WINDOW, emit};
 use crate::config::{AuthKey, Config, MAX_CONNS, Mode};
 use crate::net::OuterFamily;
-use crate::sys::{self, raw};
+use crate::platform::{self, raw};
 use crate::transport::control::{self, Control};
 use crate::transport::queue::Pending;
 use crate::transport::tun_driver::TunDriver;
@@ -152,7 +152,7 @@ impl Listener {
                 .map_err(|e| format!("{family:?} raw socket: {e}"))?;
             sockets.push((family, fd));
         }
-        let wake = sys::eventfd().map_err(|e| format!("listener eventfd: {e}"))?;
+        let wake = platform::eventfd().map_err(|e| format!("listener eventfd: {e}"))?;
         let auth = Auth::new(
             &cfg.tunables.auth_key,
             Mode::Exit,
@@ -217,9 +217,9 @@ impl Listener {
             .iter()
             .map(|(f, _)| raw::Receiver::new(*f, MIN_STRIDE))
             .collect();
-        let mut fds = vec![sys::pollfd(wake.as_raw_fd(), libc::POLLIN)];
+        let mut fds = vec![platform::pollfd(wake.as_raw_fd(), libc::POLLIN)];
         for (_, fd) in &sockets {
-            fds.push(sys::pollfd(fd.as_raw_fd(), libc::POLLIN));
+            fds.push(platform::pollfd(fd.as_raw_fd(), libc::POLLIN));
         }
         let mut scratch = [0u8; MAX_OVERHEAD + PROOF_LEN];
         let mut applied_epoch = 0;
@@ -237,7 +237,7 @@ impl Listener {
                         0
                     };
             }
-            match sys::poll(&mut fds, -1) {
+            match platform::poll(&mut fds, -1) {
                 Ok(true) => {}
                 Ok(false) => continue,
                 Err(e) => {
@@ -245,7 +245,7 @@ impl Listener {
                     return;
                 }
             }
-            if sys::poll_wake(fds[0], wake.as_fd()) {
+            if platform::poll_wake(fds[0], wake.as_fd()) {
                 let s = state.lock().unwrap();
                 auth.reload(&s.key, s.timeout);
                 if s.epoch != applied_epoch {
@@ -256,7 +256,10 @@ impl Listener {
             if stop.load(Ordering::Relaxed) {
                 break;
             }
-            if fds[1..].iter().any(|fd| fd.revents & sys::WRITE_READY != 0) {
+            if fds[1..]
+                .iter()
+                .any(|fd| fd.revents & platform::WRITE_READY != 0)
+            {
                 out.flush();
             }
             let now = Instant::now();
@@ -361,7 +364,7 @@ impl Listener {
                                         });
                                         s.main_wake
                                     };
-                                    sys::eventfd_notify(main_wake);
+                                    platform::eventfd_notify(main_wake);
                                 }
                                 Err(e) => log::error!("authentication randomness: {e}"),
                             }
@@ -556,10 +559,10 @@ impl Worker {
         let mut attached = mode == Mode::Exit;
         let mut rx = raw::Receiver::new(family, stride);
         let mut fds = [
-            sys::pollfd(tun.as_raw_fd(), libc::POLLIN),
-            sys::pollfd(ctrl.wake_fd().as_raw_fd(), libc::POLLIN),
-            sys::pollfd(-1, libc::POLLIN),
-            sys::pollfd(socket.1.as_raw_fd(), libc::POLLIN),
+            platform::pollfd(tun.as_raw_fd(), libc::POLLIN),
+            platform::pollfd(ctrl.wake_fd().as_raw_fd(), libc::POLLIN),
+            platform::pollfd(-1, libc::POLLIN),
+            platform::pollfd(socket.1.as_raw_fd(), libc::POLLIN),
         ];
         let mut busy = false;
         let mut applied_gen = 0;
@@ -587,13 +590,13 @@ impl Worker {
             let timeout = if busy || (driver.has_reads() && out.room(&driver, stride, 1)) {
                 0
             } else {
-                sys::poll_ms(
+                platform::poll_ms(
                     session
                         .next_deadline()
                         .saturating_duration_since(Instant::now()),
                 )
             };
-            match sys::poll(&mut fds, timeout) {
+            match platform::poll(&mut fds, timeout) {
                 Ok(true) => {}
                 Ok(false) => continue,
                 Err(e) => {
@@ -601,17 +604,17 @@ impl Worker {
                     break;
                 }
             }
-            sys::poll_wake(fds[1], ctrl.wake_fd());
+            platform::poll_wake(fds[1], ctrl.wake_fd());
             if stop.load(Ordering::Relaxed) || ctrl.is_stopped() {
                 break;
             }
             let now = Instant::now();
             let read_allowed = out.room(&driver, stride, 1);
             driver.service(attached, read_allowed);
-            if fds[3].revents & sys::WRITE_READY != 0 {
+            if fds[3].revents & platform::WRITE_READY != 0 {
                 out.flush();
             }
-            if fds[0].revents & sys::WRITE_READY != 0 {
+            if fds[0].revents & platform::WRITE_READY != 0 {
                 driver.flush();
             }
             let mut tun_ready = (fds[0].revents & libc::POLLIN != 0 || driver.has_reads())

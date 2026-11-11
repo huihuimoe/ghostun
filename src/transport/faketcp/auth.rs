@@ -14,7 +14,7 @@ type HmacSha256 = Hmac<Sha256>;
 
 use super::frame::TcpMeta;
 use crate::config::{AuthKey, MAX_CONNS, Mode};
-use crate::sys;
+use crate::platform;
 
 pub const CONTROL: u8 = 3;
 const VERSION: u8 = 1;
@@ -166,7 +166,7 @@ impl Auth {
     pub fn new(key: &AuthKey, mode: Mode, now: Instant, timeout: Duration) -> io::Result<Self> {
         let server = if mode == Mode::Exit {
             let mut secret = [0; NONCE_LEN];
-            sys::random(&mut secret)?;
+            platform::random(&mut secret)?;
             Some(Server {
                 cookie_key: HmacSha256::new_from_slice(&secret)
                     .expect("HMAC accepts a 32-byte key"),
@@ -203,7 +203,7 @@ impl Auth {
         let hello = Hello::mut_from_bytes(&mut frame[..HELLO_LEN]).expect("Hello buffer");
         hello.header = header(HELLO);
         hello.worker.set(worker);
-        sys::random(&mut hello.nonce)?;
+        platform::random(&mut hello.nonce)?;
         self.entry = Some(EntryState {
             frame,
             len: HELLO_LEN,
@@ -375,7 +375,7 @@ impl Auth {
         challenge.body.transcript.issued_ms.set(issued_ms);
         challenge.body.transcript.worker.set(worker);
         challenge.body.transcript.entry_nonce = hello.nonce;
-        sys::random(&mut challenge.body.transcript.exit_nonce)?;
+        platform::random(&mut challenge.body.transcript.exit_nonce)?;
         challenge.body.cookie = cookie_mac(
             &server.cookie_key,
             meta,

@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use super::auth::{self, Handshake};
 use super::{BATCH, Connection, invalid};
 use crate::config::{AuthKey, Config, MAX_CONNS};
-use crate::sys::{self, READ_READY, poll, poll_ms, pollfd};
+use crate::platform::{self, READ_READY, poll, poll_ms, pollfd};
 use crate::transport::control;
 
 pub const MAX_CANDIDATES: usize = MAX_CONNS;
@@ -41,14 +41,14 @@ impl Listener {
         let mut listeners = Vec::new();
         for &family in cfg.socket_families() {
             let ip = cfg.listen_ip.unwrap_or_else(|| family.unspecified());
-            let listener = sys::tcp::listener(
+            let listener = platform::tcp::listener(
                 SocketAddr::new(ip, cfg.listen.unwrap()),
                 cfg.iface.as_deref(),
             )?;
             listener.set_nonblocking(true)?;
             listeners.push(listener);
         }
-        let wake = sys::eventfd()?;
+        let wake = platform::eventfd()?;
         let state = Arc::new(Mutex::new(ExitState {
             key: cfg.tunables.auth_key.clone(),
             epoch: 0,
@@ -114,7 +114,7 @@ impl Listener {
                 log::error!("accept poll: {e}");
                 return;
             }
-            sys::poll_wake(fds[self.listeners.len()], self.wake.as_fd());
+            platform::poll_wake(fds[self.listeners.len()], self.wake.as_fd());
             if stop.load(Ordering::Relaxed) {
                 break;
             }
@@ -233,7 +233,7 @@ impl Candidate {
             s.admitted.push_back((id, self.conn));
             s.main_wake
         };
-        sys::eventfd_notify(wake);
+        platform::eventfd_notify(wake);
         Ok(())
     }
 }

@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::config::{Config, Tunables};
-use crate::sys;
+use crate::platform;
 
 pub struct Reload {
     pub tunables: Tunables,
@@ -87,7 +87,7 @@ impl Control {
     pub fn new(initial_cpu: Option<usize>, main_wake: RawFd) -> Self {
         Self {
             initial_cpu,
-            wake: sys::eventfd().expect("creating worker eventfd"),
+            wake: platform::eventfd().expect("creating worker eventfd"),
             main_wake,
             target_gen: AtomicU64::new(0),
             applied_gen: AtomicU64::new(0),
@@ -107,7 +107,7 @@ impl Control {
 
     #[inline]
     pub fn wake(&self) {
-        sys::eventfd_notify(self.wake.as_raw_fd());
+        platform::eventfd_notify(self.wake.as_raw_fd());
     }
 
     pub fn stop(&self, send_rst: bool) {
@@ -174,7 +174,7 @@ impl Control {
             self.established.store(established, Ordering::Release);
             self.applied_gen.store(generation, Ordering::Release);
             if generation > 0 && !was_complete && (!wait || established) {
-                sys::eventfd_notify(self.main_wake);
+                platform::eventfd_notify(self.main_wake);
             }
         }
     }
@@ -242,7 +242,7 @@ impl RollingReload {
 
 pub fn pin(id: usize, cpu: Option<usize>) {
     if let Some(target) = cpu
-        && let Err(e) = sys::pin_to_cpu(target)
+        && let Err(e) = platform::pin_to_cpu(target)
     {
         log::warn!("worker {id}: cannot pin to CPU: {e}");
     }
@@ -251,7 +251,7 @@ pub fn pin(id: usize, cpu: Option<usize>) {
 #[inline]
 pub fn sync_tun_queue(id: usize, tun: BorrowedFd<'_>, attached: &mut bool, established: bool) {
     if *attached != established {
-        match sys::tun::set_queue(tun, established) {
+        match platform::tun::set_queue(tun, established) {
             Ok(()) => *attached = established,
             Err(e) => log::warn!("worker {id}: TUN queue attach={established}: {e}"),
         }
@@ -263,7 +263,7 @@ pub struct StopOnDrop(pub &'static AtomicBool, pub RawFd);
 impl Drop for StopOnDrop {
     fn drop(&mut self) {
         self.0.store(true, Ordering::Relaxed);
-        sys::eventfd_notify(self.1);
+        platform::eventfd_notify(self.1);
     }
 }
 
@@ -279,7 +279,7 @@ impl Drop for ExitWorkerGuard {
             self.stop.store(true, Ordering::Relaxed);
         }
         self.ctrl.mark_exited();
-        sys::eventfd_notify(self.main_wake);
+        platform::eventfd_notify(self.main_wake);
     }
 }
 

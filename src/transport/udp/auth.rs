@@ -13,7 +13,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 type HmacSha256 = Hmac<Sha256>;
 
 use crate::config::{AuthKey, MAX_CONNS};
-use crate::sys;
+use crate::platform;
 
 pub const CONTROL: u8 = 3;
 const VERSION: u8 = 1;
@@ -184,7 +184,7 @@ impl Auth {
         hello.header = header(HELLO);
         hello.worker.set(worker);
         hello.mtu.set(self.mtu);
-        sys::random(&mut hello.nonce)?;
+        platform::random(&mut hello.nonce)?;
         self.entry = Some(EntryState {
             frame,
             len: HELLO_LEN,
@@ -296,7 +296,7 @@ impl Auth {
             Some(server) => server,
             None => {
                 let mut secret = [0; NONCE_LEN];
-                sys::random(&mut secret)?;
+                platform::random(&mut secret)?;
                 self.server.insert(Server {
                     cookie_key: HmacSha256::new_from_slice(&secret)
                         .expect("HMAC accepts a 32-byte key"),
@@ -319,7 +319,7 @@ impl Auth {
         challenge.body.transcript.worker.set(worker);
         challenge.body.transcript.mtu.set(mtu);
         challenge.body.transcript.entry_nonce = hello.nonce;
-        sys::random(&mut challenge.body.transcript.exit_nonce)?;
+        platform::random(&mut challenge.body.transcript.exit_nonce)?;
         challenge.body.cookie = cookie_mac(
             &server.cookie_key,
             local,

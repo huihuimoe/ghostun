@@ -7,10 +7,10 @@ use std::mem;
 use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 
 use super::queue::{BYTE_LIMIT, Pending};
-use crate::sys;
-use crate::sys::uring::{self, Cqe, Ring, Sqe};
+use crate::platform;
+use crate::platform::uring::{self, Cqe, Ring, Sqe};
 
-const BUFFERS: usize = sys::raw::BATCH;
+const BUFFERS: usize = platform::raw::BATCH;
 const GROUP: u16 = 1;
 const READ: u64 = 1;
 const CANCEL: u64 = 3;
@@ -421,7 +421,7 @@ impl<'a> TunDriver<'a> {
             return Ok(Some(packet.len()));
         }
         let Some(fast) = &mut self.fast else {
-            return sys::tun::read(self.fd, output);
+            return platform::tun::read(self.fd, output);
         };
         let Some((index, len)) = fast.ready.pop_front() else {
             return Ok(None);
@@ -516,7 +516,7 @@ impl<'a> TunDriver<'a> {
     }
 
     fn write_poll(&self, packet: &[u8]) -> bool {
-        match sys::tun::write(self.fd, packet) {
+        match platform::tun::write(self.fd, packet) {
             Ok(done) => done,
             Err(error) => {
                 log::debug!("TUN write: {error}; dropping packet");
@@ -591,7 +591,8 @@ mod tests {
                     received = true;
                     break;
                 }
-                sys::poll(&mut [sys::pollfd(driver.read_fd(), libc::POLLIN)], 10).unwrap();
+                platform::poll(&mut [platform::pollfd(driver.read_fd(), libc::POLLIN)], 10)
+                    .unwrap();
             }
             assert!(received);
             assert!(driver.fast.is_some());
@@ -602,7 +603,7 @@ mod tests {
             if !fast.reading && !fast.canceling {
                 break;
             }
-            sys::poll(&mut [sys::pollfd(driver.read_fd(), libc::POLLIN)], 10).unwrap();
+            platform::poll(&mut [platform::pollfd(driver.read_fd(), libc::POLLIN)], 10).unwrap();
         }
         assert!(!driver.fast.as_ref().unwrap().reading);
         peer.send(b"paused").unwrap();
@@ -616,7 +617,7 @@ mod tests {
                 resumed = true;
                 break;
             }
-            sys::poll(&mut [sys::pollfd(driver.read_fd(), libc::POLLIN)], 10).unwrap();
+            platform::poll(&mut [platform::pollfd(driver.read_fd(), libc::POLLIN)], 10).unwrap();
         }
         assert!(resumed);
         for sequence in 0..200 {
@@ -629,7 +630,7 @@ mod tests {
             if driver.has_reads() {
                 break;
             }
-            sys::poll(&mut [sys::pollfd(driver.read_fd(), libc::POLLIN)], 10).unwrap();
+            platform::poll(&mut [platform::pollfd(driver.read_fd(), libc::POLLIN)], 10).unwrap();
         }
         assert!(driver.has_reads());
         driver.fallback(io::Error::from_raw_os_error(libc::EOPNOTSUPP));

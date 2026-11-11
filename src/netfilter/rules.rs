@@ -15,7 +15,7 @@ use super::NftSpec;
 use super::batch::Batch;
 use crate::config::{Mode, Transport};
 use crate::net::{Cidr, OuterFamily};
-use crate::sys::raw::SOCKET_MARK;
+use crate::platform::raw::SOCKET_MARK;
 
 const REGISTER: Register = Register::Reg1;
 const NETWORK_HEADER: u32 = 1;

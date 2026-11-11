@@ -9,7 +9,7 @@ use super::auth::{Handshake, Params};
 use super::connection::TunIo;
 use super::{Connection, ROUNDS};
 use crate::config::{Config, Mode};
-use crate::sys::{self, READ_READY, poll, poll_ms, pollfd};
+use crate::platform::{self, READ_READY, poll, poll_ms, pollfd};
 use crate::transport::control::{self, Backoff};
 use crate::transport::tun_driver::TunDriver;
 
@@ -64,7 +64,7 @@ impl Worker {
         // a larger stride would strand the queue between the two bounds and spin the loop.
         let mut tun = TunIo {
             driver: TunDriver::new(self.tun.as_fd(), mtu, 0),
-            scratch: vec![0; sys::raw::BATCH * mtu],
+            scratch: vec![0; platform::raw::BATCH * mtu],
             stride: mtu,
             attached,
         };
@@ -79,12 +79,12 @@ impl Worker {
             pollfd(-1, 0),
         ];
         while !stop.load(Ordering::Relaxed) && !ctrl.is_stopped() {
-            sys::poll_wake(fds[2], ctrl.wake_fd());
+            platform::poll_wake(fds[2], ctrl.wake_fd());
             if ctrl.is_stopped() {
                 break;
             }
             tun.driver.service(tun.attached, read_allowed(&connection));
-            if fds[0].revents & sys::WRITE_READY != 0 {
+            if fds[0].revents & platform::WRITE_READY != 0 {
                 tun.driver.flush();
             }
             if let Some((new_gen, reload)) = ctrl.take_reload(generation) {
@@ -109,19 +109,20 @@ impl Worker {
             let mut now = Instant::now();
             if connection.is_none() && self.cfg.mode == Mode::Entry && now >= retry_at {
                 let remote = self.remote.expect("entry worker has remote");
-                let result = sys::tcp::connect(remote, self.cfg.iface.as_deref()).and_then(|s| {
-                    let mut c = Connection::new(s, remote, now, self.cfg.tcp_notsent)?;
-                    let (auth, hello) = Handshake::entry(
-                        &self.cfg.tunables.auth_key,
-                        Params {
-                            worker: id as u16,
-                            mtu: self.mtu,
-                        },
-                    )?;
-                    c.auth = Some(auth);
-                    c.tx.push(&hello);
-                    Ok(c)
-                });
+                let result =
+                    platform::tcp::connect(remote, self.cfg.iface.as_deref()).and_then(|s| {
+                        let mut c = Connection::new(s, remote, now, self.cfg.tcp_notsent)?;
+                        let (auth, hello) = Handshake::entry(
+                            &self.cfg.tunables.auth_key,
+                            Params {
+                                worker: id as u16,
+                                mtu: self.mtu,
+                            },
+                        )?;
+                        c.auth = Some(auth);
+                        c.tx.push(&hello);
+                        Ok(c)
+                    });
                 match result {
                     Ok(c) => {
                         connection = Some(c);
@@ -202,11 +203,11 @@ impl Worker {
                         |_, _| false,
                     );
                     drained += reads;
-                    if reads < sys::raw::BATCH {
+                    if reads < platform::raw::BATCH {
                         break;
                     }
                 }
-                busy |= drained == ROUNDS * sys::raw::BATCH;
+                busy |= drained == ROUNDS * platform::raw::BATCH;
             }
             // Arm the multishot read right after a fresh attach; otherwise the ring stays silent
             // until an unrelated socket event or timer wakes the loop.
@@ -268,7 +269,7 @@ impl Worker {
     fn retry(&self, backoff: &mut Backoff, stable: bool) -> Instant {
         let mut bytes = [0; 4];
         // Failure to obtain retry jitter must not produce a rapid reconnect loop.
-        let delay = match sys::random(&mut bytes) {
+        let delay = match platform::random(&mut bytes) {
             Ok(()) => backoff.delay(u32::from_ne_bytes(bytes), stable),
             Err(e) => {
                 log::error!("worker {}: retry randomness: {e}", self.id);

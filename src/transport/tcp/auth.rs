@@ -10,7 +10,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 use super::invalid;
 use crate::config::{AuthKey, MAX_CONNS};
-use crate::sys;
+use crate::platform;
 
 const MSG_HELLO: u8 = 1;
 const MSG_CHALLENGE: u8 = 2;
@@ -66,7 +66,7 @@ impl Params {
         hello.version = PROTOCOL_VERSION;
         hello.worker.set(self.worker);
         hello.mtu.set(self.mtu);
-        sys::random(&mut hello.nonce)?;
+        platform::random(&mut hello.nonce)?;
         Ok(bytes)
     }
 }
@@ -142,7 +142,7 @@ impl Handshake {
         }
         let mut challenge = [0; CHALLENGE_LEN];
         challenge[0] = MSG_CHALLENGE;
-        sys::random(&mut challenge[1..CHALLENGE_PREFIX_LEN])?;
+        platform::random(&mut challenge[1..CHALLENGE_PREFIX_LEN])?;
         let mut transcript = init_transcript(hello);
         transcript[OFF_TRANSCRIPT_CHALLENGE..].copy_from_slice(&challenge[..CHALLENGE_PREFIX_LEN]);
         let auth = Self {

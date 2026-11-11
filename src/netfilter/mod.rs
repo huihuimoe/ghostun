@@ -13,7 +13,7 @@ use netlink_packet_netfilter::nftables::NfTablesMessage;
 
 use crate::config::{Config, Mode, OuterMode, Transport};
 use crate::net::{Cidr, OuterFamily};
-use crate::sys;
+use crate::platform;
 
 #[derive(Clone, Debug)]
 pub struct NftSpec {
@@ -100,9 +100,9 @@ fn delete_table(table: &str) -> io::Result<()> {
 
 pub fn install(spec: &NftSpec) -> io::Result<Guard> {
     if spec.mode == Mode::Exit {
-        sys::sysctl_set("net.ipv4.ip_forward", "1")?;
+        platform::sysctl_set("net.ipv4.ip_forward", "1")?;
         if spec.inner_v6.is_some() {
-            sys::sysctl_set("net.ipv6.conf.all.forwarding", "1")?;
+            platform::sysctl_set("net.ipv6.conf.all.forwarding", "1")?;
         }
     }
     let table = table_name(&spec.tun_name);
