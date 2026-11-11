@@ -3,7 +3,7 @@
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -14,10 +14,9 @@ use super::frame::{self, MAX_OVERHEAD, TcpMeta, flags};
 use super::session::{Promoted, Session, SessionConfig, Sink, WINDOW, emit};
 use crate::config::{Config, MAX_CONNS, Mode};
 use crate::net::OuterFamily;
-use crate::platform::{self, Interest, Poller, Waker, raw};
+use crate::platform::{self, Interest, Poller, TunDriver, TunQueue, Waker, raw};
 use crate::transport::control::{self, Admission, Control};
 use crate::transport::queue::Pending;
-use crate::transport::tun_driver::TunDriver;
 #[cfg(test)]
 mod tests;
 
@@ -423,7 +422,7 @@ pub struct Worker {
     id: usize,
     mode: Mode,
     session: Session,
-    tun: OwnedFd,
+    tun: TunQueue,
     socket: (OuterFamily, OwnedFd),
     pending_out: Pending<IpAddr>,
     exit_cleanup: Option<(SharedExitState, SocketAddr, SocketAddr)>,
@@ -435,7 +434,7 @@ impl Worker {
         cfg: &Config,
         route: &crate::transport::EntryRoute,
         outer_mtu: u32,
-        tun: OwnedFd,
+        tun: TunQueue,
         seed: u64,
     ) -> Result<Self, String> {
         let worker = id as u16;
@@ -468,7 +467,7 @@ impl Worker {
         id: usize,
         cfg: &Config,
         outer_mtu: u32,
-        tun: OwnedFd,
+        tun: TunQueue,
         promo: Promoted,
         state: SharedExitState,
         seed: u64,
@@ -495,7 +494,7 @@ impl Worker {
             iss: promo.iss,
         });
         let mut attached = false;
-        control::sync_tun_queue(id, tun.as_fd(), &mut attached, true);
+        control::sync_tun_queue(id, &tun, &mut attached, true);
         let mut out = RawSink {
             sockets: std::slice::from_ref(&socket),
             sender: raw::Sender::new(family),
@@ -545,7 +544,7 @@ impl Worker {
         };
         session.start(Instant::now(), &mut out);
         let mut generation = session.generation();
-        let mut driver = TunDriver::new(tun.as_fd(), stride, overhead);
+        let mut driver = TunDriver::new(&tun, stride, overhead);
         let mut attached = mode == Mode::Exit;
         let mut rx = raw::Receiver::new(family, stride);
         let mut poller = Poller::default();
@@ -556,12 +555,7 @@ impl Worker {
         let mut busy = false;
         let mut applied_gen = 0;
         while !stop.load(Ordering::Relaxed) && !ctrl.is_stopped() {
-            let polled = driver.read_fd() == tun.as_raw_fd();
-            if polled {
-                poller.unbind(ring_slot);
-            } else {
-                poller.bind(ring_slot, &driver.read_fd(), Interest::READ);
-            }
+            let polled = driver.bind_ring(&mut poller, ring_slot);
             poller.set(
                 tun_slot,
                 Interest::READ.when(polled && out.room(&driver, stride, 1))
@@ -689,7 +683,7 @@ impl Worker {
             if mode == Mode::Exit && !established {
                 break;
             }
-            control::sync_tun_queue(id, tun.as_fd(), &mut attached, established);
+            control::sync_tun_queue(id, &tun, &mut attached, established);
             let read_allowed = out.room(&driver, stride, 1);
             driver.service(attached, read_allowed);
             ctrl.report(applied_gen, established, wait);

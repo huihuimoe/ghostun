@@ -1,6 +1,6 @@
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::UnixDatagram;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -13,8 +13,8 @@ use super::queue::SendQueue;
 use super::*;
 use crate::config::{AuthKey, MAX_CONNS};
 use crate::platform::Waker;
+use crate::platform::{TunDriver, TunQueue};
 use crate::transport::control::Backoff;
-use crate::transport::tun_driver::TunDriver;
 
 fn params() -> Params {
     Params {
@@ -23,9 +23,9 @@ fn params() -> Params {
     }
 }
 /// Poll-mode driver so tests do not depend on host io_uring support.
-fn tun_io(fd: &OwnedFd) -> TunIo<'_> {
+fn tun_io(fd: &TunQueue) -> TunIo<'_> {
     TunIo {
-        driver: TunDriver::poll(fd.as_fd(), 1380, 0),
+        driver: TunDriver::poll(fd, 1380, 0),
         scratch: vec![0; crate::platform::BATCH * 1380],
         stride: 1380,
         attached: true,
@@ -432,7 +432,7 @@ fn authenticated_admission_and_takeover_preserve_exact_data_and_ignore_incomplet
     let (tun, consumer) = UnixDatagram::pair().unwrap();
     tun.set_nonblocking(true).unwrap();
     consumer.set_nonblocking(true).unwrap();
-    let tun = OwnedFd::from(tun);
+    let tun = TunQueue::from(OwnedFd::from(tun));
     let mut io = tun_io(&tun);
     let p = packet(9);
     entry.tx.push(&p);
@@ -495,7 +495,7 @@ fn blocked_tun_queues_frames_then_delivers_in_order_after_resume() {
     consumer.set_nonblocking(true).unwrap();
     let filler = vec![99; 64];
     while tun.send(&filler).is_ok() {}
-    let tun = OwnedFd::from(tun);
+    let tun = TunQueue::from(OwnedFd::from(tun));
     let mut io = tun_io(&tun);
     let packets = [packet(10), packet(20)];
     let mut tx = SendQueue::new(crate::transport::budget::TCP_NOTSENT as usize);
@@ -532,7 +532,7 @@ fn eof_and_illegal_established_control_close_the_stream() {
     c.establish(1380);
     let (tun, _consumer) = UnixDatagram::pair().unwrap();
     tun.set_nonblocking(true).unwrap();
-    let tun = OwnedFd::from(tun);
+    let tun = TunQueue::from(OwnedFd::from(tun));
     let mut io = tun_io(&tun);
     sender.write_all(&[0, 1, 3]).unwrap();
     for _ in 0..100 {
@@ -598,7 +598,7 @@ fn partial_bytes_do_not_refresh_end_to_end_liveness() {
     c.establish(1380);
     let (tun, _consumer) = UnixDatagram::pair().unwrap();
     tun.set_nonblocking(true).unwrap();
-    let tun = OwnedFd::from(tun);
+    let tun = TunQueue::from(OwnedFd::from(tun));
     let mut io = tun_io(&tun);
     let prior = c.last_rx;
     peer.write_all(&[0, 9, PING, 0]).unwrap();
@@ -671,7 +671,7 @@ fn slow_tcp_receiver_backpressures_tun_at_the_transmit_bound_then_delivers_exact
         let (tun, producer) = UnixDatagram::pair().unwrap();
         tun.set_nonblocking(true).unwrap();
         producer.set_nonblocking(true).unwrap();
-        let tun = OwnedFd::from(tun);
+        let tun = TunQueue::from(OwnedFd::from(tun));
         let mut io = tun_io(&tun);
         let p = packet(23);
         let mut sent = 0;

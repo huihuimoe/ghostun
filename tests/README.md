@@ -54,7 +54,7 @@ with `EXPECT_TUN_DRIVER=poll` to check policy fallback. For that container, repl
 --security-opt seccomp="$PWD/tests/deny-io-uring.json"`;
 Docker bypasses seccomp in privileged containers.
 Run the ignored `platform::linux::raw::tests::entry_raw_socket_binds_and_connects_both_families`
-and `transport::tun_driver::tests::uring_recycles_buffers_and_preserves_backlog_across_runtime_fallback`
+and `platform::linux::tun_driver::tests::uring_recycles_buffers_and_preserves_backlog_across_runtime_fallback`
 tests inside the privileged container too.
 
 To run the performance scenarios from `README.md`, run:

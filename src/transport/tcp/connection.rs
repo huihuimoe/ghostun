@@ -7,8 +7,8 @@ use super::frame::{self, FRAME_PREFIX_LEN, PING, PONG, Receive, TX_LIMIT};
 use super::queue::SendQueue;
 use super::{BATCH, ROUNDS};
 use crate::platform;
+use crate::platform::TunDriver;
 use crate::transport::keepalive::{self, Keepalive};
-use crate::transport::tun_driver::TunDriver;
 
 /// TUN-side state owned by a worker and lent to its current connection.
 pub struct TunIo<'a> {

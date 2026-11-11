@@ -2,12 +2,29 @@
 
 use std::io;
 use std::mem::zeroed;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use super::cvt;
 
+/// One queue of the multi-queue TUN device; packets are moved through a [`super::TunDriver`].
+pub struct TunQueue(OwnedFd);
+
+impl AsRawFd for TunQueue {
+    #[inline(always)]
+    fn as_raw_fd(&self) -> RawFd {
+        self.0.as_raw_fd()
+    }
+}
+
+#[cfg(test)]
+impl From<OwnedFd> for TunQueue {
+    fn from(fd: OwnedFd) -> Self {
+        Self(fd)
+    }
+}
+
 #[inline]
-pub fn read(tun: BorrowedFd<'_>, buf: &mut [u8]) -> io::Result<Option<usize>> {
+pub(super) fn read(tun: &TunQueue, buf: &mut [u8]) -> io::Result<Option<usize>> {
     // SAFETY: valid nonblocking descriptor and writable buffer of the supplied length.
     let n = unsafe { libc::read(tun.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
     if n < 0 {
@@ -28,7 +45,7 @@ pub fn read(tun: BorrowedFd<'_>, buf: &mut [u8]) -> io::Result<Option<usize>> {
 }
 
 #[inline]
-pub fn write(tun: BorrowedFd<'_>, packet: &[u8]) -> io::Result<bool> {
+pub(super) fn write(tun: &TunQueue, packet: &[u8]) -> io::Result<bool> {
     loop {
         // SAFETY: valid descriptor and readable packet slice. TUN preserves packet boundaries.
         let n = unsafe { libc::write(tun.as_raw_fd(), packet.as_ptr().cast(), packet.len()) };
@@ -57,14 +74,14 @@ fn ifreq_with_flags(flags: libc::c_int) -> libc::ifreq {
     req
 }
 
-fn tun_ioctl(fd: BorrowedFd<'_>, request: libc::Ioctl, req: &mut libc::ifreq) -> io::Result<()> {
+fn tun_ioctl(fd: &TunQueue, request: libc::Ioctl, req: &mut libc::ifreq) -> io::Result<()> {
     // SAFETY: `request` is a TUN ioctl reading/writing a live `libc::ifreq`.
     cvt(unsafe { libc::ioctl(fd.as_raw_fd(), request, req as *mut libc::ifreq) }).map(drop)
 }
 
 /// Opens one non-blocking, initially detached queue fd of a multi-queue TUN device.
 /// Without `IFF_PERSIST` the kernel destroys the device when the last fd closes, including on SIGKILL.
-pub fn open_queue(name: &str) -> io::Result<OwnedFd> {
+pub fn open_queue(name: &str) -> io::Result<TunQueue> {
     if name.is_empty() || name.len() >= libc::IFNAMSIZ {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -82,24 +99,26 @@ pub fn open_queue(name: &str) -> io::Result<OwnedFd> {
             libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
         )
     })?;
-    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-    tun_ioctl(fd.as_fd(), libc::TUNSETIFF as _, &mut req)?;
-    set_queue(fd.as_fd(), false)?;
-    Ok(fd)
+    let queue = TunQueue(unsafe { OwnedFd::from_raw_fd(fd) });
+    tun_ioctl(&queue, libc::TUNSETIFF as _, &mut req)?;
+    queue.set_active(false)?;
+    Ok(queue)
 }
 
 /// Opens `queues` non-blocking, initially detached queue fds of one multi-queue TUN device.
-pub fn create(name: &str, queues: usize) -> io::Result<Vec<OwnedFd>> {
+pub fn create(name: &str, queues: usize) -> io::Result<Vec<TunQueue>> {
     (0..queues).map(|_| open_queue(name)).collect()
 }
 
-/// Attaches or detaches one multi-queue TUN fd so the kernel only hashes inner flows onto
-/// `Established` workers instead of black-holing `1/N` of traffic into reconnecting slots.
-pub fn set_queue(fd: BorrowedFd<'_>, attach: bool) -> io::Result<()> {
-    let mut req = ifreq_with_flags(if attach {
-        libc::IFF_ATTACH_QUEUE
-    } else {
-        libc::IFF_DETACH_QUEUE
-    });
-    tun_ioctl(fd, libc::TUNSETQUEUE as _, &mut req)
+impl TunQueue {
+    /// Attaches or detaches the queue so the kernel only hashes inner flows onto `Established`
+    /// workers instead of black-holing `1/N` of traffic into reconnecting slots.
+    pub fn set_active(&self, active: bool) -> io::Result<()> {
+        let mut req = ifreq_with_flags(if active {
+            libc::IFF_ATTACH_QUEUE
+        } else {
+            libc::IFF_DETACH_QUEUE
+        });
+        tun_ioctl(self, libc::TUNSETQUEUE as _, &mut req)
+    }
 }

@@ -4,20 +4,21 @@ use std::collections::VecDeque;
 use std::ffi::CStr;
 use std::io;
 use std::mem;
-use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
+use std::os::fd::{AsRawFd, RawFd};
 
-use super::queue::{BYTE_LIMIT, Pending};
-use crate::platform;
-use crate::platform::uring::{self, Cqe, Ring, Sqe};
+use super::tun::{self, TunQueue};
+use super::uring::{self, Cqe, Ring, Sqe};
+use super::{Interest, Poller};
+use crate::transport::queue::{BYTE_LIMIT, Pending};
 
-const BUFFERS: usize = platform::BATCH;
+const BUFFERS: usize = super::BATCH;
 const GROUP: u16 = 1;
 const READ: u64 = 1;
 const CANCEL: u64 = 3;
 const WRITE_BASE: u64 = 256;
 
 pub struct TunDriver<'a> {
-    fd: BorrowedFd<'a>,
+    fd: &'a TunQueue,
     fast: Option<Box<Fast>>,
     pending: Pending<()>,
     stride: usize,
@@ -323,7 +324,7 @@ impl Drop for Fast {
 }
 
 impl<'a> TunDriver<'a> {
-    pub fn new(fd: BorrowedFd<'a>, stride: usize, headroom: usize) -> Self {
+    pub fn new(fd: &'a TunQueue, stride: usize, headroom: usize) -> Self {
         let fast = match Fast::new(stride, headroom) {
             Ok(fast) => {
                 log::info!("TUN io_uring fast-path enabled");
@@ -339,7 +340,7 @@ impl<'a> TunDriver<'a> {
         driver
     }
 
-    pub(crate) fn poll(fd: BorrowedFd<'a>, stride: usize, headroom: usize) -> Self {
+    pub(crate) fn poll(fd: &'a TunQueue, stride: usize, headroom: usize) -> Self {
         Self {
             fd,
             fast: None,
@@ -351,7 +352,18 @@ impl<'a> TunDriver<'a> {
         }
     }
 
-    pub fn read_fd(&self) -> RawFd {
+    /// Binds the io_uring completion source to `slot` while the fast path is active. Returns
+    /// whether the queue itself must be polled for reads instead.
+    pub fn bind_ring(&self, poller: &mut Poller, slot: usize) -> bool {
+        match &self.fast {
+            Some(fast) => poller.bind(slot, &fast.ring.fd(), Interest::READ),
+            None => poller.unbind(slot),
+        }
+        self.fast.is_none()
+    }
+
+    #[cfg(test)]
+    fn read_fd(&self) -> RawFd {
         self.fast
             .as_ref()
             .map_or(self.fd.as_raw_fd(), |fast| fast.ring.fd())
@@ -421,7 +433,7 @@ impl<'a> TunDriver<'a> {
             return Ok(Some(packet.len()));
         }
         let Some(fast) = &mut self.fast else {
-            return platform::tun::read(self.fd, output);
+            return tun::read(self.fd, output);
         };
         let Some((index, len)) = fast.ready.pop_front() else {
             return Ok(None);
@@ -516,7 +528,7 @@ impl<'a> TunDriver<'a> {
     }
 
     fn write_poll(&self, packet: &[u8]) -> bool {
-        match platform::tun::write(self.fd, packet) {
+        match tun::write(self.fd, packet) {
             Ok(done) => done,
             Err(error) => {
                 log::debug!("TUN write: {error}; dropping packet");
@@ -569,8 +581,18 @@ impl Drop for TunDriver<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::fd::AsFd;
+    use std::os::fd::OwnedFd;
     use std::os::unix::net::UnixDatagram;
+
+    fn wait_readable(driver: &TunDriver<'_>) -> io::Result<bool> {
+        crate::platform::linux::poll(
+            &mut [crate::platform::linux::pollfd(
+                driver.read_fd(),
+                libc::POLLIN,
+            )],
+            10,
+        )
+    }
 
     #[test]
     #[ignore = "requires permitted io_uring; run in the privileged e2e container"]
@@ -578,7 +600,8 @@ mod tests {
         let (socket, peer) = UnixDatagram::pair().unwrap();
         socket.set_nonblocking(true).unwrap();
         peer.set_nonblocking(true).unwrap();
-        let mut driver = TunDriver::new(socket.as_fd(), 2048, 0);
+        let socket = TunQueue::from(OwnedFd::from(socket));
+        let mut driver = TunDriver::new(&socket, 2048, 0);
         assert!(driver.fast.is_some(), "test must exercise io_uring");
         let mut buffer = [0; 2048];
         for sequence in 0u32..200 {
@@ -591,8 +614,7 @@ mod tests {
                     received = true;
                     break;
                 }
-                platform::poll(&mut [platform::pollfd(driver.read_fd(), libc::POLLIN)], 10)
-                    .unwrap();
+                wait_readable(&driver).unwrap();
             }
             assert!(received);
             assert!(driver.fast.is_some());
@@ -603,7 +625,7 @@ mod tests {
             if !fast.reading && !fast.canceling {
                 break;
             }
-            platform::poll(&mut [platform::pollfd(driver.read_fd(), libc::POLLIN)], 10).unwrap();
+            wait_readable(&driver).unwrap();
         }
         assert!(!driver.fast.as_ref().unwrap().reading);
         peer.send(b"paused").unwrap();
@@ -617,7 +639,7 @@ mod tests {
                 resumed = true;
                 break;
             }
-            platform::poll(&mut [platform::pollfd(driver.read_fd(), libc::POLLIN)], 10).unwrap();
+            wait_readable(&driver).unwrap();
         }
         assert!(resumed);
         for sequence in 0..200 {
@@ -630,7 +652,7 @@ mod tests {
             if driver.has_reads() {
                 break;
             }
-            platform::poll(&mut [platform::pollfd(driver.read_fd(), libc::POLLIN)], 10).unwrap();
+            wait_readable(&driver).unwrap();
         }
         assert!(driver.has_reads());
         driver.fallback(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
@@ -666,7 +688,8 @@ mod tests {
         let (writer, reader) = UnixDatagram::pair().unwrap();
         writer.set_nonblocking(true).unwrap();
         reader.set_nonblocking(true).unwrap();
-        let mut driver = TunDriver::poll(writer.as_fd(), 2048, 0);
+        let writer = TunQueue::from(OwnedFd::from(writer));
+        let mut driver = TunDriver::poll(&writer, 2048, 0);
         let mut count = 0usize;
         loop {
             let packet = vec![(count % 251) as u8; 1024];

@@ -5,19 +5,17 @@ pub mod budget;
 mod control;
 mod faketcp;
 mod keepalive;
-mod queue;
+pub mod queue;
 mod tcp;
-mod tun_driver;
 mod udp;
 
 use std::net::{IpAddr, SocketAddr};
-use std::os::fd::OwnedFd;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::thread::JoinHandle;
 
 use crate::config::{Config, MAX_CONNS, Mode, OuterMode, Transport, Tunables};
-use crate::platform::{self, Waker};
+use crate::platform::{self, TunQueue, Waker};
 use control::{
     Control, CoreTable, ExitWorkerGuard, Reload, RollingReload, StopOnDrop, candidate_cpus,
 };
@@ -126,7 +124,7 @@ struct Entry {
 
 /// The Exit listener and the workers it admits, indexed by the peer's worker id.
 struct Exit {
-    _anchor_tun: Option<OwnedFd>,
+    _anchor_tun: Option<TunQueue>,
     dispatcher: ExitDispatcher,
     listener_wake: Arc<Waker>,
     listener_thread: JoinHandle<()>,
@@ -150,7 +148,7 @@ pub fn start(
     cfg: &Config,
     outer: &Outer,
     tun_mtu: u32,
-    tuns: Vec<OwnedFd>,
+    tuns: Vec<TunQueue>,
     stop: &'static AtomicBool,
     main_wake: Arc<Waker>,
 ) -> Result<Running, String> {
@@ -314,7 +312,7 @@ impl Exit {
         id: usize,
         tuple: Option<(SocketAddr, SocketAddr)>,
         peer_label: String,
-        build: impl FnOnce(&Shared, OwnedFd) -> Result<Start, String>,
+        build: impl FnOnce(&Shared, TunQueue) -> Result<Start, String>,
     ) {
         self.replace_slot(&mut shared.core_table, id, tuple);
         let tun = match platform::tun::open_queue(&shared.cfg.tun_name) {

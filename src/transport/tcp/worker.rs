@@ -1,7 +1,6 @@
 //! Per-core TCP worker: connects (entry) or adopts dispatched connections (exit) and pumps its TUN queue.
 
 use std::net::SocketAddr;
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -9,21 +8,20 @@ use super::auth::{Handshake, Params};
 use super::connection::{Ready, TunIo};
 use super::{Connection, ROUNDS};
 use crate::config::{Config, Mode};
-use crate::platform::{self, Interest, Poller};
+use crate::platform::{self, Interest, Poller, TunDriver, TunQueue};
 use crate::transport::control::{self, Backoff};
-use crate::transport::tun_driver::TunDriver;
 
 pub struct Worker {
     id: usize,
     cfg: Config,
     remote: Option<SocketAddr>,
     mtu: u16,
-    tun: OwnedFd,
+    tun: TunQueue,
     initial: Option<Connection>,
 }
 
 impl Worker {
-    pub fn new_entry(id: usize, cfg: Config, remote: SocketAddr, mtu: u16, tun: OwnedFd) -> Self {
+    pub fn new_entry(id: usize, cfg: Config, remote: SocketAddr, mtu: u16, tun: TunQueue) -> Self {
         Self {
             id,
             cfg,
@@ -34,7 +32,7 @@ impl Worker {
         }
     }
 
-    pub fn new_exit(id: usize, cfg: Config, mtu: u16, tun: OwnedFd, conn: Connection) -> Self {
+    pub fn new_exit(id: usize, cfg: Config, mtu: u16, tun: TunQueue, conn: Connection) -> Self {
         Self {
             id,
             cfg,
@@ -55,7 +53,7 @@ impl Worker {
         let mut connection = self.initial.take();
         if let Some(c) = &connection {
             log::info!("worker {id}: established {c}");
-            control::sync_tun_queue(id, self.tun.as_fd(), &mut attached, true);
+            control::sync_tun_queue(id, &self.tun, &mut attached, true);
         }
         let mut retry_at = Instant::now();
         let mut backoff = Backoff::default();
@@ -63,7 +61,7 @@ impl Worker {
         // Slots are exactly one MTU so read_batch's worst-case room check matches `tx.room(mtu)`;
         // a larger stride would strand the queue between the two bounds and spin the loop.
         let mut tun = TunIo {
-            driver: TunDriver::new(self.tun.as_fd(), mtu, 0),
+            driver: TunDriver::new(&self.tun, mtu, 0),
             scratch: vec![0; platform::BATCH * mtu],
             stride: mtu,
             attached,
@@ -193,7 +191,7 @@ impl Worker {
                 }
             }
             let established = connection.as_ref().is_some_and(|c| c.auth.is_none());
-            control::sync_tun_queue(id, self.tun.as_fd(), &mut tun.attached, established);
+            control::sync_tun_queue(id, &self.tun, &mut tun.attached, established);
             ctrl.report(generation, established, wait);
             if !established && (poller.read_ready(tun_slot) || tun.driver.has_reads()) {
                 // Discard packets that reached the queue before detach or session loss.
@@ -215,12 +213,7 @@ impl Worker {
             // Arm the multishot read right after a fresh attach; otherwise the ring stays silent
             // until an unrelated socket event or timer wakes the loop.
             tun.driver.service(tun.attached, read_allowed(&connection));
-            let polled = tun.driver.read_fd() == self.tun.as_raw_fd();
-            if polled {
-                poller.unbind(ring_slot);
-            } else {
-                poller.bind(ring_slot, &tun.driver.read_fd(), Interest::READ);
-            }
+            let polled = tun.driver.bind_ring(&mut poller, ring_slot);
             let mut tun_read = polled;
             match &connection {
                 Some(c) => {

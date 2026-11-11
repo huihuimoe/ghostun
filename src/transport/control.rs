@@ -1,14 +1,13 @@
 //! Worker thread control, CPU affinity, TUN queue synchronization, and rolling reload coordination.
 
 use std::collections::VecDeque;
-use std::os::fd::BorrowedFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use std::time::Duration;
 
 use crate::config::{AuthKey, Config, Tunables};
-use crate::platform::{self, Waker};
+use crate::platform::{self, TunQueue, Waker};
 
 pub struct Reload {
     pub tunables: Tunables,
@@ -252,9 +251,9 @@ pub fn pin(id: usize, cpu: Option<usize>) {
 }
 
 #[inline]
-pub fn sync_tun_queue(id: usize, tun: BorrowedFd<'_>, attached: &mut bool, established: bool) {
+pub fn sync_tun_queue(id: usize, tun: &TunQueue, attached: &mut bool, established: bool) {
     if *attached != established {
-        match platform::tun::set_queue(tun, established) {
+        match tun.set_active(established) {
             Ok(()) => *attached = established,
             Err(e) => log::warn!("worker {id}: TUN queue attach={established}: {e}"),
         }

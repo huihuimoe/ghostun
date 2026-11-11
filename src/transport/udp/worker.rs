@@ -3,7 +3,6 @@
 
 use std::io;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -12,10 +11,9 @@ use super::auth::{self, Auth, ExitStep, PROOF_LEN, Promoted};
 use super::session::{Session, SessionConfig, Sink};
 use crate::config::{Config, Mode};
 use crate::net::OuterFamily;
-use crate::platform::{self, Interest, Poller, Waker, udp};
+use crate::platform::{self, Interest, Poller, TunDriver, TunQueue, Waker, udp};
 use crate::transport::control::{self, Admission, Control};
 use crate::transport::queue::Pending;
-use crate::transport::tun_driver::TunDriver;
 
 const ROUNDS: usize = 4;
 const MIN_STRIDE: usize = 2048;
@@ -379,7 +377,7 @@ pub struct Worker {
     id: usize,
     mode: Mode,
     session: Session,
-    tun: OwnedFd,
+    tun: TunQueue,
     out: UdpSink,
     exit_state: Option<SharedExitState>,
 }
@@ -390,7 +388,7 @@ impl Worker {
         cfg: &Config,
         route: &crate::transport::EntryRoute,
         tun_mtu: u16,
-        tun: OwnedFd,
+        tun: TunQueue,
         seed: u64,
     ) -> Result<Self, String> {
         let worker = id as u16;
@@ -421,7 +419,7 @@ impl Worker {
         id: usize,
         cfg: &Config,
         tun_mtu: u16,
-        tun: OwnedFd,
+        tun: TunQueue,
         promo: Promoted,
         state: SharedExitState,
         seed: u64,
@@ -443,7 +441,7 @@ impl Worker {
             tun_mtu,
         );
         let mut attached = false;
-        control::sync_tun_queue(id, tun.as_fd(), &mut attached, true);
+        control::sync_tun_queue(id, &tun, &mut attached, true);
         let mut out = UdpSink::new(socket, promo.local, None);
         let session = Session::new_exit_established(
             scfg,
@@ -476,7 +474,7 @@ impl Worker {
         let stride = usize::from(session.mtu()).max(MIN_STRIDE);
         session.start(Instant::now(), &mut out);
         let mut generation = session.generation();
-        let mut driver = TunDriver::new(tun.as_fd(), usize::from(session.mtu()), 0);
+        let mut driver = TunDriver::new(&tun, usize::from(session.mtu()), 0);
         let mut attached = mode == Mode::Exit;
         let mut sender = udp::Sender::new();
         let mut rx = udp::Receiver::new(stride);
@@ -489,12 +487,7 @@ impl Worker {
         let mut applied_gen = 0;
         let mut handoff: Option<Promoted> = None;
         while !stop.load(Ordering::Relaxed) && !ctrl.is_stopped() {
-            let polled = driver.read_fd() == tun.as_raw_fd();
-            if polled {
-                poller.unbind(ring_slot);
-            } else {
-                poller.bind(ring_slot, &driver.read_fd(), Interest::READ);
-            }
+            let polled = driver.bind_ring(&mut poller, ring_slot);
             poller.set(
                 tun_slot,
                 Interest::READ.when(polled && out.room(&driver, stride, 1))
@@ -662,7 +655,7 @@ impl Worker {
             if mode == Mode::Exit && !established {
                 break;
             }
-            control::sync_tun_queue(id, tun.as_fd(), &mut attached, established);
+            control::sync_tun_queue(id, &tun, &mut attached, established);
             let read_allowed = out.room(&driver, stride, 1);
             driver.service(attached, read_allowed);
             ctrl.report(applied_gen, established, wait);

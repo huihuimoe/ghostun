@@ -6,10 +6,13 @@ pub mod route;
 pub mod signals;
 pub mod tcp;
 pub mod tun;
+mod tun_driver;
 pub mod udp;
 pub mod uring;
 
 pub use poll::{Interest, Poller};
+pub use tun::TunQueue;
+pub use tun_driver::TunDriver;
 
 use std::fs::File;
 use std::io::{self, Write};
@@ -139,7 +142,7 @@ fn notify(fd: RawFd) {
 }
 
 #[inline(always)]
-pub const fn pollfd(fd: i32, events: i16) -> libc::pollfd {
+const fn pollfd(fd: i32, events: i16) -> libc::pollfd {
     libc::pollfd {
         fd,
         events,
@@ -149,12 +152,12 @@ pub const fn pollfd(fd: i32, events: i16) -> libc::pollfd {
 
 /// Rounds up sub-millisecond waits so callers never wake just before a deadline and spin.
 #[inline(always)]
-pub fn poll_ms(wait: Duration) -> libc::c_int {
+fn poll_ms(wait: Duration) -> libc::c_int {
     wait.as_micros().div_ceil(1000) as libc::c_int
 }
 
 #[inline]
-pub fn poll(fds: &mut [libc::pollfd], timeout: libc::c_int) -> io::Result<bool> {
+fn poll(fds: &mut [libc::pollfd], timeout: libc::c_int) -> io::Result<bool> {
     // SAFETY: `fds` is a valid slice of `pollfd` structs of length `fds.len()`.
     if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) } < 0 {
         let e = io::Error::last_os_error();
