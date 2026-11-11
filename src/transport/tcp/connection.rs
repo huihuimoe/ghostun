@@ -5,8 +5,8 @@ use std::{fmt, io};
 use super::auth::{AUTH_MAX, Handshake};
 use super::frame::{self, FRAME_PREFIX_LEN, PING, PONG, Receive, TX_LIMIT};
 use super::queue::SendQueue;
-use super::{BATCH, ROUNDS, can_io};
-use crate::platform::{self, READ_READY, WRITE_READY};
+use super::{BATCH, ROUNDS};
+use crate::platform;
 use crate::transport::keepalive::{self, Keepalive};
 use crate::transport::tun_driver::TunDriver;
 
@@ -17,6 +17,14 @@ pub struct TunIo<'a> {
     pub scratch: Vec<u8>,
     pub stride: usize,
     pub attached: bool,
+}
+
+/// What the last poll reported; `false` skips the matching system call this round.
+#[derive(Clone, Copy)]
+pub(super) struct Ready {
+    pub tun: bool,
+    pub socket_read: bool,
+    pub socket_write: bool,
 }
 
 pub struct Connection {
@@ -124,21 +132,14 @@ impl Connection {
         ping: Duration,
         dead: Duration,
     ) -> io::Result<()> {
-        // Poll-mode tests have no real readiness events, so report the TUN as always readable.
-        let tun_ready = libc::pollfd {
-            fd: -1,
-            events: 0,
-            revents: libc::POLLIN,
+        // Poll-mode tests have no real readiness events, so report everything as ready.
+        let ready = Ready {
+            tun: true,
+            socket_read: true,
+            socket_write: true,
         };
-        self.pump_io(
-            tun,
-            mtu,
-            Instant::now(),
-            ping,
-            dead,
-            &[tun_ready, platform::pollfd(-1, 0)],
-        )
-        .map(drop)
+        self.pump_io(tun, mtu, Instant::now(), ping, dead, ready)
+            .map(drop)
     }
 
     #[inline]
@@ -149,7 +150,7 @@ impl Connection {
         now: Instant,
         ping: Duration,
         dead: Duration,
-        fds: &[libc::pollfd],
+        ready: Ready,
     ) -> io::Result<bool> {
         let mtu = mtu as usize;
         if now.duration_since(self.last_rx) >= dead {
@@ -158,10 +159,10 @@ impl Connection {
                 "peer liveness timeout",
             ));
         }
-        let mut tun_r = tun.driver.has_reads() || fds[0].revents & READ_READY != 0;
+        let mut tun_r = tun.driver.has_reads() || ready.tun;
         let mut tun_w = true;
-        let mut sock_r = can_io(fds[1], libc::POLLIN, READ_READY);
-        let mut sock_w = can_io(fds[1], libc::POLLOUT, WRITE_READY);
+        let mut sock_r = ready.socket_read;
+        let mut sock_w = ready.socket_write;
         self.flush_tx(&mut sock_w)?;
         let mut busy = false;
         for _ in 0..ROUNDS {

@@ -1,14 +1,14 @@
 //! Worker thread control, CPU affinity, TUN queue synchronization, and rolling reload coordination.
 
 use std::collections::VecDeque;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
+use std::os::fd::BorrowedFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use std::time::Duration;
 
 use crate::config::{AuthKey, Config, Tunables};
-use crate::platform;
+use crate::platform::{self, Waker};
 
 pub struct Reload {
     pub tunables: Tunables,
@@ -74,8 +74,8 @@ pub fn candidate_cpus<'a>(cfg: &'a Config, default_cpus: &'a [usize]) -> &'a [us
 
 pub struct Control {
     initial_cpu: Option<usize>,
-    wake: OwnedFd,
-    main_wake: RawFd,
+    wake: Waker,
+    main_wake: Arc<Waker>,
     target_gen: AtomicU64,
     applied_gen: AtomicU64,
     wait_for_established: AtomicBool,
@@ -87,10 +87,10 @@ pub struct Control {
 }
 
 impl Control {
-    pub fn new(initial_cpu: Option<usize>, main_wake: RawFd) -> Self {
+    pub fn new(initial_cpu: Option<usize>, main_wake: Arc<Waker>) -> Self {
         Self {
             initial_cpu,
-            wake: platform::eventfd().expect("creating worker eventfd"),
+            wake: Waker::new().expect("creating worker eventfd"),
             main_wake,
             target_gen: AtomicU64::new(0),
             applied_gen: AtomicU64::new(0),
@@ -104,13 +104,13 @@ impl Control {
     }
 
     #[inline(always)]
-    pub fn wake_fd(&self) -> BorrowedFd<'_> {
-        self.wake.as_fd()
+    pub fn waker(&self) -> &Waker {
+        &self.wake
     }
 
     #[inline]
     pub fn wake(&self) {
-        platform::eventfd_notify(self.wake.as_raw_fd());
+        self.wake.notify();
     }
 
     pub fn stop(&self, send_rst: bool) {
@@ -177,7 +177,7 @@ impl Control {
             self.established.store(established, Ordering::Release);
             self.applied_gen.store(generation, Ordering::Release);
             if generation > 0 && !was_complete && (!wait || established) {
-                platform::eventfd_notify(self.main_wake);
+                self.main_wake.notify();
             }
         }
     }
@@ -269,11 +269,11 @@ pub struct Admission<P> {
     pub timeout: Duration,
     /// Authenticated peers waiting for the manager to spawn their worker.
     pub admitted: VecDeque<P>,
-    main_wake: RawFd,
+    main_wake: Arc<Waker>,
 }
 
 impl<P> Admission<P> {
-    pub fn new(key: AuthKey, timeout: Duration, main_wake: RawFd) -> Self {
+    pub fn new(key: AuthKey, timeout: Duration, main_wake: Arc<Waker>) -> Self {
         Self {
             key,
             epoch: 0,
@@ -294,23 +294,23 @@ impl<P> Admission<P> {
 
     pub fn admit(&mut self, peer: P) {
         self.admitted.push_back(peer);
-        platform::eventfd_notify(self.main_wake);
+        self.main_wake.notify();
     }
 }
 
-pub struct StopOnDrop(pub &'static AtomicBool, pub RawFd);
+pub struct StopOnDrop(pub &'static AtomicBool, pub Arc<Waker>);
 
 impl Drop for StopOnDrop {
     fn drop(&mut self) {
         self.0.store(true, Ordering::Relaxed);
-        platform::eventfd_notify(self.1);
+        self.1.notify();
     }
 }
 
 pub struct ExitWorkerGuard {
     pub stop: &'static AtomicBool,
     pub ctrl: Arc<Control>,
-    pub main_wake: RawFd,
+    pub main_wake: Arc<Waker>,
 }
 
 impl Drop for ExitWorkerGuard {
@@ -319,7 +319,7 @@ impl Drop for ExitWorkerGuard {
             self.stop.store(true, Ordering::Relaxed);
         }
         self.ctrl.mark_exited();
-        platform::eventfd_notify(self.main_wake);
+        self.main_wake.notify();
     }
 }
 

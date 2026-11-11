@@ -3,7 +3,6 @@
 
 use std::io;
 use std::net::{SocketAddr, TcpListener};
-use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -11,7 +10,7 @@ use std::time::{Duration, Instant};
 use super::auth::{self, Handshake};
 use super::{BATCH, Connection, invalid};
 use crate::config::{Config, MAX_CONNS};
-use crate::platform::{self, READ_READY, poll, poll_ms, pollfd};
+use crate::platform::{self, Interest, Poller, Waker};
 use crate::transport::control::{self, Admission};
 
 pub const MAX_CANDIDATES: usize = MAX_CONNS;
@@ -23,14 +22,14 @@ pub type SharedExitState = Arc<Mutex<ExitState>>;
 /// Owns listener setup before the accept loop starts.
 pub struct Listener {
     listeners: Vec<TcpListener>,
-    wake: OwnedFd,
+    wake: Arc<Waker>,
     pub(crate) state: SharedExitState,
     mtu: u16,
     tcp_notsent: u32,
 }
 
 impl Listener {
-    pub fn bind(cfg: &Config, mtu: u16, main_wake: RawFd) -> io::Result<Self> {
+    pub fn bind(cfg: &Config, mtu: u16, main_wake: Arc<Waker>) -> io::Result<Self> {
         let mut listeners = Vec::new();
         for &family in cfg.socket_families() {
             let ip = cfg.listen_ip.unwrap_or_else(|| family.unspecified());
@@ -41,7 +40,7 @@ impl Listener {
             listener.set_nonblocking(true)?;
             listeners.push(listener);
         }
-        let wake = platform::eventfd()?;
+        let wake = Arc::new(Waker::new()?);
         let state = Arc::new(Mutex::new(ExitState::new(
             cfg.tunables.auth_key.clone(),
             cfg.tunables.dead_timeout,
@@ -56,14 +55,14 @@ impl Listener {
         })
     }
 
-    pub fn wake_fd(&self) -> RawFd {
-        self.wake.as_raw_fd()
+    pub fn waker(&self) -> Arc<Waker> {
+        self.wake.clone()
     }
 
     pub fn spawn(
         self,
         stop: &'static AtomicBool,
-        main_wake: RawFd,
+        main_wake: Arc<Waker>,
     ) -> io::Result<std::thread::JoinHandle<()>> {
         std::thread::Builder::new()
             .name("ghostun-tcp-accept".into())
@@ -76,36 +75,30 @@ impl Listener {
     fn run(self, stop: &AtomicBool) {
         let mut candidates: Vec<Candidate> = Vec::with_capacity(MAX_CANDIDATES);
         let candidate_offset = self.listeners.len() + 1;
-        let mut fds = Vec::with_capacity(MAX_CANDIDATES + candidate_offset);
+        let mut poller = Poller::default();
+        for listener in &self.listeners {
+            poller.add(listener, Interest::READ);
+        }
+        let wake_slot = poller.add(&self.wake, Interest::READ);
         while !stop.load(Ordering::Relaxed) {
             // Candidate count is bounded; poll all sockets and listener without per-candidate threads.
-            fds.clear();
-            for listener in &self.listeners {
-                fds.push(pollfd(listener.as_raw_fd(), libc::POLLIN));
-            }
-            fds.push(pollfd(self.wake.as_raw_fd(), libc::POLLIN));
+            poller.truncate(candidate_offset);
             for c in &candidates {
-                fds.push(pollfd(
-                    c.conn.socket.as_raw_fd(),
-                    libc::POLLIN
-                        | if c.conn.tx.bytes() > 0 {
-                            libc::POLLOUT
-                        } else {
-                            0
-                        },
-                ));
+                poller.add(
+                    &c.conn.socket,
+                    Interest::READ | Interest::WRITE.when(c.conn.tx.bytes() > 0),
+                );
             }
             let now = Instant::now();
             let timeout = candidates
                 .iter()
                 .map(|c| (c.conn.since + c.timeout).saturating_duration_since(now))
-                .min()
-                .map_or(-1, poll_ms);
-            if let Err(e) = poll(&mut fds, timeout) {
+                .min();
+            if let Err(e) = poller.wait(timeout) {
                 log::error!("accept poll: {e}");
                 return;
             }
-            platform::poll_wake(fds[self.listeners.len()], self.wake.as_fd());
+            poller.woken(wake_slot, &self.wake);
             if stop.load(Ordering::Relaxed) {
                 break;
             }
@@ -113,7 +106,7 @@ impl Listener {
             let mut i = 0;
             while i < candidates.len() {
                 let expired = now.duration_since(candidates[i].conn.since) >= candidates[i].timeout;
-                if fds[i + candidate_offset].revents == 0 && !expired {
+                if !poller.fired(i + candidate_offset) && !expired {
                     i += 1;
                     continue;
                 }
@@ -121,7 +114,7 @@ impl Listener {
                     Ok(false) => i += 1,
                     result => {
                         let candidate = candidates.swap_remove(i);
-                        fds.swap_remove(i + candidate_offset);
+                        poller.swap_remove(i + candidate_offset);
                         let (id, local, peer) = (
                             candidate.identity.map(|v| v.0),
                             candidate.conn.local,
@@ -142,7 +135,7 @@ impl Listener {
                 }
             }
             for (index, listener) in self.listeners.iter().enumerate() {
-                if fds[index].revents & READ_READY == 0 {
+                if !poller.read_ready(index) {
                     continue;
                 }
                 // Bound accepts per turn so hostile arrivals cannot starve candidate deadlines.

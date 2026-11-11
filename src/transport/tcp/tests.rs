@@ -12,6 +12,7 @@ use super::listener::{Candidate, ExitState, SharedExitState};
 use super::queue::SendQueue;
 use super::*;
 use crate::config::{AuthKey, MAX_CONNS};
+use crate::platform::Waker;
 use crate::transport::control::Backoff;
 use crate::transport::tun_driver::TunDriver;
 
@@ -386,7 +387,7 @@ fn candidates(key: &AuthKey) -> SharedExitState {
     Arc::new(Mutex::new(ExitState::new(
         key.clone(),
         Duration::from_secs(4),
-        -1,
+        Arc::new(Waker::new().unwrap()),
     )))
 }
 

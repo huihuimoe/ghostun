@@ -1,26 +1,12 @@
 //! Process runtime: TUN and netfilter setup, signals, and the reload/shutdown loop around the transport.
 
 use std::net::SocketAddr;
-use std::os::fd::{AsFd, AsRawFd};
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::Ordering;
 
 use crate::config::{Config, Mode};
 use crate::netfilter;
 use crate::platform::{self, route};
 use crate::transport::{self, EntryRoute, Outer, budget};
-
-static STOP: AtomicBool = AtomicBool::new(false);
-static RELOAD: AtomicBool = AtomicBool::new(false);
-static MAIN_WAKE: AtomicI32 = AtomicI32::new(-1);
-
-extern "C" fn on_signal(sig: libc::c_int) {
-    if sig == libc::SIGHUP {
-        RELOAD.store(true, Ordering::Relaxed);
-    } else {
-        STOP.store(true, Ordering::Relaxed);
-    }
-    platform::eventfd_notify(MAIN_WAKE.load(Ordering::Relaxed));
-}
 
 fn interface_mtu(dev: &str) -> u32 {
     platform::iface_mtu(dev).unwrap_or_else(|e| {
@@ -75,10 +61,8 @@ fn resolve_outer(cfg: &Config) -> Result<Outer, String> {
 }
 
 pub fn run(mut cfg: Config) -> Result<(), String> {
-    let main_wake = platform::eventfd().map_err(|e| format!("eventfd: {e}"))?;
-    let main_wake_fd = main_wake.as_raw_fd();
-    MAIN_WAKE.store(main_wake_fd, Ordering::Relaxed);
-    platform::install_signal_handlers(on_signal).map_err(|e| format!("signal handlers: {e}"))?;
+    let signals = platform::signals::install().map_err(|e| format!("signal handlers: {e}"))?;
+    let (stop, main_wake) = (signals.stop(), signals.waker());
     let outer = resolve_outer(&cfg)?;
     let tun_mtu = cfg.resolve_tun_mtu(outer.mtu)?;
     let listen_port = cfg.listen.unwrap_or(0);
@@ -148,11 +132,10 @@ pub fn run(mut cfg: Config) -> Result<(), String> {
         None
     };
 
-    let mut running = transport::start(&cfg, &outer, tun_mtu, tuns, &STOP, main_wake_fd)?;
-    let mut poll_fd = [platform::pollfd(main_wake_fd, libc::POLLIN)];
-    while !STOP.load(Ordering::Relaxed) {
-        platform::eventfd_drain(main_wake.as_fd());
-        if RELOAD.swap(false, Ordering::Relaxed) {
+    let mut running = transport::start(&cfg, &outer, tun_mtu, tuns, stop, main_wake.clone())?;
+    while !stop.load(Ordering::Relaxed) {
+        main_wake.drain();
+        if signals.take_reload() {
             match cfg.reload() {
                 Ok(next) if next == cfg && !running.is_reloading() => {
                     log::info!("configuration reload: no changes");
@@ -165,15 +148,15 @@ pub fn run(mut cfg: Config) -> Result<(), String> {
             }
         }
         running.advance();
-        if STOP.load(Ordering::Relaxed) {
+        if stop.load(Ordering::Relaxed) {
             break;
         }
-        if let Err(e) = platform::poll(&mut poll_fd, -1) {
+        if let Err(e) = main_wake.wait() {
             log::error!("main poll: {e}");
             break;
         }
     }
-    STOP.store(true, Ordering::Relaxed);
+    stop.store(true, Ordering::Relaxed);
     running.join();
     log::info!("shutting down");
     if let Some(guard) = guard {

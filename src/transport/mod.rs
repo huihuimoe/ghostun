@@ -11,13 +11,13 @@ mod tun_driver;
 mod udp;
 
 use std::net::{IpAddr, SocketAddr};
-use std::os::fd::{OwnedFd, RawFd};
+use std::os::fd::OwnedFd;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::thread::JoinHandle;
 
 use crate::config::{Config, MAX_CONNS, Mode, OuterMode, Transport, Tunables};
-use crate::platform;
+use crate::platform::{self, Waker};
 use control::{
     Control, CoreTable, ExitWorkerGuard, Reload, RollingReload, StopOnDrop, candidate_cpus,
 };
@@ -104,7 +104,7 @@ struct Shared {
     tun_mtu: u32,
     seed: u64,
     stop: &'static AtomicBool,
-    main_wake: RawFd,
+    main_wake: Arc<Waker>,
     default_cpus: Vec<usize>,
     core_table: CoreTable,
     generation: u64,
@@ -128,7 +128,7 @@ struct Entry {
 struct Exit {
     _anchor_tun: Option<OwnedFd>,
     dispatcher: ExitDispatcher,
-    listener_wake: RawFd,
+    listener_wake: Arc<Waker>,
     listener_thread: JoinHandle<()>,
     workers: Vec<Option<ExitSlot>>,
     reload_gen: Option<u64>,
@@ -152,7 +152,7 @@ pub fn start(
     tun_mtu: u32,
     tuns: Vec<OwnedFd>,
     stop: &'static AtomicBool,
-    main_wake: RawFd,
+    main_wake: Arc<Waker>,
 ) -> Result<Running, String> {
     if cfg.transport != Transport::Faketcp && cfg.base_port_explicit {
         log::warn!(
@@ -169,7 +169,7 @@ pub fn start(
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos() as u64),
         stop,
-        main_wake,
+        main_wake: main_wake.clone(),
         core_table: CoreTable::new(candidate_cpus(cfg, &default_cpus)),
         default_cpus,
         generation: 0,
@@ -212,16 +212,19 @@ pub fn start(
         };
         for (i, start) in starts.into_iter().enumerate() {
             let cpu = shared.core_table.acquire();
-            let ctrl = Arc::new(Control::new(cpu, main_wake));
+            let ctrl = Arc::new(Control::new(cpu, main_wake.clone()));
             let worker_ctrl = Arc::clone(&ctrl);
             entry.cpus.push(cpu);
             entry.controls.push(ctrl);
             entry.threads.push(
                 std::thread::Builder::new()
                     .name(format!("ghostun-w{i}"))
-                    .spawn(move || {
-                        let _guard = StopOnDrop(stop, main_wake);
-                        start.run(stop, &worker_ctrl);
+                    .spawn({
+                        let main_wake = main_wake.clone();
+                        move || {
+                            let _guard = StopOnDrop(stop, main_wake);
+                            start.run(stop, &worker_ctrl);
+                        }
                     })
                     .expect("spawning worker thread"),
             );
@@ -231,30 +234,30 @@ pub fn start(
         let anchor_tun = tuns.into_iter().next();
         let (dispatcher, listener_wake, listener_thread) = match cfg.transport {
             Transport::Udp => {
-                let listener = udp::Listener::bind(cfg, tun_mtu as u16, main_wake)?;
-                let wake = listener.wake_fd();
+                let listener = udp::Listener::bind(cfg, tun_mtu as u16, main_wake.clone())?;
+                let wake = listener.waker();
                 let state = Arc::clone(&listener.state);
                 let thread = listener
-                    .spawn(stop, main_wake)
+                    .spawn(stop, main_wake.clone())
                     .expect("spawning UDP accept thread");
                 (ExitDispatcher::Udp(state), wake, thread)
             }
             Transport::Tcp => {
-                let listener = tcp::Listener::bind(cfg, tun_mtu as u16, main_wake)
+                let listener = tcp::Listener::bind(cfg, tun_mtu as u16, main_wake.clone())
                     .map_err(|e| format!("tcp listener: {e}"))?;
-                let wake = listener.wake_fd();
+                let wake = listener.waker();
                 let state = Arc::clone(&listener.state);
                 let thread = listener
-                    .spawn(stop, main_wake)
+                    .spawn(stop, main_wake.clone())
                     .expect("spawning TCP accept thread");
                 (ExitDispatcher::Tcp(state), wake, thread)
             }
             Transport::Faketcp => {
-                let listener = faketcp::Listener::bind(cfg, outer.mtu, seed, main_wake)?;
-                let wake = listener.wake_fd();
+                let listener = faketcp::Listener::bind(cfg, outer.mtu, seed, main_wake.clone())?;
+                let wake = listener.waker();
                 let state = Arc::clone(&listener.state);
                 let thread = listener
-                    .spawn(stop, main_wake)
+                    .spawn(stop, main_wake.clone())
                     .expect("spawning FakeTCP accept thread");
                 (ExitDispatcher::Fake(state), wake, thread)
             }
@@ -332,10 +335,10 @@ impl Exit {
             }
         };
         let cpu = shared.core_table.acquire();
-        let ctrl = Arc::new(Control::new(cpu, shared.main_wake));
+        let ctrl = Arc::new(Control::new(cpu, shared.main_wake.clone()));
         let worker_ctrl = Arc::clone(&ctrl);
         let stop = shared.stop;
-        let main_wake = shared.main_wake;
+        let main_wake = shared.main_wake.clone();
         let thread = std::thread::Builder::new()
             .name(format!("ghostun-w{id}"))
             .spawn(move || {
@@ -358,7 +361,7 @@ impl Exit {
 
     fn reload(&mut self, shared: &mut Shared, key_changed: bool, cpus_changed: bool) {
         self.dispatcher.reload(&shared.cfg.tunables, key_changed);
-        platform::eventfd_notify(self.listener_wake);
+        self.listener_wake.notify();
         self.reap_exited_workers(&mut shared.core_table);
         if key_changed {
             for slot in &mut self.workers {
@@ -533,7 +536,7 @@ impl Running {
                 for slot in exit.workers.iter().flatten() {
                     slot.ctrl.stop(true);
                 }
-                platform::eventfd_notify(exit.listener_wake);
+                exit.listener_wake.notify();
                 let threads = exit.workers.into_iter().flatten().map(|slot| slot.thread);
                 (threads.collect(), Some(exit.listener_thread))
             }

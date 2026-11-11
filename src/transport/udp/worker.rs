@@ -2,17 +2,17 @@
 //! plus the Exit handshake listener that authenticates incoming peers before workers are spawned.
 
 use std::io;
-use std::net::{IpAddr, SocketAddr};
-use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
+use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::auth::{self, Auth, ExitStep, PROOF_LEN, Promoted};
 use super::session::{Session, SessionConfig, Sink};
 use crate::config::{Config, Mode};
 use crate::net::OuterFamily;
-use crate::platform::{self, udp};
+use crate::platform::{self, Interest, Poller, Waker, udp};
 use crate::transport::control::{self, Admission, Control};
 use crate::transport::queue::Pending;
 use crate::transport::tun_driver::TunDriver;
@@ -34,7 +34,7 @@ struct UnconnectedDst {
 }
 
 struct UdpSink {
-    socket: OwnedFd,
+    socket: UdpSocket,
     local: SocketAddr,
     entry_bind: Option<EntryBind>,
     reuse_initial: bool,
@@ -42,7 +42,7 @@ struct UdpSink {
 }
 
 impl UdpSink {
-    fn new(socket: OwnedFd, local: SocketAddr, entry_bind: Option<EntryBind>) -> Self {
+    fn new(socket: UdpSocket, local: SocketAddr, entry_bind: Option<EntryBind>) -> Self {
         Self {
             socket,
             local,
@@ -69,7 +69,7 @@ impl UdpSink {
             .iter()
             .take(count)
             .map(|p| p.bytes.as_slice());
-        let completed = sender.send(self.socket.as_fd(), frames);
+        let completed = sender.send(&self.socket, frames);
         for _ in 0..completed {
             self.pending.pop();
         }
@@ -81,7 +81,7 @@ impl UdpSink {
         frames: impl ExactSizeIterator<Item = &'a [u8]> + Clone,
     ) {
         let completed = if self.pending.packets.is_empty() {
-            sender.send(self.socket.as_fd(), frames.clone())
+            sender.send(&self.socket, frames.clone())
         } else {
             0
         };
@@ -96,7 +96,7 @@ impl Sink for UdpSink {
     fn send(&mut self, frame: &[u8]) {
         if self.pending.packets.is_empty() {
             loop {
-                match udp::send(self.socket.as_fd(), frame) {
+                match udp::send(&self.socket, frame) {
                     Ok(()) => return,
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -165,15 +165,15 @@ impl ExitState {
 pub type SharedExitState = Arc<Mutex<ExitState>>;
 
 pub struct Listener {
-    sockets: Vec<(OuterFamily, OwnedFd)>,
-    wake: OwnedFd,
+    sockets: Vec<(OuterFamily, UdpSocket)>,
+    wake: Arc<Waker>,
     pub(crate) state: SharedExitState,
     listen_ip: Option<IpAddr>,
     listen_port: u16,
 }
 
 impl Listener {
-    pub fn bind(cfg: &Config, tun_mtu: u16, main_wake: RawFd) -> Result<Self, String> {
+    pub fn bind(cfg: &Config, tun_mtu: u16, main_wake: Arc<Waker>) -> Result<Self, String> {
         let listen_port = cfg.listen.expect("validated exit listen port");
         let mut sockets = Vec::new();
         for &family in cfg.socket_families() {
@@ -181,7 +181,9 @@ impl Listener {
                 .map_err(|e| format!("{family:?} UDP listener: {e}"))?;
             sockets.push((family, fd));
         }
-        let wake = platform::eventfd().map_err(|e| format!("listener eventfd: {e}"))?;
+        let wake = Waker::new()
+            .map(Arc::new)
+            .map_err(|e| format!("listener eventfd: {e}"))?;
         let auth = Auth::new(
             &cfg.tunables.auth_key,
             tun_mtu,
@@ -206,14 +208,14 @@ impl Listener {
         })
     }
 
-    pub fn wake_fd(&self) -> RawFd {
-        self.wake.as_raw_fd()
+    pub fn waker(&self) -> Arc<Waker> {
+        self.wake.clone()
     }
 
     pub fn spawn(
         self,
         stop: &'static AtomicBool,
-        main_wake: RawFd,
+        main_wake: Arc<Waker>,
     ) -> io::Result<std::thread::JoinHandle<()>> {
         std::thread::Builder::new()
             .name("ghostun-udp-accept".into())
@@ -232,25 +234,21 @@ impl Listener {
             listen_port,
         } = self;
         let mut pending: Pending<UnconnectedDst> = Pending::default();
-        let mut fds = vec![platform::pollfd(wake.as_raw_fd(), libc::POLLIN)];
-        for (_, fd) in &sockets {
-            fds.push(platform::pollfd(fd.as_raw_fd(), libc::POLLIN));
+        let mut poller = Poller::default();
+        let wake_slot = poller.add(&wake, Interest::READ);
+        for (_, socket) in &sockets {
+            poller.add(socket, Interest::READ);
         }
         let mut buf = [0u8; PROOF_LEN + 64];
         while !stop.load(Ordering::Relaxed) {
-            for (index, _) in sockets.iter().enumerate() {
-                fds[index + 1].events = libc::POLLIN
-                    | if pending
-                        .packets
-                        .front()
-                        .is_some_and(|p| p.metadata.index == index)
-                    {
-                        libc::POLLOUT
-                    } else {
-                        0
-                    };
+            for index in 0..sockets.len() {
+                let blocked = pending
+                    .packets
+                    .front()
+                    .is_some_and(|p| p.metadata.index == index);
+                poller.set(index + 1, Interest::READ | Interest::WRITE.when(blocked));
             }
-            match platform::poll(&mut fds, -1) {
+            match poller.wait(None) {
                 Ok(true) => {}
                 Ok(false) => continue,
                 Err(e) => {
@@ -258,26 +256,23 @@ impl Listener {
                     return;
                 }
             }
-            if platform::poll_wake(fds[0], wake.as_fd()) && state.lock().unwrap().sync() {
+            if poller.woken(wake_slot, &wake) && state.lock().unwrap().sync() {
                 pending.clear();
             }
             if stop.load(Ordering::Relaxed) {
                 break;
             }
-            if fds[1..]
-                .iter()
-                .any(|fd| fd.revents & platform::WRITE_READY != 0)
-            {
+            if (1..=sockets.len()).any(|slot| poller.write_ready(slot)) {
                 flush_unconnected(&sockets, &mut pending);
             }
             let now = Instant::now();
             for (index, (family, fd)) in sockets.iter().enumerate() {
-                if fds[index + 1].revents & libc::POLLIN == 0 {
+                if !poller.readable(index + 1) {
                     continue;
                 }
                 for _ in 0..ROUNDS * platform::BATCH {
                     let (n, local, peer) =
-                        match udp::recv_unconnected(fd.as_fd(), *family, listen_port, &mut buf) {
+                        match udp::recv_unconnected(fd, *family, listen_port, &mut buf) {
                             Ok(res) => res,
                             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                             Err(_) => break,
@@ -313,14 +308,14 @@ impl Listener {
 }
 
 fn send_or_queue(
-    sockets: &[(OuterFamily, OwnedFd)],
+    sockets: &[(OuterFamily, UdpSocket)],
     pending: &mut Pending<UnconnectedDst>,
     dst: UnconnectedDst,
     frame: &[u8],
 ) {
     if pending.packets.is_empty() {
         loop {
-            match udp::send_unconnected(sockets[dst.index].1.as_fd(), dst.local, dst.peer, frame) {
+            match udp::send_unconnected(&sockets[dst.index].1, dst.local, dst.peer, frame) {
                 Ok(()) => return,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -336,15 +331,10 @@ fn send_or_queue(
     }
 }
 
-fn flush_unconnected(sockets: &[(OuterFamily, OwnedFd)], pending: &mut Pending<UnconnectedDst>) {
+fn flush_unconnected(sockets: &[(OuterFamily, UdpSocket)], pending: &mut Pending<UnconnectedDst>) {
     while let Some(front) = pending.packets.front() {
         let dst = front.metadata;
-        match udp::send_unconnected(
-            sockets[dst.index].1.as_fd(),
-            dst.local,
-            dst.peer,
-            &front.bytes,
-        ) {
+        match udp::send_unconnected(&sockets[dst.index].1, dst.local, dst.peer, &front.bytes) {
             Ok(()) => pending.pop(),
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -490,47 +480,40 @@ impl Worker {
         let mut attached = mode == Mode::Exit;
         let mut sender = udp::Sender::new();
         let mut rx = udp::Receiver::new(stride);
-        let mut fds = [
-            platform::pollfd(tun.as_raw_fd(), libc::POLLIN),
-            platform::pollfd(ctrl.wake_fd().as_raw_fd(), libc::POLLIN),
-            platform::pollfd(-1, libc::POLLIN),
-            platform::pollfd(out.socket.as_raw_fd(), libc::POLLIN),
-        ];
+        let mut poller = Poller::default();
+        let tun_slot = poller.add(&tun, Interest::READ);
+        let wake_slot = poller.add(ctrl.waker(), Interest::READ);
+        let ring_slot = poller.reserve();
+        let socket_slot = poller.add(&out.socket, Interest::READ);
         let mut busy = false;
         let mut applied_gen = 0;
         let mut handoff: Option<Promoted> = None;
         while !stop.load(Ordering::Relaxed) && !ctrl.is_stopped() {
-            fds[2].fd = if driver.read_fd() == tun.as_raw_fd() {
-                -1
+            let polled = driver.read_fd() == tun.as_raw_fd();
+            if polled {
+                poller.unbind(ring_slot);
             } else {
-                driver.read_fd()
-            };
-            fds[0].events = if fds[2].fd == -1 && out.room(&driver, stride, 1) {
-                libc::POLLIN
-            } else {
-                0
-            } | if driver.wants_write() {
-                libc::POLLOUT
-            } else {
-                0
-            };
-            fds[3].fd = out.socket.as_raw_fd();
-            fds[3].events = libc::POLLIN
-                | if out.pending.packets.is_empty() {
-                    0
-                } else {
-                    libc::POLLOUT
-                };
+                poller.bind(ring_slot, &driver.read_fd(), Interest::READ);
+            }
+            poller.set(
+                tun_slot,
+                Interest::READ.when(polled && out.room(&driver, stride, 1))
+                    | Interest::WRITE.when(driver.wants_write()),
+            );
+            // The session may have rebound to a fresh socket.
+            poller.bind(
+                socket_slot,
+                &out.socket,
+                Interest::READ | Interest::WRITE.when(!out.pending.packets.is_empty()),
+            );
             let timeout = if busy || (driver.has_reads() && out.room(&driver, stride, 1)) {
-                0
+                Duration::ZERO
             } else {
-                platform::poll_ms(
-                    session
-                        .next_deadline()
-                        .saturating_duration_since(Instant::now()),
-                )
+                session
+                    .next_deadline()
+                    .saturating_duration_since(Instant::now())
             };
-            match platform::poll(&mut fds, timeout) {
+            match poller.wait(Some(timeout)) {
                 Ok(true) => {}
                 Ok(false) => continue,
                 Err(e) => {
@@ -538,25 +521,25 @@ impl Worker {
                     break;
                 }
             }
-            platform::poll_wake(fds[1], ctrl.wake_fd());
+            poller.woken(wake_slot, ctrl.waker());
             if stop.load(Ordering::Relaxed) || ctrl.is_stopped() {
                 break;
             }
             let now = Instant::now();
             let read_allowed = out.room(&driver, stride, 1);
             driver.service(attached, read_allowed);
-            if fds[3].revents & platform::WRITE_READY != 0 {
+            if poller.write_ready(socket_slot) {
                 out.flush(&mut sender);
             }
-            if fds[0].revents & platform::WRITE_READY != 0 {
+            if poller.write_ready(tun_slot) {
                 driver.flush();
             }
-            let mut tun_ready = (fds[0].revents & libc::POLLIN != 0 || driver.has_reads())
-                && out.room(&driver, stride, 1);
-            let mut udp_ready = fds[3].revents & libc::POLLIN != 0;
+            let mut tun_ready =
+                (poller.readable(tun_slot) || driver.has_reads()) && out.room(&driver, stride, 1);
+            let mut udp_ready = poller.readable(socket_slot);
             for _ in 0..ROUNDS {
                 if udp_ready {
-                    udp_ready = match rx.receive(out.socket.as_fd()) {
+                    udp_ready = match rx.receive(&out.socket) {
                         Ok(m) => {
                             for k in 0..m {
                                 let n = rx.lens[k];

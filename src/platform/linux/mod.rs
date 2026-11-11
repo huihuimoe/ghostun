@@ -1,22 +1,26 @@
 //! Thin OS wrappers: poll, signals, CSPRNG, CPU affinity, sysctl, plus TUN, socket and route-netlink submodules.
 
+mod poll;
 pub mod raw;
 pub mod route;
+pub mod signals;
 pub mod tcp;
 pub mod tun;
 pub mod udp;
 pub mod uring;
 
+pub use poll::{Interest, Poller};
+
 use std::fs::File;
 use std::io::{self, Write};
 use std::mem::{size_of, zeroed};
 use std::net::{IpAddr, SocketAddr};
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub const READ_READY: i16 = libc::POLLIN | libc::POLLERR | libc::POLLHUP;
-pub const WRITE_READY: i16 = libc::POLLOUT | libc::POLLERR | libc::POLLHUP;
+const READ_READY: i16 = libc::POLLIN | libc::POLLERR | libc::POLLHUP;
+const WRITE_READY: i16 = libc::POLLOUT | libc::POLLERR | libc::POLLHUP;
 
 /// Packets moved per batched socket or TUN system call.
 pub const BATCH: usize = 64;
@@ -85,52 +89,53 @@ pub fn random(bytes: &mut [u8]) -> io::Result<()> {
     getrandom::fill(bytes).map_err(|_| io::Error::other("OS cryptographic randomness unavailable"))
 }
 
-pub fn install_signal_handlers(handler: extern "C" fn(libc::c_int)) -> io::Result<()> {
-    for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
-        // SAFETY: `sigaction` is zero-initialized and populated with a valid C signal handler.
+/// Cross-thread wakeup that a poll loop can wait on.
+pub struct Waker(OwnedFd);
+
+impl Waker {
+    pub fn new() -> io::Result<Self> {
+        // SAFETY: constant flags; returned descriptor is owned immediately.
+        let fd = cvt(unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) })?;
+        Ok(Self(unsafe { OwnedFd::from_raw_fd(fd) }))
+    }
+
+    #[inline]
+    pub fn notify(&self) {
+        notify(self.0.as_raw_fd());
+    }
+
+    #[inline]
+    pub fn drain(&self) {
+        let mut buf = [0u8; 8];
+        // SAFETY: 8-byte read from a valid nonblocking eventfd.
         unsafe {
-            let mut sa: libc::sigaction = zeroed();
-            sa.sa_sigaction = handler as libc::sighandler_t;
-            libc::sigemptyset(&mut sa.sa_mask);
-            cvt(libc::sigaction(sig, &sa, std::ptr::null_mut()))?;
+            let _ = libc::read(self.0.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len());
         }
     }
-    Ok(())
+
+    /// Blocks until notified; a signal also ends the wait.
+    pub fn wait(&self) -> io::Result<()> {
+        poll(&mut [pollfd(self.0.as_raw_fd(), libc::POLLIN)], -1).map(drop)
+    }
 }
 
-pub fn eventfd() -> io::Result<OwnedFd> {
-    // SAFETY: constant flags; returned descriptor is owned immediately.
-    let fd = cvt(unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) })?;
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+impl AsRawFd for Waker {
+    #[inline(always)]
+    fn as_raw_fd(&self) -> RawFd {
+        self.0.as_raw_fd()
+    }
 }
 
+/// Async-signal-safe; a negative `fd` means no waker is installed yet.
 #[inline]
-pub fn eventfd_notify(fd: RawFd) {
+fn notify(fd: RawFd) {
     if fd >= 0 {
         let one = 1u64.to_ne_bytes();
-        // SAFETY: async-signal-safe 8-byte write to a valid nonblocking eventfd.
+        // SAFETY: 8-byte write to a valid nonblocking eventfd.
         unsafe {
             let _ = libc::write(fd, one.as_ptr().cast(), one.len());
         }
     }
-}
-
-#[inline]
-pub fn eventfd_drain(fd: BorrowedFd<'_>) {
-    let mut buf = [0u8; 8];
-    // SAFETY: 8-byte read from a valid nonblocking eventfd.
-    unsafe {
-        let _ = libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len());
-    }
-}
-
-#[inline]
-pub fn poll_wake(pfd: libc::pollfd, fd: BorrowedFd<'_>) -> bool {
-    let ready = pfd.revents & libc::POLLIN != 0;
-    if ready {
-        eventfd_drain(fd);
-    }
-    ready
 }
 
 #[inline(always)]

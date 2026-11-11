@@ -3,8 +3,8 @@
 use std::ffi::CString;
 use std::io;
 use std::mem::{size_of, zeroed};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::ptr::{read_unaligned, write_unaligned};
 
 use libc::{in_pktinfo, in6_pktinfo};
@@ -109,7 +109,7 @@ pub fn listener(
     listen_ip: Option<IpAddr>,
     port: u16,
     bind_dev: Option<&str>,
-) -> io::Result<OwnedFd> {
+) -> io::Result<UdpSocket> {
     let fd = socket_common(family, bind_dev, true)?;
     let one: libc::c_int = 1;
     match family {
@@ -121,7 +121,7 @@ pub fn listener(
     let (ptr, len) = sa.as_ptr_len();
     // SAFETY: `sa` outlives `bind` and `ptr`/`len` match its family.
     cvt(unsafe { libc::bind(fd.as_raw_fd(), ptr, len) })?;
-    Ok(fd)
+    Ok(fd.into())
 }
 
 /// Connected Entry worker socket bound to `local_ip:0` (kernel-assigned ephemeral port).
@@ -129,10 +129,10 @@ pub fn connect_entry(
     local_ip: IpAddr,
     remote: SocketAddr,
     bind_dev: Option<&str>,
-) -> io::Result<(OwnedFd, SocketAddr)> {
+) -> io::Result<(UdpSocket, SocketAddr)> {
     let fd = connect_bound(SocketAddr::new(local_ip, 0), remote, bind_dev, false)?;
     let local = local_addr(&fd, OuterFamily::of(remote.ip()))?;
-    Ok((fd, local))
+    Ok((fd.into(), local))
 }
 
 /// Connected Exit worker socket sharing `local` via `SO_REUSEADDR` + `SO_REUSEPORT` and connected
@@ -141,8 +141,8 @@ pub fn connect_exit(
     local: SocketAddr,
     peer: SocketAddr,
     bind_dev: Option<&str>,
-) -> io::Result<OwnedFd> {
-    connect_bound(local, peer, bind_dev, true)
+) -> io::Result<UdpSocket> {
+    connect_bound(local, peer, bind_dev, true).map(UdpSocket::from)
 }
 
 fn connect_bound(
@@ -170,7 +170,7 @@ fn connect_bound(
 /// Receives one datagram on an unconnected listener socket, returning `(len, local, peer)`.
 /// Truncated frames or frames missing packet-info return `len == 0`.
 pub fn recv_unconnected(
-    fd: BorrowedFd<'_>,
+    fd: &UdpSocket,
     family: OuterFamily,
     listen_port: u16,
     buf: &mut [u8],
@@ -231,7 +231,7 @@ pub fn recv_unconnected(
 
 /// Sends one datagram from an unconnected listener socket using `local.ip()` as source address.
 pub fn send_unconnected(
-    fd: BorrowedFd<'_>,
+    fd: &UdpSocket,
     local: SocketAddr,
     peer: SocketAddr,
     frame: &[u8],
@@ -301,7 +301,7 @@ unsafe fn put_cmsg<T>(msg: &mut libc::msghdr, level: libc::c_int, ty: libc::c_in
 }
 
 #[inline]
-pub fn send(fd: BorrowedFd<'_>, frame: &[u8]) -> io::Result<()> {
+pub fn send(fd: &UdpSocket, frame: &[u8]) -> io::Result<()> {
     // SAFETY: `frame` remains live for the synchronous send syscall.
     let n = unsafe {
         libc::send(
@@ -340,7 +340,7 @@ impl Sender {
 
     pub fn send<'a>(
         &mut self,
-        fd: BorrowedFd<'_>,
+        fd: &UdpSocket,
         frames: impl ExactSizeIterator<Item = &'a [u8]>,
     ) -> usize {
         let count = frames.len();
@@ -406,7 +406,7 @@ impl Receiver {
     }
 
     /// Truncated frames have length zero.
-    pub fn receive(&mut self, fd: BorrowedFd<'_>) -> io::Result<usize> {
+    pub fn receive(&mut self, fd: &UdpSocket) -> io::Result<usize> {
         // SAFETY: boxed buffers and descriptors remain live and fixed.
         let m = unsafe {
             libc::recvmmsg(
@@ -474,7 +474,6 @@ unsafe fn pktinfo_v6(msg: &libc::msghdr) -> Option<(Ipv6Addr, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::fd::AsFd;
 
     #[test]
     fn connected_exit_socket_steers_peer_traffic_away_from_wildcard_listener() {
@@ -483,51 +482,47 @@ mod tests {
             (OuterFamily::Ipv6, IpAddr::V6(Ipv6Addr::LOCALHOST)),
         ] {
             let lis = listener(family, None, 0, None).unwrap();
-            let port = local_addr(&lis, family).unwrap().port();
+            let port = lis.local_addr().unwrap().port();
             let target = SocketAddr::new(ip, port);
 
             let (entry1, entry1_local) = connect_entry(ip, target, None).unwrap();
-            send(entry1.as_fd(), b"hello-1").unwrap();
+            send(&entry1, b"hello-1").unwrap();
 
             let mut buf = [0u8; 64];
-            let (n, local, peer) = recv_unconnected(lis.as_fd(), family, port, &mut buf).unwrap();
+            let (n, local, peer) = recv_unconnected(&lis, family, port, &mut buf).unwrap();
             assert_eq!(&buf[..n], b"hello-1");
             assert_eq!(local, target);
             assert_eq!(peer, entry1_local);
 
-            send_unconnected(lis.as_fd(), local, peer, b"challenge-1").unwrap();
+            send_unconnected(&lis, local, peer, b"challenge-1").unwrap();
             let mut rx1 = Receiver::new(64);
-            assert_eq!(rx1.receive(entry1.as_fd()).unwrap(), 1);
+            assert_eq!(rx1.receive(&entry1).unwrap(), 1);
             assert_eq!(&rx1.buffers()[..rx1.lens[0]], b"challenge-1");
 
             // Promote peer1 to a connected Exit worker socket on the same port.
             let worker1 = connect_exit(local, peer, None).unwrap();
             let mut tx_entry = Sender::new();
             assert_eq!(
-                tx_entry.send(
-                    entry1.as_fd(),
-                    [b"data-a".as_slice(), b"data-b"].into_iter()
-                ),
+                tx_entry.send(&entry1, [b"data-a".as_slice(), b"data-b"].into_iter()),
                 2
             );
 
             // Kernel delivers peer1's datagrams to worker1, not the wildcard listener.
             assert_eq!(
-                recv_unconnected(lis.as_fd(), family, port, &mut buf)
+                recv_unconnected(&lis, family, port, &mut buf)
                     .unwrap_err()
                     .kind(),
                 io::ErrorKind::WouldBlock
             );
             let mut rx_worker = Receiver::new(64);
-            assert_eq!(rx_worker.receive(worker1.as_fd()).unwrap(), 2);
+            assert_eq!(rx_worker.receive(&worker1).unwrap(), 2);
             assert_eq!(&rx_worker.buffers()[..rx_worker.lens[0]], b"data-a");
             assert_eq!(&rx_worker.buffers()[64..64 + rx_worker.lens[1]], b"data-b");
 
             // A second peer on a different ephemeral port still reaches the wildcard listener.
             let (entry2, entry2_local) = connect_entry(ip, target, None).unwrap();
-            send(entry2.as_fd(), b"hello-2").unwrap();
-            let (n2, local2, peer2) =
-                recv_unconnected(lis.as_fd(), family, port, &mut buf).unwrap();
+            send(&entry2, b"hello-2").unwrap();
+            let (n2, local2, peer2) = recv_unconnected(&lis, family, port, &mut buf).unwrap();
             assert_eq!(&buf[..n2], b"hello-2");
             assert_eq!(local2, target);
             assert_eq!(peer2, entry2_local);

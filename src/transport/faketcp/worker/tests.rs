@@ -94,8 +94,8 @@ fn rolling_reload_rotates_workers_sequentially_and_rolls_back() {
     let cpus_1 = vec![Some(1), Some(1)];
     let cpus_default = vec![Some(0), Some(1)];
     let controls = vec![
-        Arc::new(Control::new(Some(0), -1)),
-        Arc::new(Control::new(Some(1), -1)),
+        Arc::new(Control::new(Some(0), Arc::new(Waker::new().unwrap()))),
+        Arc::new(Control::new(Some(1), Arc::new(Waker::new().unwrap()))),
     ];
     let mut entries = [
         make_session(Mode::Entry, 0, 0xa7, now),
@@ -203,8 +203,8 @@ fn rolling_reload_fast_forwards_unestablished_workers() {
     let now = Instant::now();
     let cpus_default = vec![Some(0), Some(1)];
     let controls = vec![
-        Arc::new(Control::new(Some(0), -1)),
-        Arc::new(Control::new(Some(1), -1)),
+        Arc::new(Control::new(Some(0), Arc::new(Waker::new().unwrap()))),
+        Arc::new(Control::new(Some(1), Arc::new(Waker::new().unwrap()))),
     ];
     let mut exits = [
         make_session(Mode::Exit, 0, 0xa7, now),

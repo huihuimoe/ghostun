@@ -19,11 +19,6 @@ pub use worker::Worker;
 const ROUNDS: usize = 4;
 const BATCH: usize = 64;
 
-#[inline(always)]
-const fn can_io(pfd: libc::pollfd, event: i16, ready: i16) -> bool {
-    pfd.events & event == 0 || pfd.revents & ready != 0
-}
-
 #[inline]
 fn invalid(reason: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, reason)

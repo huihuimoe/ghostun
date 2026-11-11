@@ -6,10 +6,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use super::auth::{Handshake, Params};
-use super::connection::TunIo;
+use super::connection::{Ready, TunIo};
 use super::{Connection, ROUNDS};
 use crate::config::{Config, Mode};
-use crate::platform::{self, READ_READY, poll, poll_ms, pollfd};
+use crate::platform::{self, Interest, Poller};
 use crate::transport::control::{self, Backoff};
 use crate::transport::tun_driver::TunDriver;
 
@@ -72,19 +72,18 @@ impl Worker {
             c.as_ref()
                 .is_some_and(|c| c.auth.is_none() && c.tx.room(mtu))
         };
-        let mut fds = [
-            pollfd(-1, 0),
-            pollfd(-1, 0),
-            pollfd(ctrl.wake_fd().as_raw_fd(), libc::POLLIN),
-            pollfd(-1, 0),
-        ];
+        let mut poller = Poller::default();
+        let tun_slot = poller.reserve();
+        let socket_slot = poller.reserve();
+        let wake_slot = poller.add(ctrl.waker(), Interest::READ);
+        let ring_slot = poller.reserve();
         while !stop.load(Ordering::Relaxed) && !ctrl.is_stopped() {
-            platform::poll_wake(fds[2], ctrl.wake_fd());
+            poller.woken(wake_slot, ctrl.waker());
             if ctrl.is_stopped() {
                 break;
             }
             tun.driver.service(tun.attached, read_allowed(&connection));
-            if fds[0].revents & platform::WRITE_READY != 0 {
+            if poller.write_ready(tun_slot) {
                 tun.driver.flush();
             }
             if let Some((new_gen, reload)) = ctrl.take_reload(generation) {
@@ -97,7 +96,7 @@ impl Worker {
                     wait |= connection.as_ref().is_some_and(|c| c.auth.is_none());
                     connection = None;
                     tun.driver.reset();
-                    fds[1] = pollfd(-1, 0);
+                    poller.unbind(socket_slot);
                     retry_at = Instant::now();
                 }
                 self.cfg.tunables = reload.tunables;
@@ -126,7 +125,7 @@ impl Worker {
                 match result {
                     Ok(c) => {
                         connection = Some(c);
-                        fds[1] = pollfd(-1, 0);
+                        poller.unbind(socket_slot);
                     }
                     Err(e) => {
                         log::warn!("worker {id}: connection failure ({remote}): {e}");
@@ -137,8 +136,8 @@ impl Worker {
             let mut busy = false;
             if let Some(c) = connection.as_mut() {
                 let result = if c.auth.is_some() {
-                    if fds[1].fd < 0
-                        || fds[1].revents != 0
+                    if !poller.is_bound(socket_slot)
+                        || poller.fired(socket_slot)
                         || now.duration_since(c.since) >= self.cfg.tunables.dead_timeout
                     {
                         c.authenticate(now, self.cfg.tunables.dead_timeout)
@@ -159,7 +158,11 @@ impl Worker {
                         now,
                         self.cfg.tunables.ping_interval,
                         self.cfg.tunables.dead_timeout,
-                        &fds,
+                        Ready {
+                            tun: poller.read_ready(tun_slot),
+                            socket_read: poller.can_read(socket_slot),
+                            socket_write: poller.can_write(socket_slot),
+                        },
                     )
                     .map(|more| busy = more)
                 };
@@ -176,7 +179,7 @@ impl Worker {
                     connection = None;
                     // Queued TUN writes and completed reads belong to the dead session.
                     tun.driver.reset();
-                    fds[1] = pollfd(-1, 0);
+                    poller.unbind(socket_slot);
                     if self.cfg.mode == Mode::Entry {
                         retry_at = if was_established {
                             backoff.reset();
@@ -192,7 +195,7 @@ impl Worker {
             let established = connection.as_ref().is_some_and(|c| c.auth.is_none());
             control::sync_tun_queue(id, self.tun.as_fd(), &mut tun.attached, established);
             ctrl.report(generation, established, wait);
-            if !established && (fds[0].revents & READ_READY != 0 || tun.driver.has_reads()) {
+            if !established && (poller.read_ready(tun_slot) || tun.driver.has_reads()) {
                 // Discard packets that reached the queue before detach or session loss.
                 let mut drained = 0;
                 for _ in 0..ROUNDS {
@@ -213,40 +216,38 @@ impl Worker {
             // until an unrelated socket event or timer wakes the loop.
             tun.driver.service(tun.attached, read_allowed(&connection));
             let polled = tun.driver.read_fd() == self.tun.as_raw_fd();
-            let tun_read = if polled { libc::POLLIN } else { 0 };
-            let tun_write = if tun.driver.wants_write() {
-                libc::POLLOUT
+            if polled {
+                poller.unbind(ring_slot);
             } else {
-                0
-            };
-            fds = [
-                pollfd(self.tun.as_raw_fd(), tun_read | tun_write),
-                pollfd(-1, 0),
-                pollfd(ctrl.wake_fd().as_raw_fd(), libc::POLLIN),
-                pollfd(if polled { -1 } else { tun.driver.read_fd() }, libc::POLLIN),
-            ];
-            if let Some(c) = &connection {
-                fds[1] = pollfd(
-                    c.socket.as_raw_fd(),
-                    if c.tun_pending || c.rx.ready() {
-                        0
-                    } else {
-                        libc::POLLIN
-                    } | if c.tx.bytes() > 0 { libc::POLLOUT } else { 0 },
-                );
-                if established && !c.tx.room(self.mtu as usize) {
-                    fds[0].events &= !libc::POLLIN;
-                }
+                poller.bind(ring_slot, &tun.driver.read_fd(), Interest::READ);
             }
+            let mut tun_read = polled;
+            match &connection {
+                Some(c) => {
+                    poller.bind(
+                        socket_slot,
+                        &c.socket,
+                        Interest::READ.when(!c.tun_pending && !c.rx.ready())
+                            | Interest::WRITE.when(c.tx.bytes() > 0),
+                    );
+                    tun_read &= !established || c.tx.room(mtu);
+                }
+                None => poller.unbind(socket_slot),
+            }
+            poller.bind(
+                tun_slot,
+                &self.tun,
+                Interest::READ.when(tun_read) | Interest::WRITE.when(tun.driver.wants_write()),
+            );
             if stop.load(Ordering::Relaxed) || ctrl.is_stopped() {
                 break;
             }
             let timeout = if busy {
-                0
+                Some(Duration::ZERO)
             } else {
                 now = Instant::now();
                 match &connection {
-                    Some(c) => poll_ms(
+                    Some(c) => Some(
                         c.next_deadline(
                             self.cfg.tunables.ping_interval,
                             self.cfg.tunables.dead_timeout,
@@ -254,12 +255,12 @@ impl Worker {
                         .saturating_duration_since(now),
                     ),
                     None if self.cfg.mode == Mode::Entry => {
-                        poll_ms(retry_at.saturating_duration_since(now))
+                        Some(retry_at.saturating_duration_since(now))
                     }
-                    None => -1,
+                    None => None,
                 }
             };
-            if let Err(e) = poll(&mut fds, timeout) {
+            if let Err(e) = poller.wait(timeout) {
                 log::error!("worker {id}: poll: {e}");
                 return;
             }
