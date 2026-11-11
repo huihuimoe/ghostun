@@ -1,5 +1,6 @@
 //! Outer transports and the per-worker runtime they share: worker threads, rolling reload, shutdown.
 
+mod auth;
 pub mod budget;
 mod control;
 mod faketcp;

@@ -2,37 +2,19 @@
 
 use std::io;
 use std::mem;
-use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use hmac::{Hmac, KeyInit, Mac};
-use sha2::Sha256;
+use hmac::{KeyInit, Mac};
 use zerocopy::byteorder::network_endian::{U16, U64};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
-
-type HmacSha256 = Hmac<Sha256>;
 
 use super::frame::TcpMeta;
 use crate::config::{AuthKey, MAX_CONNS, Mode};
 use crate::platform;
-
-pub const CONTROL: u8 = 3;
-const VERSION: u8 = 1;
-pub(crate) const HELLO: u8 = 1;
-pub(crate) const CHALLENGE: u8 = 2;
-pub(crate) const PROOF: u8 = 3;
-pub(crate) const FINISHED: u8 = 4;
-
-const NONCE_LEN: usize = 32;
-const TAG_LEN: usize = 32;
-
-#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned, PartialEq, Eq)]
-#[repr(C)]
-struct Header {
-    control: u8,
-    version: u8,
-    kind: u8,
-}
+pub(crate) use crate::transport::auth::{CHALLENGE, CONTROL, FINISHED, FINISHED_LEN, HELLO, PROOF};
+use crate::transport::auth::{
+    Finished, Header, HmacSha256, NONCE_LEN, TAG_LEN, address, header, is_fresh, mac,
+};
 
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
 #[repr(C)]
@@ -77,18 +59,9 @@ struct Proof {
     entry_tag: [u8; TAG_LEN],
 }
 
-#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
-#[repr(C)]
-struct Finished {
-    header: Header,
-    ticket: U64,
-    tag: [u8; TAG_LEN],
-}
-
 pub const HELLO_LEN: usize = mem::size_of::<Hello>();
 const CHALLENGE_LEN: usize = mem::size_of::<Challenge>();
 pub const PROOF_LEN: usize = mem::size_of::<Proof>();
-pub const FINISHED_LEN: usize = mem::size_of::<Finished>();
 
 const ENTRY_BYTES: u32 = (HELLO_LEN + PROOF_LEN) as u32;
 pub(crate) const EXIT_BYTES: u32 = (CHALLENGE_LEN + FINISHED_LEN) as u32;
@@ -151,15 +124,6 @@ pub struct Auth {
     entry: Option<EntryState>,
     origin: Instant,
     timeout: Duration,
-}
-
-#[inline]
-fn header(kind: u8) -> Header {
-    Header {
-        control: CONTROL,
-        version: VERSION,
-        kind,
-    }
 }
 
 impl Auth {
@@ -402,7 +366,7 @@ impl Auth {
         let mut frame = [0; PROOF_LEN];
         frame[..CHALLENGE_LEN].copy_from_slice(challenge.as_bytes());
         let proof = Proof::mut_from_bytes(&mut frame).expect("Proof buffer");
-        proof.header.kind = PROOF;
+        proof.header = header(PROOF);
         proof.entry_tag = self.sign(ENTRY_DOMAIN, isns, challenge.body.as_bytes());
         Some(frame)
     }
@@ -421,11 +385,11 @@ impl Auth {
         if ticket <= self.server.as_ref()?.accepted[worker] {
             return None;
         }
-        let issued = proof.body.transcript.issued_ms.get();
-        let elapsed = now.saturating_duration_since(self.origin).as_millis();
-        if u128::from(issued) > elapsed
-            || elapsed - u128::from(issued) > self.timeout.as_millis() * 2
-        {
+        if !is_fresh(
+            proof.body.transcript.issued_ms.get(),
+            now.saturating_duration_since(self.origin),
+            self.timeout,
+        ) {
             return None;
         }
         let isns = Isns {
@@ -470,9 +434,7 @@ impl Auth {
 
     #[inline]
     fn mac(&self, domain: &[u8], isns: Isns, body: &[u8]) -> HmacSha256 {
-        let mut mac = self.key.clone();
-        mac.update(domain);
-        mac.update(&[VERSION]);
+        let mut mac = mac(&self.key, domain);
         mac.update(&isns.entry.to_be_bytes());
         mac.update(&isns.exit.to_be_bytes());
         mac.update(body);
@@ -488,21 +450,6 @@ impl Auth {
     fn verify(&self, domain: &[u8], isns: Isns, body: &[u8], tag: &[u8]) -> bool {
         self.mac(domain, isns, body).verify_slice(tag).is_ok()
     }
-}
-
-#[inline]
-fn address(mac: &mut HmacSha256, addr: SocketAddr) {
-    match addr.ip() {
-        std::net::IpAddr::V4(ip) => {
-            mac.update(&[4]);
-            mac.update(&ip.octets());
-        }
-        std::net::IpAddr::V6(ip) => {
-            mac.update(&[6]);
-            mac.update(&ip.octets());
-        }
-    }
-    mac.update(&addr.port().to_be_bytes());
 }
 
 #[inline]
