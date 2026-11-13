@@ -10,7 +10,7 @@ workflow:
 test:
   stage: test
   interruptible: true
-  image: rust:1.99.1-slim-trixie
+  image: rust:1.100.0-slim-trixie
   variables:
     CARGO_BUILD_JOBS: "2"
     CARGO_INCREMENTAL: "0"

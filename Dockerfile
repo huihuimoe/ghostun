@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.29
-FROM --platform=$BUILDPLATFORM rust:1.99.1-slim-trixie AS build
+FROM --platform=$BUILDPLATFORM rust:1.100.0-slim-trixie AS build
 ARG TARGETARCH
 ENV RUSTFLAGS="-C linker=rust-lld"
 WORKDIR /build
